@@ -1,5 +1,9 @@
 # 🐕 mostro-watchdog
 
+<p align="center">
+  <img src="mascot.png" alt="mostro-watchdog mascot" width="300" />
+</p>
+
 Real-time Telegram notification bot for [Mostro](https://mostro.network) administrators. Monitors Nostr dispute events (kind 38386) and sends instant alerts to a Telegram group or channel.
 
 ## Why?
