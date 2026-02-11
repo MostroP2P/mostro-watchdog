@@ -67,7 +67,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     info!("🔍 Subscribed to dispute events. Watching...");
 
     // Send startup notification
-    let startup_msg = "🐕 *mostro-watchdog* is now online and monitoring for disputes.";
+    let startup_msg = "🐕 *mostro\\-watchdog* is now online and monitoring for disputes\\.";
     if let Err(e) = bot
         .send_message(ChatId(config.telegram.chat_id), startup_msg)
         .parse_mode(teloxide::types::ParseMode::MarkdownV2)
@@ -147,11 +147,31 @@ async fn handle_dispute_event(bot: &Bot, chat_id: i64, event: &Event) {
 }
 
 fn chrono_timestamp(unix: u64) -> String {
-    use std::time::{Duration, UNIX_EPOCH};
-    let d = UNIX_EPOCH + Duration::from_secs(unix);
-    // Format as human-readable UTC
-    let datetime: std::time::SystemTime = d;
-    format!("{:?}", datetime)
+    let secs = unix as i64;
+    let days = secs / 86400;
+    let time_secs = secs % 86400;
+    let hours = time_secs / 3600;
+    let minutes = (time_secs % 3600) / 60;
+    let seconds = time_secs % 60;
+
+    // Simple days-since-epoch to Y-M-D (good enough for 2020-2099)
+    let mut y = 1970i64;
+    let mut remaining = days;
+    loop {
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
+        if remaining < days_in_year { break; }
+        remaining -= days_in_year;
+        y += 1;
+    }
+    let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
+    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let mut m = 0usize;
+    for md in &month_days {
+        if remaining < *md { break; }
+        remaining -= md;
+        m += 1;
+    }
+    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m + 1, remaining + 1, hours, minutes, seconds)
 }
 
 fn escape_markdown(text: &str) -> String {
