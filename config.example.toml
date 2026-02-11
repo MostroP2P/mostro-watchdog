@@ -1,0 +1,30 @@
+# mostro-watchdog configuration
+# Copy this file to config.toml and fill in your values.
+
+[mostro]
+# Your Mostro daemon's Nostr public key (hex or npub format)
+# Find this in your mostrod configuration
+pubkey = "npub1..."
+
+[nostr]
+# Nostr relays to connect to (use the same relays as your mostrod)
+relays = [
+    "wss://relay.mostro.network",
+    "wss://relay.damus.io",
+]
+
+[telegram]
+# Bot token from @BotFather (https://t.me/BotFather)
+# 1. Open Telegram and search for @BotFather
+# 2. Send /newbot and follow the instructions
+# 3. Copy the token here
+bot_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
+
+# Chat ID where alerts will be sent
+# This can be a group, channel, or personal chat ID
+# To get a group/channel ID:
+# 1. Add your bot to the group/channel
+# 2. Send a message in the group
+# 3. Visit: https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
+# 4. Find the "chat":{"id": ...} value
+chat_id = -1001234567890
