@@ -7,6 +7,93 @@ mod config;
 
 use config::Config;
 
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Parse command-line arguments for config path.
+///
+/// Supported forms:
+///   mostro-watchdog                          → config.toml (cwd)
+///   mostro-watchdog /path/to/config.toml     → positional arg
+///   mostro-watchdog --config /path/to/config  → named flag
+///   mostro-watchdog -c /path/to/config        → short flag
+///   mostro-watchdog --help | -h              → print usage
+///   mostro-watchdog --version | -V           → print version
+fn parse_config_path() -> PathBuf {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    if args.is_empty() {
+        return default_config_path();
+    }
+
+    match args[0].as_str() {
+        "--help" | "-h" => {
+            print_usage();
+            std::process::exit(0);
+        }
+        "--version" | "-V" => {
+            println!("mostro-watchdog {VERSION}");
+            std::process::exit(0);
+        }
+        "--config" | "-c" => {
+            if let Some(path) = args.get(1) {
+                PathBuf::from(path)
+            } else {
+                eprintln!("Error: --config requires a path argument\n");
+                print_usage();
+                std::process::exit(1);
+            }
+        }
+        arg if arg.starts_with('-') => {
+            eprintln!("Error: unknown option '{arg}'\n");
+            print_usage();
+            std::process::exit(1);
+        }
+        path => PathBuf::from(path),
+    }
+}
+
+/// Resolve the default config path with fallback:
+/// 1. ./config.toml (current directory)
+/// 2. ~/.config/mostro-watchdog/config.toml
+fn default_config_path() -> PathBuf {
+    let local = PathBuf::from("config.toml");
+    if local.exists() {
+        return local;
+    }
+
+    if let Some(home) = std::env::var_os("HOME") {
+        let xdg = PathBuf::from(home).join(".config/mostro-watchdog/config.toml");
+        if xdg.exists() {
+            return xdg;
+        }
+    }
+
+    // Return local path anyway — Config::load will produce a helpful error
+    local
+}
+
+fn print_usage() {
+    println!(
+        "🐕 mostro-watchdog {VERSION} — Dispute notification bot for Mostro admins\n\n\
+         USAGE:\n\
+         \x20   mostro-watchdog [OPTIONS] [CONFIG_PATH]\n\n\
+         ARGS:\n\
+         \x20   [CONFIG_PATH]  Path to config.toml (default: ./config.toml)\n\n\
+         OPTIONS:\n\
+         \x20   -c, --config <PATH>  Path to config file\n\
+         \x20   -h, --help           Print this help message\n\
+         \x20   -V, --version        Print version\n\n\
+         CONFIG SEARCH ORDER:\n\
+         \x20   1. ./config.toml (current directory)\n\
+         \x20   2. ~/.config/mostro-watchdog/config.toml\n\n\
+         EXAMPLES:\n\
+         \x20   mostro-watchdog\n\
+         \x20   mostro-watchdog /etc/mostro-watchdog/config.toml\n\
+         \x20   mostro-watchdog --config ~/my-config.toml\n\
+         \x20   RUST_LOG=debug mostro-watchdog"
+    );
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -16,10 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let config_path = std::env::args()
-        .nth(1)
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("config.toml"));
+    let config_path = parse_config_path();
 
     let config = Config::load(&config_path)?;
 
@@ -158,20 +242,49 @@ fn chrono_timestamp(unix: u64) -> String {
     let mut y = 1970i64;
     let mut remaining = days;
     loop {
-        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) { 366 } else { 365 };
-        if remaining < days_in_year { break; }
+        let days_in_year = if y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+            366
+        } else {
+            365
+        };
+        if remaining < days_in_year {
+            break;
+        }
         remaining -= days_in_year;
         y += 1;
     }
     let leap = y % 4 == 0 && (y % 100 != 0 || y % 400 == 0);
-    let month_days = [31, if leap { 29 } else { 28 }, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    let month_days = [
+        31,
+        if leap { 29 } else { 28 },
+        31,
+        30,
+        31,
+        30,
+        31,
+        31,
+        30,
+        31,
+        30,
+        31,
+    ];
     let mut m = 0usize;
     for md in &month_days {
-        if remaining < *md { break; }
+        if remaining < *md {
+            break;
+        }
         remaining -= md;
         m += 1;
     }
-    format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC", y, m + 1, remaining + 1, hours, minutes, seconds)
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02} UTC",
+        y,
+        m + 1,
+        remaining + 1,
+        hours,
+        minutes,
+        seconds
+    )
 }
 
 fn escape_markdown(text: &str) -> String {

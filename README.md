@@ -81,15 +81,28 @@ You'll need to set:
 ### Run
 
 ```bash
-# Default (looks for config.toml in current directory)
+# Default (looks for ./config.toml, then ~/.config/mostro-watchdog/config.toml)
 ./target/release/mostro-watchdog
 
 # Custom config path
+./target/release/mostro-watchdog --config /path/to/config.toml
+
+# Positional argument also works
 ./target/release/mostro-watchdog /path/to/config.toml
 
 # With debug logging
 RUST_LOG=mostro_watchdog=debug ./target/release/mostro-watchdog
+
+# Help & version
+./target/release/mostro-watchdog --help
+./target/release/mostro-watchdog --version
 ```
+
+The config file is searched in this order:
+1. `./config.toml` (current directory)
+2. `~/.config/mostro-watchdog/config.toml`
+
+Or specify it explicitly with `--config` / `-c`.
 
 ### Setting up the Telegram bot
 
