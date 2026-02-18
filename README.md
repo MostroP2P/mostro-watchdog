@@ -31,6 +31,26 @@ Mostro daemon → Nostr (kind 38386) → mostro-watchdog → Telegram alert
 - A Telegram bot token (from [@BotFather](https://t.me/BotFather))
 - Your Mostro daemon's Nostr public key
 
+#### Native Build Dependencies
+
+Some Rust crates require native libraries and build tools. Install them before building:
+
+**Ubuntu / Debian:**
+
+```bash
+sudo apt update
+sudo apt install -y cmake pkg-config libssl-dev
+```
+
+**macOS (Homebrew):**
+
+```bash
+brew install cmake openssl pkg-config
+export OPENSSL_DIR=$(brew --prefix openssl)
+```
+
+> **Tip:** Add the `export OPENSSL_DIR=...` line to your `~/.zshrc` (or `~/.bashrc`) so you don't have to set it every time.
+
 ### Install
 
 ```bash
