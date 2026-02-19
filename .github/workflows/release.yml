@@ -143,19 +143,14 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install cross for cross-compilation (Linux ARM64)
+      - name: Install cross-compilation toolchain (Linux ARM64)
         if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
 
       - name: Build binary
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            # Use cross for robust cross-compilation
-            cross build --release --target ${{ matrix.target }}
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+        run: cargo build --release --target ${{ matrix.target }}
         shell: bash
 
       - name: Prepare binary

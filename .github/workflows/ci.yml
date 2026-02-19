@@ -63,19 +63,25 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install cross for cross-compilation
+      - name: Cache dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install cross-compilation tool
         if: matrix.target == 'aarch64-unknown-linux-gnu'
-        run: |
-          cargo install cross --git https://github.com/cross-rs/cross
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
 
       - name: Check compilation
-        run: |
-          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            # Use cross for robust cross-compilation
-            cross check --target ${{ matrix.target }}
-          else
-            cargo check --target ${{ matrix.target }}
-          fi
+        run: cargo check --target ${{ matrix.target }}
 
   security-audit:
     name: Security Audit
