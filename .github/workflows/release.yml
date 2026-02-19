@@ -157,6 +157,9 @@ jobs:
             export AR=aarch64-linux-gnu-ar
             export STRIP=aarch64-linux-gnu-strip
             export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+            # Use vendored OpenSSL for cross-compilation to avoid dependency issues
+            export OPENSSL_STATIC=1
+            export OPENSSL_VENDOR=1
           fi
           cargo build --release --target ${{ matrix.target }}
         shell: bash
