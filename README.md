@@ -1,5 +1,10 @@
 # 🐕 mostro-watchdog
 
+[![CI](https://github.com/MostroP2P/mostro-watchdog/workflows/CI/badge.svg)](https://github.com/MostroP2P/mostro-watchdog/actions/workflows/ci.yml)
+[![Release](https://github.com/MostroP2P/mostro-watchdog/workflows/Release/badge.svg)](https://github.com/MostroP2P/mostro-watchdog/actions/workflows/release.yml)
+[![Latest Release](https://img.shields.io/github/v/release/MostroP2P/mostro-watchdog)](https://github.com/MostroP2P/mostro-watchdog/releases/latest)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+
 <p align="center">
   <img src="mascot.png" alt="mostro-watchdog mascot" width="300" />
 </p>
@@ -53,8 +58,44 @@ export OPENSSL_DIR=$(brew --prefix openssl)
 
 ### Install
 
+#### Option 1: Download Pre-compiled Binary (Recommended)
+
+Download the latest binary for your platform from the [releases page](https://github.com/MostroP2P/mostro-watchdog/releases/latest):
+
 ```bash
-# From source
+# Linux x86_64
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-linux-x86_64
+chmod +x mostro-watchdog-linux-x86_64
+sudo mv mostro-watchdog-linux-x86_64 /usr/local/bin/mostro-watchdog
+
+# Linux ARM64 (Raspberry Pi, etc.)
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-linux-aarch64
+chmod +x mostro-watchdog-linux-aarch64
+sudo mv mostro-watchdog-linux-aarch64 /usr/local/bin/mostro-watchdog
+
+# macOS x86_64
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-macos-x86_64
+chmod +x mostro-watchdog-macos-x86_64
+sudo mv mostro-watchdog-macos-x86_64 /usr/local/bin/mostro-watchdog
+
+# macOS ARM64 (Apple Silicon)
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-macos-aarch64
+chmod +x mostro-watchdog-macos-aarch64
+sudo mv mostro-watchdog-macos-aarch64 /usr/local/bin/mostro-watchdog
+```
+
+**Verify the download** (recommended):
+```bash
+# Download checksums
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/manifest.txt
+
+# Verify your binary
+sha256sum -c manifest.txt --ignore-missing
+```
+
+#### Option 2: Build from Source
+
+```bash
 git clone https://github.com/MostroP2P/mostro-watchdog.git
 cd mostro-watchdog
 cargo build --release

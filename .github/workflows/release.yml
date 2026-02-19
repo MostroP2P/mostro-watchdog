@@ -1,0 +1,241 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      upload_url: ${{ steps.create_release.outputs.upload_url }}
+      release_id: ${{ steps.create_release.outputs.id }}
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Create changelog content from git log since last tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -z "$PREVIOUS_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --reverse)
+          else
+            CHANGELOG=$(git log ${PREVIOUS_TAG}..HEAD --pretty=format:"- %s (%h)" --reverse)
+          fi
+          
+          # Update CHANGELOG.md
+          if [ ! -f CHANGELOG.md ]; then
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)," >> CHANGELOG.md
+            echo "and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          fi
+          
+          # Create temporary file with new content
+          {
+            head -n 7 CHANGELOG.md
+            echo "## [v${{ steps.get_version.outputs.version }}] - $(date +%Y-%m-%d)"
+            echo ""
+            echo "$CHANGELOG"
+            echo ""
+            tail -n +8 CHANGELOG.md
+          } > CHANGELOG_NEW.md
+          mv CHANGELOG_NEW.md CHANGELOG.md
+          
+          # Save changelog for release notes
+          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: Commit changelog
+        run: |
+          git config --local user.email "action@github.com"
+          git config --local user.name "GitHub Action"
+          git add CHANGELOG.md
+          git commit -m "Update CHANGELOG.md for v${{ steps.get_version.outputs.version }}" || exit 0
+
+      - name: Create Release
+        id: create_release
+        uses: actions/create-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          release_name: Release v${{ steps.get_version.outputs.version }}
+          body: |
+            ## Changes in v${{ steps.get_version.outputs.version }}
+            
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            
+            ## Installation
+            
+            Download the appropriate binary for your platform from the assets below.
+            
+            ### Verify checksums
+            
+            ```bash
+            # Download the manifest
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.get_version.outputs.version }}/manifest.txt
+            
+            # Verify your downloaded binary
+            sha256sum -c manifest.txt --ignore-missing
+            ```
+          draft: false
+          prerelease: false
+
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: mostro-watchdog-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: mostro-watchdog-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: mostro-watchdog-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: mostro-watchdog-macos-aarch64
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+            name: mostro-watchdog-windows-x86_64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation dependencies (Linux)
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export CC=aarch64-linux-gnu-gcc
+            export CXX=aarch64-linux-gnu-g++
+            export AR=aarch64-linux-gnu-ar
+            export STRIP=aarch64-linux-gnu-strip
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+          fi
+          cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Prepare binary
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/mostro-watchdog.exe ${{ matrix.name }}
+          else
+            cp target/${{ matrix.target }}/release/mostro-watchdog ${{ matrix.name }}
+            strip ${{ matrix.name }} || true
+          fi
+        shell: bash
+
+      - name: Generate checksum
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            certutil -hashfile ${{ matrix.name }} SHA256 > ${{ matrix.name }}.sha256
+          else
+            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          fi
+        shell: bash
+
+      - name: Upload Release Asset
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.name }}
+          asset_name: ${{ matrix.name }}
+          asset_content_type: application/octet-stream
+
+      - name: Upload Checksum
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./${{ matrix.name }}.sha256
+          asset_name: ${{ matrix.name }}.sha256
+          asset_content_type: text/plain
+
+  create-manifest:
+    name: Create Manifest
+    runs-on: ubuntu-latest
+    needs: [create-release, build]
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all checksums
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          REPO="${{ github.repository }}"
+          
+          # Download all checksum files
+          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-x86_64.sha256
+          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-aarch64.sha256
+          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-x86_64.sha256
+          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-aarch64.sha256
+          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-windows-x86_64.exe.sha256
+
+      - name: Create manifest
+        run: |
+          echo "# mostro-watchdog v${{ needs.create-release.outputs.version }} - SHA256 Checksums" > manifest.txt
+          echo "# Generated on $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> manifest.txt
+          echo "" >> manifest.txt
+          
+          # Process each checksum file
+          for file in *.sha256; do
+            if [ -f "$file" ]; then
+              # Extract just the hash and filename, normalize format
+              if grep -q "SHA256(" "$file"; then
+                # Windows certutil format: SHA256(filename)= hash
+                grep "SHA256(" "$file" | sed 's/SHA256(\([^)]*\))= \([a-f0-9]*\)/\2  \1/' >> manifest.txt
+              else
+                # Linux sha256sum format: hash  filename
+                cat "$file" >> manifest.txt
+              fi
+            fi
+          done
+
+      - name: Upload Manifest
+        uses: actions/upload-release-asset@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          asset_path: ./manifest.txt
+          asset_name: manifest.txt
+          asset_content_type: text/plain

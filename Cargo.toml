@@ -18,3 +18,15 @@ serde_json = "1"
 toml = "0.8"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[package.metadata.release]
+# Automatically create and push git tag
+tag = true
+# Push to origin
+push = true  
+# Don't publish to crates.io (this is a binary, not a library)
+publish = false
+# Pre-release hook to ensure tests pass
+pre-release-hook = ["cargo", "test"]
+# Post-release hook could be used to trigger additional actions
+# post-release-hook = ["echo", "Release completed for {{version}}"]
