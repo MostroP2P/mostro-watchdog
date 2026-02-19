@@ -63,22 +63,19 @@ jobs:
           toolchain: stable
           targets: ${{ matrix.target }}
 
-      - name: Install cross-compilation dependencies
+      - name: Install cross for cross-compilation
         if: matrix.target == 'aarch64-unknown-linux-gnu'
         run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-aarch64-linux-gnu
+          cargo install cross --git https://github.com/cross-rs/cross
 
       - name: Check compilation
         run: |
           if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
-            export CC=aarch64-linux-gnu-gcc
-            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
-            # Use vendored OpenSSL for cross-compilation to avoid dependency issues
-            export OPENSSL_STATIC=1
-            export OPENSSL_VENDOR=1
+            # Use cross for robust cross-compilation
+            cross check --target ${{ matrix.target }}
+          else
+            cargo check --target ${{ matrix.target }}
           fi
-          cargo check --target ${{ matrix.target }}
 
   security-audit:
     name: Security Audit
@@ -92,3 +89,5 @@ jobs:
 
       - name: Run security audit
         uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
