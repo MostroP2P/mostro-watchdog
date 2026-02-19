@@ -52,7 +52,7 @@ jobs:
         if: inputs.dry_run == true
         run: |
           echo "🔍 Performing dry run for ${{ inputs.level }} release..."
-          cargo release ${{ inputs.level }} --dry-run --execute
+          cargo release ${{ inputs.level }}
 
       - name: Perform release
         if: inputs.dry_run == false

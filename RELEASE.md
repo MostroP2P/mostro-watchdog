@@ -80,7 +80,11 @@ Users can verify downloaded binaries:
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/download/v0.1.1/manifest.txt
 
 # Verify your binary (example for Linux x86_64)
+# Linux/WSL
 sha256sum -c manifest.txt --ignore-missing
+
+# macOS  
+shasum -a 256 -c manifest.txt --ignore-missing
 ```
 
 ## Changelog

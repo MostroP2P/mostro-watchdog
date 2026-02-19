@@ -13,8 +13,6 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
       version: ${{ steps.get_version.outputs.version }}
     steps:
       - name: Checkout code
@@ -64,21 +62,17 @@ jobs:
           echo "$CHANGELOG" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Commit changelog
-        run: |
-          git config --local user.email "action@github.com"
-          git config --local user.name "GitHub Action"
-          git add CHANGELOG.md
-          git commit -m "Update CHANGELOG.md for v${{ steps.get_version.outputs.version }}" || exit 0
+      # Note: CHANGELOG.md updates are included in release notes but not committed 
+      # to avoid detached HEAD issues. The changelog is preserved in the release.
 
       - name: Create Release
         id: create_release
-        uses: actions/create-release@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ github.ref }}
-          release_name: Release v${{ steps.get_version.outputs.version }}
+          name: Release v${{ steps.get_version.outputs.version }}
           body: |
             ## Changes in v${{ steps.get_version.outputs.version }}
             
@@ -94,8 +88,11 @@ jobs:
             # Download the manifest
             curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.get_version.outputs.version }}/manifest.txt
             
-            # Verify your downloaded binary
+            # Linux/WSL
             sha256sum -c manifest.txt --ignore-missing
+            
+            # macOS
+            shasum -a 256 -c manifest.txt --ignore-missing
             ```
           draft: false
           prerelease: false
@@ -157,7 +154,12 @@ jobs:
             cp target/${{ matrix.target }}/release/mostro-watchdog.exe ${{ matrix.name }}
           else
             cp target/${{ matrix.target }}/release/mostro-watchdog ${{ matrix.name }}
-            strip ${{ matrix.name }} || true
+            # Use appropriate strip for target architecture
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              aarch64-linux-gnu-strip ${{ matrix.name }} || true
+            else
+              strip ${{ matrix.name }} || true
+            fi
           fi
         shell: bash
 
@@ -170,25 +172,15 @@ jobs:
           fi
         shell: bash
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.name }}
-          asset_name: ${{ matrix.name }}
-          asset_content_type: application/octet-stream
-
-      - name: Upload Checksum
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./${{ matrix.name }}.sha256
-          asset_name: ${{ matrix.name }}.sha256
-          asset_content_type: text/plain
+          tag_name: v${{ needs.create-release.outputs.version }}
+          files: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
 
   create-manifest:
     name: Create Manifest
@@ -220,8 +212,13 @@ jobs:
           for file in *.sha256; do
             if [ -f "$file" ]; then
               # Extract just the hash and filename, normalize format
-              if grep -q "SHA256(" "$file"; then
-                # Windows certutil format: SHA256(filename)= hash
+              if grep -q "SHA256 hash of" "$file"; then
+                # Windows certutil format: SHA256 hash of filename:\nhex_hash\n
+                hash=$(grep -A1 "SHA256 hash of" "$file" | tail -1 | tr -d '[:space:]')
+                filename=$(echo "$file" | sed 's/\.sha256$//')
+                echo "$hash  $filename" >> manifest.txt
+              elif grep -q "SHA256(" "$file"; then
+                # BSD/OpenSSL format: SHA256(filename)= hash  
                 grep "SHA256(" "$file" | sed 's/SHA256(\([^)]*\))= \([a-f0-9]*\)/\2  \1/' >> manifest.txt
               else
                 # Linux sha256sum format: hash  filename
@@ -231,11 +228,9 @@ jobs:
           done
 
       - name: Upload Manifest
-        uses: actions/upload-release-asset@v1
+        uses: softprops/action-gh-release@v2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./manifest.txt
-          asset_name: manifest.txt
-          asset_content_type: text/plain
+          tag_name: v${{ needs.create-release.outputs.version }}
+          files: manifest.txt

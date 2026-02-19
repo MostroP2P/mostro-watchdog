@@ -90,7 +90,11 @@ sudo mv mostro-watchdog-macos-aarch64 /usr/local/bin/mostro-watchdog
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/manifest.txt
 
 # Verify your binary
+# Linux/WSL
 sha256sum -c manifest.txt --ignore-missing
+
+# macOS
+shasum -a 256 -c manifest.txt --ignore-missing
 ```
 
 #### Option 2: Build from Source

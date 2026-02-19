@@ -93,7 +93,7 @@ cargo release patch --execute  # or minor/major
 ## Troubleshooting
 
 ### Permission Errors
-- Verify repository has "Actions: Write" permission
+- Verify repository has "Actions: Read" permission and "Contents: Write" permission
 - Check that workflows are enabled in repository settings
 
 ### Failed Cross-compilation
