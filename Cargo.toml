@@ -1,6 +1,6 @@
 [package]
 name = "mostro-watchdog"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["MostroP2P"]
 description = "Nostr-based notification bot for Mostro administrators. Monitors dispute events and sends real-time Telegram alerts."
