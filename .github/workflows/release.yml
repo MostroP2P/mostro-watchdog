@@ -92,7 +92,7 @@ jobs:
             sha256sum -c manifest.txt --ignore-missing
             
             # macOS
-            shasum -a 256 -c manifest.txt --ignore-missing
+            shasum -a 256 -c manifest.txt
             ```
           draft: false
           prerelease: false

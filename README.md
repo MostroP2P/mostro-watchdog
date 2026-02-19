@@ -94,7 +94,7 @@ curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/m
 sha256sum -c manifest.txt --ignore-missing
 
 # macOS
-shasum -a 256 -c manifest.txt --ignore-missing
+shasum -a 256 -c manifest.txt
 ```
 
 #### Option 2: Build from Source

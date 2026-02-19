@@ -76,15 +76,19 @@ Each release includes:
 Users can verify downloaded binaries:
 
 ```bash
-# Download the manifest
-curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/download/v0.1.1/manifest.txt
+# Download the manifest (replace {VERSION} with desired release, e.g., v0.1.1)
+curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/download/{VERSION}/manifest.txt
+
+# Or get the latest release programmatically:
+# LATEST=$(curl -s https://api.github.com/repos/MostroP2P/mostro-watchdog/releases/latest | grep -o '"tag_name": "[^"]*"' | cut -d'"' -f4)
+# curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/download/$LATEST/manifest.txt
 
 # Verify your binary (example for Linux x86_64)
 # Linux/WSL
 sha256sum -c manifest.txt --ignore-missing
 
 # macOS  
-shasum -a 256 -c manifest.txt --ignore-missing
+shasum -a 256 -c manifest.txt
 ```
 
 ## Changelog

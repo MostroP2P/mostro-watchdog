@@ -41,7 +41,7 @@ The workflows use:
 - **Triggers**: Tag pushes (v*.*.*)
 - **Functions**:
   - Cross-compiles for all platforms
-  - Updates `CHANGELOG.md`
+  - Changelog content included in GitHub release notes (not committed)
   - Creates GitHub release
   - Uploads binaries and checksums
   - Generates `manifest.txt`
@@ -66,13 +66,13 @@ The release workflow builds for:
    - Click "Run workflow"
 
 2. **Automatic Chain**:
-   ```
+   ```text
    cargo-release.yml → creates tag → release.yml → builds binaries
    ```
 
 3. **Result**:
    - New version in `Cargo.toml`
-   - Updated `CHANGELOG.md`
+   - Changelog content included in GitHub release notes (not committed)
    - Git tag created
    - GitHub release with binaries
    - SHA256 checksums and manifest
