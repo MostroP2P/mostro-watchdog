@@ -96,7 +96,7 @@ shasum -a 256 -c manifest.txt
 The `CHANGELOG.md` file is automatically updated with:
 - New version number and date
 - List of commits since last release
-- Proper markdown formatting
+- Proper Markdown formatting
 - Links to GitHub releases
 
 ## Configuration
@@ -135,5 +135,6 @@ If automated release fails:
 1. Manually bump version in `Cargo.toml`
 2. Commit changes: `git commit -am "Bump version to X.Y.Z"`
 3. Create tag: `git tag vX.Y.Z`
-4. Push: `git push origin vX.Y.Z`
-5. The tag push will trigger the release workflow
+4. Push commit: `git push`
+5. Push tag: `git push origin vX.Y.Z`
+6. The tag push will trigger the release workflow
