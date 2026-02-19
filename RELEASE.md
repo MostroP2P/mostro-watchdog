@@ -49,7 +49,7 @@ cargo release minor --execute
 cargo release major --execute
 
 # Dry run (preview changes)
-cargo release patch --dry-run --execute
+cargo release patch
 ```
 
 ## Supported Architectures
