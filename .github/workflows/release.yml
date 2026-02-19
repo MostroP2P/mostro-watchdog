@@ -46,21 +46,33 @@ jobs:
             echo "" >> CHANGELOG.md
           fi
           
-          # Create temporary file with new content
-          {
-            head -n 7 CHANGELOG.md
-            echo "## [v${{ steps.get_version.outputs.version }}] - $(date +%Y-%m-%d)"
-            echo ""
-            echo "$CHANGELOG"
-            echo ""
-            tail -n +8 CHANGELOG.md
-          } > CHANGELOG_NEW.md
+          # Create temporary file with robust version section detection
+          awk -v version="v${{ steps.get_version.outputs.version }}" -v date="$(date +%Y-%m-%d)" -v changelog="$CHANGELOG" '
+            /^## \[v/ && !inserted {
+              print "## [" version "] - " date
+              print ""
+              print changelog
+              print ""
+              inserted = 1
+            }
+            { print }
+            END {
+              if (!inserted) {
+                print ""
+                print "## [" version "] - " date
+                print ""
+                print changelog
+                print ""
+              }
+            }
+          ' CHANGELOG.md > CHANGELOG_NEW.md
           mv CHANGELOG_NEW.md CHANGELOG.md
           
-          # Save changelog for release notes
-          echo "CHANGELOG<<EOF" >> $GITHUB_OUTPUT
+          # Save changelog for release notes with collision-resistant delimiter
+          CHANGELOG_DELIMITER="CHANGELOG_EOF_$(date +%s)_$$"
+          echo "CHANGELOG<<${CHANGELOG_DELIMITER}" >> $GITHUB_OUTPUT
           echo "$CHANGELOG" >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
+          echo "${CHANGELOG_DELIMITER}" >> $GITHUB_OUTPUT
 
       # Note: CHANGELOG.md updates are included in release notes but not committed 
       # to avoid detached HEAD issues. The changelog is preserved in the release.
@@ -101,6 +113,7 @@ jobs:
     name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     needs: create-release
+    continue-on-error: true
     strategy:
       matrix:
         include:
@@ -186,6 +199,7 @@ jobs:
     name: Create Manifest
     runs-on: ubuntu-latest
     needs: [create-release, build]
+    if: always() && needs.create-release.result == 'success'
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -195,12 +209,21 @@ jobs:
           VERSION="${{ needs.create-release.outputs.version }}"
           REPO="${{ github.repository }}"
           
-          # Download all checksum files
-          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-x86_64.sha256
-          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-aarch64.sha256
-          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-x86_64.sha256
-          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-aarch64.sha256
-          curl -LO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-windows-x86_64.exe.sha256
+          # Download all checksum files (continue on individual failures)
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-x86_64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-aarch64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-x86_64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-aarch64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-windows-x86_64.exe.sha256 || true
+          
+          # Verify at least one checksum file exists
+          if ! ls *.sha256 1> /dev/null 2>&1; then
+            echo "ERROR: No checksum files found. All builds may have failed."
+            exit 1
+          fi
+          
+          echo "Downloaded checksums:"
+          ls -la *.sha256
 
       - name: Create manifest
         run: |
