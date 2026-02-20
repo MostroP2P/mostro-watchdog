@@ -70,8 +70,16 @@ curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/inst
 curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/install.sh | bash -s -- --install-dir ~/.local/bin
 ```
 
+> **Prefer to inspect before running?**
+>
+> ```bash
+> curl -fsSL -o install.sh https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/install.sh
+> less install.sh        # review the script
+> bash install.sh        # run after inspection
+> ```
+
 The script will:
-- ✅ Auto-detect your platform (Linux x64/ARM64, macOS Intel/Apple Silicon, Windows)
+- ✅ Auto-detect your platform (Linux x64/ARM64, macOS Intel/Apple Silicon, Windows via WSL/Git Bash/MSYS2)
 - ✅ Download the latest pre-built binary
 - ✅ Verify checksums for security
 - ✅ Install to `/usr/local/bin` (or custom directory)

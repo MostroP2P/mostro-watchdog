@@ -179,8 +179,10 @@ impl Config {
             if health.heartbeat_enabled && health.heartbeat_interval == 0 {
                 return Err("heartbeat_interval must be greater than 0".into());
             }
-            if health.relay_timeout == 0 {
-                return Err("relay_timeout must be greater than 0".into());
+            if health.check_relays && health.relay_timeout == 0 {
+                return Err(
+                    "relay_timeout must be greater than 0 when check_relays is enabled".into(),
+                );
             }
         }
 
