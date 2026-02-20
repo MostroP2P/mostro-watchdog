@@ -74,7 +74,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ## Alert Examples
 
 ### Heartbeat Notification
-```
+```text
 💓 Health Check
 
 ✅ System: Online
@@ -84,7 +84,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ```
 
 ### Event Silence Alert
-```
+```text
 ⚠️ Event Silence Alert
 
 🔕 No dispute events received for 2 hours
@@ -96,7 +96,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ```
 
 ### Relay Connection Alert
-```
+```text
 🔌 Relay Connection Alert
 
 ⚠️ Disconnected relays: 2
@@ -174,7 +174,7 @@ When `enable_http_endpoint = true`, the bot exposes a health status endpoint:
 
 The enhanced startup message now includes health monitoring status:
 
-```
+```text
 🐕 mostro-watchdog is now online and monitoring for disputes.
 
 📊 Health monitoring: enabled

@@ -3,3 +3,4 @@ config.toml
 *.swp
 *.swo
 .DS_Store
+PR_STATUS_SUMMARY.md
