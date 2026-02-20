@@ -175,6 +175,15 @@ impl Config {
             return Err("Mostro pubkey cannot be empty".into());
         }
 
+        if let Some(ref health) = config.health {
+            if health.heartbeat_enabled && health.heartbeat_interval == 0 {
+                return Err("heartbeat_interval must be greater than 0".into());
+            }
+            if health.relay_timeout == 0 {
+                return Err("relay_timeout must be greater than 0".into());
+            }
+        }
+
         Ok(config)
     }
 }

@@ -110,13 +110,11 @@ sudo mv mostro-watchdog-macos-aarch64 /usr/local/bin/mostro-watchdog
 
 **Windows:**
 ```powershell
-# Download via PowerShell (run as Administrator)
-Invoke-WebRequest -Uri "https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-windows-x86_64.exe" -OutFile "C:\Windows\System32\mostro-watchdog.exe"
-
-# Or download manually and add to PATH
-# 1. Download mostro-watchdog-windows-x86_64.exe from the releases page
-# 2. Rename to mostro-watchdog.exe
-# 3. Place in a directory that's in your PATH (e.g., C:\Windows\System32)
+# Download and install to user directory
+$UserBin = "$env:USERPROFILE\bin"
+New-Item -ItemType Directory -Force -Path $UserBin
+Invoke-WebRequest -Uri "https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-windows-x86_64.exe" -OutFile "$UserBin\mostro-watchdog.exe"
+# Add $UserBin to your PATH environment variable if not already present
 ```
 
 **Verify the download** (recommended):

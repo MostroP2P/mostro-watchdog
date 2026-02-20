@@ -90,19 +90,15 @@ impl HealthMonitor {
             .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
             .map(|d| d.as_secs());
 
-        format!(
-            r#"{{"status":"{}","uptime_seconds":{},"events_processed":{},"last_event_timestamp":{},"last_heartbeat_timestamp":{},"version":"{}"}}"#,
-            if is_healthy { "healthy" } else { "unhealthy" },
-            uptime_secs,
-            events_count,
-            last_event_ts
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            last_heartbeat_ts
-                .map(|t| t.to_string())
-                .unwrap_or_else(|| "null".to_string()),
-            VERSION
-        )
+        serde_json::json!({
+            "status": if is_healthy { "healthy" } else { "unhealthy" },
+            "uptime_seconds": uptime_secs,
+            "events_processed": events_count,
+            "last_event_timestamp": last_event_ts,
+            "last_heartbeat_timestamp": last_heartbeat_ts,
+            "version": VERSION
+        })
+        .to_string()
     }
 }
 
@@ -192,7 +188,7 @@ fn print_usage() {
 }
 
 /// Start health monitoring background tasks
-async fn start_health_tasks(
+fn start_health_tasks(
     health_monitor: Arc<HealthMonitor>,
     bot: Bot,
     chat_id: i64,
@@ -209,6 +205,7 @@ async fn start_health_tasks(
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(heartbeat_interval));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // skip the immediate first tick
 
             loop {
                 interval.tick().await;
@@ -258,8 +255,10 @@ async fn start_health_tasks(
         let threshold = health_config.event_alert_threshold;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(threshold / 2)); // Check twice as often as threshold
+            let check_period = std::cmp::max(threshold / 2, 1);
+            let mut interval = tokio::time::interval(Duration::from_secs(check_period));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // skip the immediate first tick
 
             let mut last_alert = SystemTime::UNIX_EPOCH;
 
@@ -318,24 +317,29 @@ async fn start_health_tasks(
         let client_rc = client.clone();
         let bot_rc = bot.clone();
         let relays_rc = relays.to_vec();
+        let relay_check_interval = health_config.relay_timeout;
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // Check every 5 minutes
+            let check_secs = std::cmp::max(relay_check_interval, 1) * 10; // Check every 10x the timeout (min 10s)
+            let mut interval = tokio::time::interval(Duration::from_secs(check_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await; // skip first immediate tick to allow connections to establish
 
             loop {
                 interval.tick().await;
 
-                let relay_stats = client_rc.relay_pool().stats().await;
                 let mut failed_relays = Vec::new();
 
-                for relay_url in &relays_rc {
-                    if let Some(stat) = relay_stats.get(relay_url) {
-                        if stat.status() != nostr_sdk::relay::RelayStatus::Connected {
-                            failed_relays.push(relay_url.clone());
+                for relay_url_str in &relays_rc {
+                    match client_rc.pool().relay(relay_url_str).await {
+                        Ok(relay) => {
+                            if relay.status() != RelayStatus::Connected {
+                                failed_relays.push(relay_url_str.clone());
+                            }
                         }
-                    } else {
-                        failed_relays.push(relay_url.clone());
+                        Err(_) => {
+                            failed_relays.push(relay_url_str.clone());
+                        }
                     }
                 }
 
@@ -362,12 +366,7 @@ async fn start_health_tasks(
                         );
                     }
 
-                    // Attempt to reconnect failed relays
-                    for relay_url in &failed_relays {
-                        if let Err(e) = client_rc.add_relay(relay_url).await {
-                            error!("Failed to reconnect to relay {}: {}", relay_url, e);
-                        }
-                    }
+                    // Attempt to reconnect all failed/terminated relays
                     client_rc.connect().await;
                 }
             }
@@ -392,14 +391,16 @@ async fn start_health_server(
     health_monitor: Arc<HealthMonitor>,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    use hyper::body::Body;
+    use http_body_util::Full;
+    use hyper::body::Bytes;
     use hyper::service::service_fn;
     use hyper::{Request, Response, StatusCode};
     use hyper_util::rt::TokioIo;
     use hyper_util::server::conn::auto::Builder;
+    use std::convert::Infallible;
     use tokio::net::TcpListener;
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     info!(
         "🌐 Health HTTP endpoint listening on http://{}/health",
@@ -407,7 +408,14 @@ async fn start_health_server(
     );
 
     loop {
-        let (stream, _) = listener.accept().await?;
+        let (stream, _) = match listener.accept().await {
+            Ok(conn) => conn,
+            Err(e) => {
+                error!("Failed to accept HTTP connection: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
+                continue;
+            }
+        };
         let health_monitor = health_monitor.clone();
 
         tokio::spawn(async move {
@@ -417,16 +425,18 @@ async fn start_health_server(
                     match req.uri().path() {
                         "/health" => {
                             let status_json = health_monitor.get_status_json().await;
-                            Ok::<Response<Body>, hyper::Error>(
+                            Ok::<Response<Full<Bytes>>, Infallible>(
                                 Response::builder()
                                     .status(StatusCode::OK)
                                     .header("Content-Type", "application/json")
-                                    .body(Body::from(status_json))?,
+                                    .body(Full::from(Bytes::from(status_json)))
+                                    .expect("valid response"),
                             )
                         }
                         _ => Ok(Response::builder()
                             .status(StatusCode::NOT_FOUND)
-                            .body(Body::from("Not Found"))?),
+                            .body(Full::from(Bytes::from("Not Found")))
+                            .expect("valid response")),
                     }
                 }
             });
@@ -509,8 +519,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &health_config,
         client.clone(),
         &config.nostr.relays,
-    )
-    .await;
+    );
 
     // Send startup notification
     let startup_msg = format!(

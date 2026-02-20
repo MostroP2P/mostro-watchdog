@@ -32,7 +32,7 @@ mostro-watchdog includes comprehensive health monitoring to ensure the system is
 ### 🌐 HTTP Health Endpoint (Optional)
 
 - **Purpose**: External monitoring integration (uptime checkers, Kubernetes probes)
-- **Endpoint**: `http://localhost:8080/health` (port configurable)
+- **Endpoint**: `http://127.0.0.1:8080/health` (port configurable)
 - **Format**: JSON response with system status
 - **Data**: uptime, events processed, last event timestamp, version
 
@@ -74,7 +74,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ## Alert Examples
 
 ### Heartbeat Notification
-```
+```text
 💓 Health Check
 
 ✅ System: Online
@@ -84,7 +84,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ```
 
 ### Event Silence Alert
-```
+```text
 ⚠️ Event Silence Alert
 
 🔕 No dispute events received for 2 hours
@@ -96,7 +96,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 ```
 
 ### Relay Connection Alert
-```
+```text
 🔌 Relay Connection Alert
 
 ⚠️ Disconnected relays: 2
@@ -109,7 +109,7 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 When `enable_http_endpoint = true`, the bot exposes a health status endpoint:
 
 ### Endpoint Details
-- **URL**: `http://0.0.0.0:<port>/health`
+- **URL**: `http://127.0.0.1:<port>/health`
 - **Method**: GET
 - **Content-Type**: application/json
 
@@ -163,7 +163,7 @@ When `enable_http_endpoint = true`, the bot exposes a health status endpoint:
 ### Memory Efficiency
 - Minimal state tracking (only essential timestamps and counters)
 - No persistent storage requirements
-- Automatic cleanup of stale data
+- Counters grow monotonically; timestamps are overwritten on each update
 
 ### Error Handling
 - Health task failures are logged but don't crash the main application
@@ -174,7 +174,7 @@ When `enable_http_endpoint = true`, the bot exposes a health status endpoint:
 
 The enhanced startup message now includes health monitoring status:
 
-```
+```text
 🐕 mostro-watchdog is now online and monitoring for disputes.
 
 📊 Health monitoring: enabled

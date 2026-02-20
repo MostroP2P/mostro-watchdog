@@ -37,8 +37,10 @@ print_error() {
 
 # Detect OS and architecture
 detect_platform() {
-    local os=$(uname -s | tr '[:upper:]' '[:lower:]')
-    local arch=$(uname -m)
+    local os
+    os=$(uname -s | tr '[:upper:]' '[:lower:]')
+    local arch
+    arch=$(uname -m)
     
     case "$os" in
         linux*)
@@ -85,7 +87,7 @@ get_latest_version() {
     print_info "Fetching latest release information..."
     
     if command -v curl >/dev/null 2>&1; then
-        LATEST_VERSION=$(curl -s "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
+        LATEST_VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
     elif command -v wget >/dev/null 2>&1; then
         LATEST_VERSION=$(wget -qO- "https://api.github.com/repos/${REPO}/releases/latest" | grep -o '"tag_name": *"[^"]*"' | grep -o '"[^"]*"$' | tr -d '"')
     else
@@ -105,15 +107,17 @@ get_latest_version() {
 download_binary() {
     local download_url="https://github.com/${REPO}/releases/download/${LATEST_VERSION}/${BINARY_NAME}"
     local checksum_url="https://github.com/${REPO}/releases/download/${LATEST_VERSION}/manifest.txt"
-    local temp_dir=$(mktemp -d)
+    local temp_dir
+    temp_dir=$(mktemp -d)
+    TEMP_DIR="$temp_dir"
     local binary_path="${temp_dir}/${BINARY_NAME}"
     local checksum_path="${temp_dir}/manifest.txt"
     
     print_info "Downloading ${BINARY_NAME}..."
     
     if command -v curl >/dev/null 2>&1; then
-        curl -L -o "$binary_path" "$download_url"
-        curl -L -o "$checksum_path" "$checksum_url"
+        curl -fSL -o "$binary_path" "$download_url"
+        curl -fSL -o "$checksum_path" "$checksum_url"
     elif command -v wget >/dev/null 2>&1; then
         wget -O "$binary_path" "$download_url"
         wget -O "$checksum_path" "$checksum_url"
@@ -134,16 +138,20 @@ download_binary() {
         if sha256sum -c manifest.txt --ignore-missing --status 2>/dev/null; then
             print_success "Checksum verification passed"
         else
-            print_warning "Checksum verification failed, but continuing installation"
+            print_error "Checksum verification failed — aborting installation"
+            exit 1
         fi
     elif command -v shasum >/dev/null 2>&1; then
         # macOS
-        local expected_checksum=$(grep "$BINARY_NAME" manifest.txt | cut -d' ' -f1)
-        local actual_checksum=$(shasum -a 256 "$BINARY_NAME" | cut -d' ' -f1)
+        local expected_checksum
+        expected_checksum=$(grep "$BINARY_NAME" manifest.txt | cut -d' ' -f1)
+        local actual_checksum
+        actual_checksum=$(shasum -a 256 "$BINARY_NAME" | cut -d' ' -f1)
         if [ "$expected_checksum" = "$actual_checksum" ]; then
             print_success "Checksum verification passed"
         else
-            print_warning "Checksum verification failed, but continuing installation"
+            print_error "Checksum verification failed — aborting installation"
+            exit 1
         fi
     else
         print_warning "No checksum tool available, skipping verification"
@@ -180,11 +188,13 @@ install_binary() {
 # Verify installation
 verify_installation() {
     if command -v "$EXECUTABLE_NAME" >/dev/null 2>&1; then
-        local version=$("$EXECUTABLE_NAME" --version 2>/dev/null || echo "unknown")
+        local version
+        version=$("$EXECUTABLE_NAME" --version 2>/dev/null || echo "unknown")
         print_success "Installation verified: $version"
         return 0
     elif [ -x "${INSTALL_DIR}/${EXECUTABLE_NAME}" ]; then
-        local version=$("${INSTALL_DIR}/${EXECUTABLE_NAME}" --version 2>/dev/null || echo "unknown")
+        local version
+        version=$("${INSTALL_DIR}/${EXECUTABLE_NAME}" --version 2>/dev/null || echo "unknown")
         print_success "Installation verified: $version"
         print_warning "Note: ${INSTALL_DIR} may not be in your PATH"
         print_info "You can run: ${INSTALL_DIR}/${EXECUTABLE_NAME}"
@@ -224,9 +234,10 @@ show_next_steps() {
 }
 
 # Cleanup
+TEMP_DIR=""
 cleanup() {
-    if [ -n "$TEMP_BINARY_PATH" ] && [ -f "$TEMP_BINARY_PATH" ]; then
-        rm -f "$TEMP_BINARY_PATH"
+    if [ -n "$TEMP_DIR" ] && [ -d "$TEMP_DIR" ]; then
+        rm -rf "$TEMP_DIR"
     fi
 }
 trap cleanup EXIT
@@ -279,5 +290,7 @@ main() {
     fi
 }
 
-# Run main function
-main "$@"
+# Run main function only when executed directly (not sourced)
+if [[ "${BASH_SOURCE[0]}" == "${0}" ]]; then
+    main "$@"
+fi
