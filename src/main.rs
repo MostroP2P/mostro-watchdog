@@ -378,9 +378,10 @@ fn start_health_tasks(
     if health_config.enable_http_endpoint {
         let health_monitor_http = health_monitor.clone();
         let http_port = health_config.http_port;
+        let http_bind = health_config.http_bind.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = start_health_server(health_monitor_http, http_port).await {
+            if let Err(e) = start_health_server(health_monitor_http, &http_bind, http_port).await {
                 error!("Health HTTP server failed: {}", e);
             }
         });
@@ -390,6 +391,7 @@ fn start_health_tasks(
 /// Start HTTP health status endpoint
 async fn start_health_server(
     health_monitor: Arc<HealthMonitor>,
+    bind: &str,
     port: u16,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use http_body_util::Full;
@@ -401,7 +403,7 @@ async fn start_health_server(
     use std::convert::Infallible;
     use tokio::net::TcpListener;
 
-    let addr = format!("127.0.0.1:{}", port);
+    let addr = format!("{}:{}", bind, port);
     let listener = TcpListener::bind(&addr).await?;
     info!(
         "🌐 Health HTTP endpoint listening on http://{}/health",

@@ -72,6 +72,10 @@ pub struct HealthConfig {
     /// HTTP endpoint port (default: 8080)
     #[serde(default = "default_http_port")]
     pub http_port: u16,
+    /// HTTP endpoint bind address (default: 127.0.0.1)
+    /// Set to "0.0.0.0" for Docker or external access
+    #[serde(default = "default_http_bind")]
+    pub http_bind: String,
 }
 
 fn default_false() -> bool {
@@ -94,6 +98,10 @@ fn default_http_port() -> u16 {
     8080
 }
 
+fn default_http_bind() -> String {
+    "127.0.0.1".to_string()
+}
+
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
@@ -104,6 +112,7 @@ impl Default for HealthConfig {
             event_alert_threshold: default_event_alert_threshold(),
             enable_http_endpoint: false,
             http_port: default_http_port(),
+            http_bind: default_http_bind(),
         }
     }
 }
