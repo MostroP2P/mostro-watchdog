@@ -75,3 +75,7 @@ enable_http_endpoint = false
 # HTTP endpoint port (default: 8080)
 # Health endpoint will be available at http://localhost:8080/health
 http_port = 8080
+
+# HTTP endpoint bind address (default: "127.0.0.1")
+# Set to "0.0.0.0" when running in Docker to allow port mapping
+# http_bind = "0.0.0.0"

@@ -1,7 +1,7 @@
 services:
   mostro-watchdog:
     build: .
-    image: mostrop2p/mostro-watchdog:latest
+    image: ghcr.io/mostrop2p/mostro-watchdog:latest
     container_name: mostro-watchdog
     restart: unless-stopped
     volumes:

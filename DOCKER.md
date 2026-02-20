@@ -60,10 +60,18 @@ docker run -d \
 
 ## Health Endpoint
 
-If you enable the HTTP health endpoint in your config, expose the port:
+To use the HTTP health endpoint in Docker, you must configure **both** `enable_http_endpoint` and `http_bind` in your `config.toml`:
+
+```toml
+[health]
+enable_http_endpoint = true
+http_bind = "0.0.0.0"   # Required for Docker — default 127.0.0.1 is not reachable from outside the container
+http_port = 8080
+```
+
+Then expose the port in `docker-compose.yml`:
 
 ```yaml
-# docker-compose.yml
 services:
   mostro-watchdog:
     # ...
@@ -82,13 +90,11 @@ docker run -d \
   ghcr.io/mostrop2p/mostro-watchdog:latest
 ```
 
-Then check:
+Check it:
 
 ```bash
 curl http://localhost:8080/health
 ```
-
-> **Note:** The health endpoint binds to `127.0.0.1` inside the container by default. If you need to expose it via Docker port mapping, set `enable_http_endpoint = true` in your config and update the bind address in the code to `0.0.0.0`, or use a reverse proxy.
 
 ## Configuration
 
