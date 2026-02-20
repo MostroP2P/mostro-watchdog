@@ -52,7 +52,8 @@ jobs:
       matrix:
         target:
           - x86_64-unknown-linux-gnu
-          - aarch64-unknown-linux-gnu
+          # TODO: Re-enable aarch64 when cross-compilation OpenSSL issues are resolved
+          # - aarch64-unknown-linux-gnu
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
