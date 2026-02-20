@@ -1,0 +1,267 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+
+      - name: Generate changelog
+        id: changelog
+        run: |
+          # Create changelog content from git log since last tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 HEAD~1 2>/dev/null || echo "")
+          if [ -z "$PREVIOUS_TAG" ]; then
+            CHANGELOG=$(git log --pretty=format:"- %s (%h)" --reverse)
+          else
+            CHANGELOG=$(git log ${PREVIOUS_TAG}..HEAD --pretty=format:"- %s (%h)" --reverse)
+          fi
+          
+          # Update CHANGELOG.md
+          if [ ! -f CHANGELOG.md ]; then
+            echo "# Changelog" > CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "All notable changes to this project will be documented in this file." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+            echo "The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/)," >> CHANGELOG.md
+            echo "and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html)." >> CHANGELOG.md
+            echo "" >> CHANGELOG.md
+          fi
+          
+          # Create temporary file with robust version section detection
+          awk -v version="v${{ steps.get_version.outputs.version }}" -v date="$(date +%Y-%m-%d)" -v changelog="$CHANGELOG" '
+            /^## \[v/ && !inserted {
+              print "## [" version "] - " date
+              print ""
+              print changelog
+              print ""
+              inserted = 1
+            }
+            { print }
+            END {
+              if (!inserted) {
+                print ""
+                print "## [" version "] - " date
+                print ""
+                print changelog
+                print ""
+              }
+            }
+          ' CHANGELOG.md > CHANGELOG_NEW.md
+          mv CHANGELOG_NEW.md CHANGELOG.md
+          
+          # Save changelog for release notes with collision-resistant delimiter
+          CHANGELOG_DELIMITER="CHANGELOG_EOF_$(date +%s)_$$"
+          echo "CHANGELOG<<${CHANGELOG_DELIMITER}" >> $GITHUB_OUTPUT
+          echo "$CHANGELOG" >> $GITHUB_OUTPUT
+          echo "${CHANGELOG_DELIMITER}" >> $GITHUB_OUTPUT
+
+      # Note: CHANGELOG.md updates are included in release notes but not committed 
+      # to avoid detached HEAD issues. The changelog is preserved in the release.
+
+      - name: Create Release
+        id: create_release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release v${{ steps.get_version.outputs.version }}
+          body: |
+            ## Changes in v${{ steps.get_version.outputs.version }}
+            
+            ${{ steps.changelog.outputs.CHANGELOG }}
+            
+            ## Installation
+            
+            Download the appropriate binary for your platform from the assets below.
+            
+            ### Verify checksums
+            
+            ```bash
+            # Download the manifest
+            curl -LO https://github.com/${{ github.repository }}/releases/download/v${{ steps.get_version.outputs.version }}/manifest.txt
+            
+            # Linux/WSL
+            sha256sum -c manifest.txt --ignore-missing
+            
+            # macOS
+            shasum -a 256 -c manifest.txt
+            ```
+          draft: false
+          prerelease: false
+
+  build:
+    name: Build for ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    needs: create-release
+    continue-on-error: true
+    strategy:
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: mostro-watchdog-linux-x86_64
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+            name: mostro-watchdog-linux-aarch64
+          - target: x86_64-apple-darwin
+            os: macos-latest
+            name: mostro-watchdog-macos-x86_64
+          - target: aarch64-apple-darwin
+            os: macos-latest
+            name: mostro-watchdog-macos-aarch64
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+            name: mostro-watchdog-windows-x86_64.exe
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: stable
+          targets: ${{ matrix.target }}
+
+      - name: Install aarch64 dependencies
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          # Enable arm64 architecture
+          sudo dpkg --add-architecture arm64
+          sudo apt-get update
+          # Install cross-compiler and OpenSSL headers for arm64
+          sudo apt-get install -y gcc-aarch64-linux-gnu libssl-dev:arm64 pkg-config
+
+      - name: Install cross-compilation toolchain (Linux ARM64)
+        if: matrix.os == 'ubuntu-latest' && matrix.target == 'aarch64-unknown-linux-gnu'
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Build binary
+        run: |
+          if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+            export OPENSSL_DIR=/usr/lib/aarch64-linux-gnu
+            export PKG_CONFIG_ALLOW_CROSS=1
+            export PKG_CONFIG_PATH=/usr/lib/aarch64-linux-gnu/pkgconfig
+          fi
+          cargo build --release --target ${{ matrix.target }}
+        shell: bash
+
+      - name: Prepare binary
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            cp target/${{ matrix.target }}/release/mostro-watchdog.exe ${{ matrix.name }}
+          else
+            cp target/${{ matrix.target }}/release/mostro-watchdog ${{ matrix.name }}
+            # Use appropriate strip for target architecture
+            if [ "${{ matrix.target }}" = "aarch64-unknown-linux-gnu" ]; then
+              aarch64-linux-gnu-strip ${{ matrix.name }} || true
+            else
+              strip ${{ matrix.name }} || true
+            fi
+          fi
+        shell: bash
+
+      - name: Generate checksum
+        run: |
+          if [ "${{ matrix.os }}" = "windows-latest" ]; then
+            certutil -hashfile ${{ matrix.name }} SHA256 > ${{ matrix.name }}.sha256
+          else
+            sha256sum ${{ matrix.name }} > ${{ matrix.name }}.sha256
+          fi
+        shell: bash
+
+      - name: Upload Release Assets
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.create-release.outputs.version }}
+          files: |
+            ${{ matrix.name }}
+            ${{ matrix.name }}.sha256
+
+  create-manifest:
+    name: Create Manifest
+    runs-on: ubuntu-latest
+    needs: [create-release, build]
+    if: always() && needs.create-release.result == 'success'
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download all checksums
+        run: |
+          VERSION="${{ needs.create-release.outputs.version }}"
+          REPO="${{ github.repository }}"
+          
+          # Download all checksum files (continue on individual failures)
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-x86_64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-linux-aarch64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-x86_64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-macos-aarch64.sha256 || true
+          curl --fail -SLO https://github.com/${REPO}/releases/download/v${VERSION}/mostro-watchdog-windows-x86_64.exe.sha256 || true
+          
+          # Verify at least one checksum file exists
+          if ! ls *.sha256 1> /dev/null 2>&1; then
+            echo "ERROR: No checksum files found. All builds may have failed."
+            exit 1
+          fi
+          
+          echo "Downloaded checksums:"
+          ls -la *.sha256
+
+      - name: Create manifest
+        run: |
+          echo "# mostro-watchdog v${{ needs.create-release.outputs.version }} - SHA256 Checksums" > manifest.txt
+          echo "# Generated on $(date -u +"%Y-%m-%d %H:%M:%S UTC")" >> manifest.txt
+          echo "" >> manifest.txt
+          
+          # Process each checksum file
+          for file in *.sha256; do
+            if [ -f "$file" ]; then
+              # Extract just the hash and filename, normalize format
+              if grep -q "SHA256 hash of" "$file"; then
+                # Windows certutil format: SHA256 hash of filename:\nhex_hash\n
+                hash=$(grep -A1 "SHA256 hash of" "$file" | tail -1 | tr -d '[:space:]')
+                filename=$(echo "$file" | sed 's/\.sha256$//')
+                echo "$hash  $filename" >> manifest.txt
+              elif grep -q "SHA256(" "$file"; then
+                # BSD/OpenSSL format: SHA256(filename)= hash  
+                grep "SHA256(" "$file" | sed 's/SHA256(\([^)]*\))= \([a-f0-9]*\)/\2  \1/' >> manifest.txt
+              else
+                # Linux sha256sum format: hash  filename
+                cat "$file" >> manifest.txt
+              fi
+            fi
+          done
+
+      - name: Upload Manifest
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: v${{ needs.create-release.outputs.version }}
+          files: manifest.txt
