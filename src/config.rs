@@ -7,6 +7,7 @@ pub struct Config {
     pub nostr: NostrConfig,
     pub telegram: TelegramConfig,
     pub alerts: Option<AlertsConfig>,
+    pub health: Option<HealthConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -44,6 +45,65 @@ impl Default for AlertsConfig {
             settled: true,
             released: true,
             other: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct HealthConfig {
+    /// Enable periodic heartbeat notifications
+    #[serde(default = "default_true")]
+    pub heartbeat_enabled: bool,
+    /// Heartbeat interval in seconds (default: 3600 = 1 hour)
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval: u64,
+    /// Check relay connections periodically
+    #[serde(default = "default_true")]
+    pub check_relays: bool,
+    /// Relay connection timeout in seconds (default: 30)
+    #[serde(default = "default_connection_timeout")]
+    pub relay_timeout: u64,
+    /// Alert if no events received for this many seconds (default: 7200 = 2 hours)
+    #[serde(default = "default_event_alert_threshold")]
+    pub event_alert_threshold: u64,
+    /// Enable optional health status endpoint
+    #[serde(default = "default_false")]
+    pub enable_http_endpoint: bool,
+    /// HTTP endpoint port (default: 8080)
+    #[serde(default = "default_http_port")]
+    pub http_port: u16,
+}
+
+fn default_false() -> bool {
+    false
+}
+
+fn default_heartbeat_interval() -> u64 {
+    3600 // 1 hour
+}
+
+fn default_connection_timeout() -> u64 {
+    30 // 30 seconds
+}
+
+fn default_event_alert_threshold() -> u64 {
+    7200 // 2 hours
+}
+
+fn default_http_port() -> u16 {
+    8080
+}
+
+impl Default for HealthConfig {
+    fn default() -> Self {
+        Self {
+            heartbeat_enabled: true,
+            heartbeat_interval: default_heartbeat_interval(),
+            check_relays: true,
+            relay_timeout: default_connection_timeout(),
+            event_alert_threshold: default_event_alert_threshold(),
+            enable_http_endpoint: false,
+            http_port: default_http_port(),
         }
     }
 }
