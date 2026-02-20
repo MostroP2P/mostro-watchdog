@@ -225,8 +225,6 @@ When a dispute is detected, you'll receive a message like:
 - [x] **Pre-built binaries for Linux, macOS, Windows** ✅ *Available now with automatic installation script*
 - [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
 - [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
-- [ ] Alert on other important Mostro events (order cancellations, expired invoices)
-- [ ] Configurable alert templates
 - [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
 
