@@ -183,10 +183,7 @@ When a dispute is detected, you'll receive a message like:
 
 ## Roadmap
 
-- [ ] Alert on dispute status changes (in-progress, resolved, etc.)
-- [ ] Alert on other important Mostro events (order cancellations, expired invoices)
-- [ ] Configurable alert templates
-- [ ] Multiple Telegram channels for different event types
+- [x] Alert on dispute status changes (in-progress, resolved, etc.)
 - [ ] Health check / heartbeat notifications
 - [ ] Docker image
 - [ ] Pre-built binaries for Linux, macOS, Windows
