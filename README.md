@@ -19,7 +19,7 @@ When a user opens a dispute on Mostro, administrators need to respond quickly. U
 
 ## How it works
 
-```
+```text
 Mostro daemon → Nostr (kind 38386) → mostro-watchdog → Telegram alert
 ```
 
@@ -162,7 +162,7 @@ Or specify it explicitly with `--config` / `-c`.
 
 When a dispute is detected, you'll receive a message like:
 
-```
+```text
 🚨 NEW DISPUTE
 
 📋 Dispute ID: abc123def456
