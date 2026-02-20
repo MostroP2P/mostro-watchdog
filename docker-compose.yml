@@ -1,0 +1,11 @@
+services:
+  mostro-watchdog:
+    build: .
+    image: mostrop2p/mostro-watchdog:latest
+    container_name: mostro-watchdog
+    restart: unless-stopped
+    volumes:
+      - ./config.toml:/config/config.toml:ro
+    # Uncomment to expose the health HTTP endpoint
+    # ports:
+    #   - "8080:8080"

@@ -142,7 +142,28 @@ shasum -a 256 -c manifest.txt
 # Get-FileHash .\mostro-watchdog-windows-x86_64.exe -Algorithm SHA256
 ```
 
-#### Option 3: Build from Source
+#### Option 3: Docker
+
+```bash
+git clone https://github.com/MostroP2P/mostro-watchdog.git
+cd mostro-watchdog
+cp config.example.toml config.toml
+# Edit config.toml with your settings
+docker compose up -d
+```
+
+Pre-built images are available from GitHub Container Registry:
+
+```bash
+docker pull ghcr.io/mostrop2p/mostro-watchdog:latest
+docker run -d --name mostro-watchdog --restart unless-stopped \
+  -v $(pwd)/config.toml:/config/config.toml:ro \
+  ghcr.io/mostrop2p/mostro-watchdog:latest
+```
+
+See [DOCKER.md](DOCKER.md) for full documentation.
+
+#### Option 4: Build from Source
 
 ```bash
 git clone https://github.com/MostroP2P/mostro-watchdog.git
