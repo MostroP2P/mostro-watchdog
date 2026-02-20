@@ -47,6 +47,7 @@ The bot monitors these dispute status changes:
 You can enable/disable specific alert types in your `config.toml`:
 
 ```toml
+```toml
 [alerts]
 initiated = true        # New disputes (recommended: true)
 in_progress = true      # Dispute taken (recommended: true)
@@ -63,7 +64,7 @@ The `[alerts]` section is **optional**. If not present, all alert types default 
 ## Alert Format Examples
 
 ### New Dispute (initiated)
-```
+```text
 🚨 NEW DISPUTE
 
 📋 Dispute ID: `abc123def456`
@@ -74,7 +75,7 @@ The `[alerts]` section is **optional**. If not present, all alert types default 
 ```
 
 ### Dispute In Progress
-```
+```text
 🔄 DISPUTE IN PROGRESS
 
 📋 Dispute ID: `abc123def456`
@@ -85,7 +86,7 @@ The `[alerts]` section is **optional**. If not present, all alert types default 
 ```
 
 ### Dispute Resolved (settled)
-```
+```text
 ✅ DISPUTE RESOLVED
 
 📋 Dispute ID: `abc123def456`
