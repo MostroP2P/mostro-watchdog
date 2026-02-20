@@ -58,30 +58,71 @@ export OPENSSL_DIR=$(brew --prefix openssl)
 
 ### Install
 
-#### Option 1: Download Pre-compiled Binary (Recommended)
+#### Option 1: Automatic Installation Script (Recommended)
+
+The easiest way to install mostro-watchdog is using our installation script:
+
+```bash
+# Download and run the installation script
+curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/install.sh | bash
+
+# Or for custom installation directory:
+curl -fsSL https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/install.sh | bash -s -- --install-dir ~/.local/bin
+```
+
+> **Prefer to inspect before running?**
+>
+> ```bash
+> curl -fsSL -o install.sh https://raw.githubusercontent.com/MostroP2P/mostro-watchdog/main/install.sh
+> less install.sh        # review the script
+> bash install.sh        # run after inspection
+> ```
+
+The script will:
+- ✅ Auto-detect your platform (Linux x64/ARM64, macOS Intel/Apple Silicon, Windows via WSL/Git Bash/MSYS2)
+- ✅ Download the latest pre-built binary
+- ✅ Verify checksums for security
+- ✅ Install to `/usr/local/bin` (or custom directory)
+- ✅ Set executable permissions
+- ✅ Provide next steps guidance
+
+#### Option 2: Manual Binary Download
 
 Download the latest binary for your platform from the [releases page](https://github.com/MostroP2P/mostro-watchdog/releases/latest):
 
+**Linux:**
 ```bash
-# Linux x86_64
+# x86_64 (Intel/AMD)
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-linux-x86_64
 chmod +x mostro-watchdog-linux-x86_64
 sudo mv mostro-watchdog-linux-x86_64 /usr/local/bin/mostro-watchdog
 
-# Linux ARM64 (Raspberry Pi, etc.)
+# ARM64 (Raspberry Pi, ARM servers)
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-linux-aarch64
 chmod +x mostro-watchdog-linux-aarch64
 sudo mv mostro-watchdog-linux-aarch64 /usr/local/bin/mostro-watchdog
+```
 
-# macOS x86_64
+**macOS:**
+```bash
+# Intel Macs
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-macos-x86_64
 chmod +x mostro-watchdog-macos-x86_64
 sudo mv mostro-watchdog-macos-x86_64 /usr/local/bin/mostro-watchdog
 
-# macOS ARM64 (Apple Silicon)
+# Apple Silicon (M1/M2/M3)
 curl -LO https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-macos-aarch64
 chmod +x mostro-watchdog-macos-aarch64
 sudo mv mostro-watchdog-macos-aarch64 /usr/local/bin/mostro-watchdog
+```
+
+**Windows:**
+```powershell
+# Download and install to user directory
+$UserBin = "$env:USERPROFILE\bin"
+New-Item -ItemType Directory -Force -Path $UserBin
+Invoke-WebRequest -Uri "https://github.com/MostroP2P/mostro-watchdog/releases/latest/download/mostro-watchdog-windows-x86_64.exe" -OutFile "$UserBin\mostro-watchdog.exe"
+# Add $UserBin to your PATH environment variable if not already present
 ```
 
 **Verify the download** (recommended):
@@ -95,9 +136,13 @@ sha256sum -c manifest.txt --ignore-missing
 
 # macOS
 shasum -a 256 -c manifest.txt
+
+# Windows (PowerShell)
+# Manual verification - compare hash from manifest.txt with:
+# Get-FileHash .\mostro-watchdog-windows-x86_64.exe -Algorithm SHA256
 ```
 
-#### Option 2: Build from Source
+#### Option 3: Build from Source
 
 ```bash
 git clone https://github.com/MostroP2P/mostro-watchdog.git
@@ -183,10 +228,11 @@ When a dispute is detected, you'll receive a message like:
 
 ## Roadmap
 
-- [x] Alert on dispute status changes (in-progress, resolved, etc.)
-- [ ] Health check / heartbeat notifications
+- [x] **Pre-built binaries for Linux, macOS, Windows** ✅ *Available now with automatic installation script*
+- [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
+- [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
+- [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
-- [ ] Pre-built binaries for Linux, macOS, Windows
 
 ## Contributing
 

@@ -224,9 +224,9 @@ fn start_health_tasks(
                      ⏰ Uptime: {} hours {} minutes\n\
                      📊 Events processed: {}\n\
                      🔔 Status: Monitoring active",
-                    uptime / 3600,
-                    (uptime % 3600) / 60,
-                    events_count
+                    escape_markdown(&(uptime / 3600).to_string()),
+                    escape_markdown(&((uptime % 3600) / 60).to_string()),
+                    escape_markdown(&events_count.to_string())
                 );
 
                 if let Err(e) = bot_hb
@@ -288,9 +288,9 @@ fn start_health_tasks(
                              • Mostro daemon status\n\
                              • Nostr relay connections\n\
                              • Network connectivity",
-                            threshold / 3600,
-                            uptime / 3600,
-                            (uptime % 3600) / 60
+                            escape_markdown(&(threshold / 3600).to_string()),
+                            escape_markdown(&(uptime / 3600).to_string()),
+                            escape_markdown(&((uptime % 3600) / 60).to_string())
                         );
 
                         if let Err(e) = bot_es
@@ -317,10 +317,11 @@ fn start_health_tasks(
         let client_rc = client.clone();
         let bot_rc = bot.clone();
         let relays_rc = relays.to_vec();
-        let relay_check_interval = health_config.relay_timeout;
+        // Derive relay check cadence from relay_timeout (check every 10x the timeout, min 10s)
+        let relay_timeout = health_config.relay_timeout;
 
         tokio::spawn(async move {
-            let check_secs = std::cmp::max(relay_check_interval, 1) * 10; // Check every 10x the timeout (min 10s)
+            let check_secs = std::cmp::max(relay_timeout, 1) * 10;
             let mut interval = tokio::time::interval(Duration::from_secs(check_secs));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             interval.tick().await; // skip first immediate tick to allow connections to establish
@@ -349,8 +350,8 @@ fn start_health_tasks(
                          ⚠️ Disconnected relays: {}\n\
                          ✅ Connected relays: {}\n\
                          🔄 Attempting reconnection\\.\\.\\.",
-                        failed_relays.len(),
-                        relays_rc.len() - failed_relays.len()
+                        escape_markdown(&failed_relays.len().to_string()),
+                        escape_markdown(&(relays_rc.len() - failed_relays.len()).to_string())
                     );
 
                     if let Err(e) = bot_rc
@@ -400,7 +401,7 @@ async fn start_health_server(
     use std::convert::Infallible;
     use tokio::net::TcpListener;
 
-    let addr = format!("0.0.0.0:{}", port);
+    let addr = format!("127.0.0.1:{}", port);
     let listener = TcpListener::bind(&addr).await?;
     info!(
         "🌐 Health HTTP endpoint listening on http://{}/health",
@@ -412,6 +413,7 @@ async fn start_health_server(
             Ok(conn) => conn,
             Err(e) => {
                 error!("Failed to accept HTTP connection: {}", e);
+                tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
             }
         };
