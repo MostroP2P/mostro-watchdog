@@ -49,3 +49,29 @@ released = true
 
 # Other/unknown status changes (default: true)
 other = true
+
+# Health check and monitoring configuration (optional)
+[health]
+# Enable periodic heartbeat notifications (default: true)
+heartbeat_enabled = true
+
+# Send heartbeat every N seconds (default: 3600 = 1 hour)
+heartbeat_interval = 3600
+
+# Check Nostr relay connections periodically (default: true)
+check_relays = true
+
+# Relay connection timeout in seconds (default: 30)
+relay_timeout = 30
+
+# Alert if no events received for N seconds (default: 7200 = 2 hours)
+# Set to 0 to disable event silence alerts
+event_alert_threshold = 7200
+
+# Enable HTTP health status endpoint (default: false)
+# Useful for external monitoring systems (uptime checkers, k8s liveness probes)
+enable_http_endpoint = false
+
+# HTTP endpoint port (default: 8080)
+# Health endpoint will be available at http://localhost:8080/health
+http_port = 8080
