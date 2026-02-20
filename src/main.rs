@@ -236,7 +236,7 @@ async fn handle_dispute_event(
                  👤 *Initiated by:* {}\n\
                  ⏰ *Time:* {}\n\n\
                  ⚡ Please take this dispute in Mostrix or your admin client\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&initiator),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
@@ -248,7 +248,7 @@ async fn handle_dispute_event(
                  👨‍⚖️ *Status:* Taken by solver\n\
                  ⏰ *Time:* {}\n\n\
                  ℹ️ Dispute is now being handled\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
@@ -259,7 +259,7 @@ async fn handle_dispute_event(
                  ✅ *Resolution:* Seller refunded\n\
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: funds returned to seller\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
@@ -270,7 +270,7 @@ async fn handle_dispute_event(
                  💸 *Resolution:* Payment to buyer\n\
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: buyer receives payment\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
@@ -281,7 +281,7 @@ async fn handle_dispute_event(
                  🤝 *Resolution:* Released by seller\n\
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: trade completed\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
@@ -292,7 +292,7 @@ async fn handle_dispute_event(
                  📊 *Status:* {}\n\
                  ⏰ *Time:* {}\n\n\
                  ℹ️ Status changed\\.",
-                escape_markdown(&dispute_id),
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&status),
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
@@ -382,4 +382,156 @@ fn escape_markdown(text: &str) -> String {
         escaped.push(c);
     }
     escaped
+}
+
+/// Escape text for use inside MarkdownV2 code spans.
+/// Only escapes backticks and backslashes since code spans protect against other formatting.
+fn escape_markdown_code(text: &str) -> String {
+    let mut escaped = String::with_capacity(text.len());
+    for c in text.chars() {
+        if c == '`' || c == '\\' {
+            escaped.push('\\');
+        }
+        escaped.push(c);
+    }
+    escaped
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use config::AlertsConfig;
+
+    #[test]
+    fn test_escape_markdown() {
+        // Test all special characters
+        assert_eq!(escape_markdown("_italic_"), "\\_italic\\_");
+        assert_eq!(escape_markdown("*bold*"), "\\*bold\\*");
+        assert_eq!(escape_markdown("[link]"), "\\[link\\]");
+        assert_eq!(escape_markdown("(paren)"), "\\(paren\\)");
+        assert_eq!(escape_markdown("~strike~"), "\\~strike\\~");
+        assert_eq!(escape_markdown("`code`"), "\\`code\\`");
+        assert_eq!(escape_markdown(">quote"), "\\>quote");
+        assert_eq!(escape_markdown("#header"), "\\#header");
+        assert_eq!(escape_markdown("+plus"), "\\+plus");
+        assert_eq!(escape_markdown("-minus"), "\\-minus");
+        assert_eq!(escape_markdown("=equals"), "\\=equals");
+        assert_eq!(escape_markdown("|pipe|"), "\\|pipe\\|");
+        assert_eq!(escape_markdown("{brace}"), "\\{brace\\}");
+        assert_eq!(escape_markdown(".dot"), "\\.dot");
+        assert_eq!(escape_markdown("!exclaim"), "\\!exclaim");
+
+        // Test complex case with special characters from CodeRabbit example
+        assert_eq!(
+            escape_markdown("test_123-abc*def"),
+            "test\\_123\\-abc\\*def"
+        );
+
+        // Test empty and normal text
+        assert_eq!(escape_markdown(""), "");
+        assert_eq!(escape_markdown("normal text"), "normal text");
+    }
+
+    #[test]
+    fn test_escape_markdown_code() {
+        // Only backticks and backslashes should be escaped in code spans
+        assert_eq!(
+            escape_markdown_code("test`with`backticks"),
+            "test\\`with\\`backticks"
+        );
+        assert_eq!(
+            escape_markdown_code("test\\with\\backslashes"),
+            "test\\\\with\\\\backslashes"
+        );
+        assert_eq!(escape_markdown_code("test`and\\both"), "test\\`and\\\\both");
+
+        // Other markdown characters should NOT be escaped in code spans
+        assert_eq!(escape_markdown_code("test_123-abc*def"), "test_123-abc*def");
+        assert_eq!(
+            escape_markdown_code("*bold* _italic_ [link]"),
+            "*bold* _italic_ [link]"
+        );
+
+        // Test empty and normal text
+        assert_eq!(escape_markdown_code(""), "");
+        assert_eq!(escape_markdown_code("normal text"), "normal text");
+    }
+
+    #[test]
+    fn test_chrono_timestamp() {
+        // Test known Unix timestamp: 1609459200 = 2021-01-01 00:00:00 UTC
+        assert_eq!(chrono_timestamp(1609459200), "2021-01-01 00:00:00 UTC");
+
+        // Test another known timestamp: 1640995200 = 2022-01-01 00:00:00 UTC
+        assert_eq!(chrono_timestamp(1640995200), "2022-01-01 00:00:00 UTC");
+
+        // Test with time: 1609459200 + 3661 = 2021-01-01 01:01:01 UTC
+        assert_eq!(chrono_timestamp(1609462861), "2021-01-01 01:01:01 UTC");
+
+        // Test leap year: 1582934400 = 2020-02-29 00:00:00 UTC (leap year)
+        assert_eq!(chrono_timestamp(1582934400), "2020-02-29 00:00:00 UTC");
+    }
+
+    #[test]
+    fn test_alerts_config_defaults() {
+        let config = AlertsConfig::default();
+        assert!(config.initiated);
+        assert!(config.in_progress);
+        assert!(config.seller_refunded);
+        assert!(config.settled);
+        assert!(config.released);
+        assert!(config.other);
+    }
+
+    #[test]
+    fn test_alert_gating_logic() {
+        let mut config = AlertsConfig::default();
+
+        // Test all enabled (default)
+        assert!(should_send_alert("initiated", &config));
+        assert!(should_send_alert("in-progress", &config));
+        assert!(should_send_alert("seller-refunded", &config));
+        assert!(should_send_alert("settled", &config));
+        assert!(should_send_alert("released", &config));
+        assert!(should_send_alert("unknown-status", &config)); // maps to other
+
+        // Test specific disabling
+        config.initiated = false;
+        assert!(!should_send_alert("initiated", &config));
+        assert!(should_send_alert("in-progress", &config)); // still enabled
+
+        config.other = false;
+        assert!(!should_send_alert("unknown-status", &config)); // maps to other
+        assert!(should_send_alert("settled", &config)); // still enabled
+    }
+
+    /// Helper function to test alert gating logic
+    /// This mirrors the logic in handle_dispute_event
+    fn should_send_alert(status: &str, alerts_config: &AlertsConfig) -> bool {
+        match status {
+            "initiated" => alerts_config.initiated,
+            "in-progress" => alerts_config.in_progress,
+            "seller-refunded" => alerts_config.seller_refunded,
+            "settled" => alerts_config.settled,
+            "released" => alerts_config.released,
+            _ => alerts_config.other,
+        }
+    }
+
+    #[test]
+    fn test_edge_cases() {
+        // Test unknown status mapping
+        let config = AlertsConfig::default();
+        assert!(should_send_alert("", &config)); // empty status maps to other
+        assert!(should_send_alert("invalid-status", &config)); // unknown status maps to other
+
+        // Test malformed events (simulated with empty strings)
+        assert_eq!(escape_markdown_code(""), "");
+        assert_eq!(chrono_timestamp(0), "1970-01-01 00:00:00 UTC"); // Unix epoch
+
+        // Test boundary conditions - backslash is NOT in escape_markdown special chars
+        assert_eq!(escape_markdown("\\"), "\\"); // backslash not escaped by escape_markdown
+        assert_eq!(escape_markdown_code("\\"), "\\\\"); // but IS escaped by escape_markdown_code
+        assert_eq!(escape_markdown_code("`"), "\\`");
+    }
 }
