@@ -161,15 +161,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Process events
+    let alerts_config = config.alerts.unwrap_or_default();
     client
         .handle_notifications(|notification| {
             let bot = bot.clone();
             let chat_id = config.telegram.chat_id;
+            let alerts_config = alerts_config.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::Custom(38386) {
-                        handle_dispute_event(&bot, chat_id, &event).await;
+                        handle_dispute_event(&bot, chat_id, &event, &alerts_config).await;
                     }
                 }
                 Ok(false) // Keep listening
@@ -180,7 +182,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn handle_dispute_event(bot: &Bot, chat_id: i64, event: &Event) {
+async fn handle_dispute_event(
+    bot: &Bot,
+    chat_id: i64,
+    event: &Event,
+    alerts_config: &config::AlertsConfig,
+) {
     let mut dispute_id = String::from("unknown");
     let mut status = String::from("unknown");
     let mut initiator = String::from("unknown");
@@ -202,22 +209,95 @@ async fn handle_dispute_event(bot: &Bot, chat_id: i64, event: &Event) {
         dispute_id, status, initiator
     );
 
-    // Only notify on new disputes (status: initiated)
-    if status != "initiated" {
-        info!("Skipping non-initiation event (status: {})", status);
+    // Check if this alert type is enabled
+    let alert_enabled = match status.as_str() {
+        "initiated" => alerts_config.initiated,
+        "in-progress" => alerts_config.in_progress,
+        "seller-refunded" => alerts_config.seller_refunded,
+        "settled" => alerts_config.settled,
+        "released" => alerts_config.released,
+        _ => alerts_config.other,
+    };
+
+    if !alert_enabled {
+        info!(
+            "Alert for status '{}' is disabled, skipping notification",
+            status
+        );
         return;
     }
 
-    let message = format!(
-        "🚨 *NEW DISPUTE*\n\n\
-         📋 *Dispute ID:* `{}`\n\
-         👤 *Initiated by:* {}\n\
-         ⏰ *Time:* {}\n\n\
-         ⚡ Please take this dispute in Mostrix or your admin client\\.",
-        escape_markdown(&dispute_id),
-        escape_markdown(&initiator),
-        escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
-    );
+    // Generate appropriate message based on status
+    let message = match status.as_str() {
+        "initiated" => {
+            format!(
+                "🚨 *NEW DISPUTE*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 👤 *Initiated by:* {}\n\
+                 ⏰ *Time:* {}\n\n\
+                 ⚡ Please take this dispute in Mostrix or your admin client\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&initiator),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+        "in-progress" => {
+            format!(
+                "🔄 *DISPUTE IN PROGRESS*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 👨‍⚖️ *Status:* Taken by solver\n\
+                 ⏰ *Time:* {}\n\n\
+                 ℹ️ Dispute is now being handled\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+        "seller-refunded" => {
+            format!(
+                "💰 *DISPUTE RESOLVED*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 ✅ *Resolution:* Seller refunded\n\
+                 ⏰ *Time:* {}\n\n\
+                 ✔️ Dispute closed: funds returned to seller\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+        "settled" => {
+            format!(
+                "✅ *DISPUTE RESOLVED*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 💸 *Resolution:* Payment to buyer\n\
+                 ⏰ *Time:* {}\n\n\
+                 ✔️ Dispute closed: buyer receives payment\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+        "released" => {
+            format!(
+                "🔓 *DISPUTE RESOLVED*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 🤝 *Resolution:* Released by seller\n\
+                 ⏰ *Time:* {}\n\n\
+                 ✔️ Dispute closed: trade completed\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+        _ => {
+            format!(
+                "📡 *DISPUTE STATUS UPDATE*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 📊 *Status:* {}\n\
+                 ⏰ *Time:* {}\n\n\
+                 ℹ️ Status changed\\.",
+                escape_markdown(&dispute_id),
+                escape_markdown(&status),
+                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+            )
+        }
+    };
 
     if let Err(e) = bot
         .send_message(ChatId(chat_id), &message)
@@ -226,7 +306,10 @@ async fn handle_dispute_event(bot: &Bot, chat_id: i64, event: &Event) {
     {
         error!("Failed to send Telegram alert: {}", e);
     } else {
-        info!("✅ Telegram alert sent for dispute {}", dispute_id);
+        info!(
+            "✅ Telegram alert sent for dispute {} (status: {})",
+            dispute_id, status
+        );
     }
 }
 

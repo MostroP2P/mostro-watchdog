@@ -6,6 +6,46 @@ pub struct Config {
     pub mostro: MostroConfig,
     pub nostr: NostrConfig,
     pub telegram: TelegramConfig,
+    pub alerts: Option<AlertsConfig>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct AlertsConfig {
+    /// Enable alerts for new disputes (status: initiated)
+    #[serde(default = "default_true")]
+    pub initiated: bool,
+    /// Enable alerts when dispute is taken (status: in-progress)
+    #[serde(default = "default_true")]
+    pub in_progress: bool,
+    /// Enable alerts when dispute is resolved with seller refund
+    #[serde(default = "default_true")]
+    pub seller_refunded: bool,
+    /// Enable alerts when dispute is settled (payment to buyer)
+    #[serde(default = "default_true")]
+    pub settled: bool,
+    /// Enable alerts when dispute is released
+    #[serde(default = "default_true")]
+    pub released: bool,
+    /// Enable alerts for unknown/other status changes
+    #[serde(default = "default_true")]
+    pub other: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+impl Default for AlertsConfig {
+    fn default() -> Self {
+        Self {
+            initiated: true,
+            in_progress: true,
+            seller_refunded: true,
+            settled: true,
+            released: true,
+            other: true,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

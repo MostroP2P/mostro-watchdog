@@ -28,3 +28,24 @@ bot_token = "123456789:ABCdefGHIjklMNOpqrsTUVwxyz"
 # 3. Visit: https://api.telegram.org/bot<YOUR_TOKEN>/getUpdates
 # 4. Find the "chat":{"id": ...} value
 chat_id = -1001234567890
+
+# Alert configuration (optional)
+# Enable/disable specific types of dispute alerts
+[alerts]
+# New disputes (default: true)
+initiated = true
+
+# Dispute taken by solver (default: true)
+in_progress = true
+
+# Dispute resolved with seller refund (default: true)
+seller_refunded = true
+
+# Dispute settled with payment to buyer (default: true)
+settled = true
+
+# Dispute released by seller (default: true)
+released = true
+
+# Other/unknown status changes (default: true)
+other = true
