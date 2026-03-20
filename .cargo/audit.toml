@@ -1,0 +1,17 @@
+# Audit configuration for cargo-audit
+# These are transitive dependencies from teloxide/nostr-sdk that we cannot directly control
+
+[advisories]
+ignore = [
+    # rsa timing sidechannel - transitive dep from nostr-sdk
+    # No patch available, low impact for our use case (not handling private RSA keys)
+    "RUSTSEC-2023-0071",
+    
+    # rustls-webpki CRL matching issue - transitive dep
+    # Limited impact, we're not using CRL validation
+    "RUSTSEC-2026-0049",
+]
+
+# Also ignore unmaintained/unsound warnings that are informational
+[informational]
+ignore = ["unmaintained", "unsound"]
