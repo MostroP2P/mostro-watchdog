@@ -1,5 +1,8 @@
 # Audit configuration for cargo-audit
 # These are transitive dependencies from teloxide/nostr-sdk that we cannot directly control
+#
+# NOTE: This file is kept for local development use. The CI uses --ignore flags
+# directly in the workflow because rustsec/audit-check action doesn't read this file.
 
 [advisories]
 ignore = [
@@ -10,6 +13,12 @@ ignore = [
     # rustls-webpki CRL matching issue - transitive dep
     # Limited impact, we're not using CRL validation
     "RUSTSEC-2026-0049",
+    
+    # unmaintained crates - transitive deps
+    "RUSTSEC-2024-0384",  # instant
+    "RUSTSEC-2024-0370",  # proc-macro-error
+    "RUSTSEC-2025-0134",  # rustls-pemfile
+    "RUSTSEC-2026-0002",  # lru
 ]
 
 # Also ignore unmaintained/unsound warnings that are informational
