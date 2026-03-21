@@ -37,3 +37,7 @@ publish = false
 pre-release-hook = ["cargo", "test"]
 # Post-release hook could be used to trigger additional actions
 # post-release-hook = ["echo", "Release completed for {{version}}"]
+
+[profile.release]
+strip = true
+lto = true
