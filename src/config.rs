@@ -51,8 +51,8 @@ impl Default for AlertsConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct HealthConfig {
-    /// Enable periodic heartbeat notifications
-    #[serde(default = "default_true")]
+    /// Enable periodic heartbeat notifications (disabled by default to avoid flooding the chat)
+    #[serde(default = "default_false")]
     pub heartbeat_enabled: bool,
     /// Heartbeat interval in seconds (default: 3600 = 1 hour)
     #[serde(default = "default_heartbeat_interval")]
@@ -105,7 +105,7 @@ fn default_http_bind() -> String {
 impl Default for HealthConfig {
     fn default() -> Self {
         Self {
-            heartbeat_enabled: true,
+            heartbeat_enabled: false,
             heartbeat_interval: default_heartbeat_interval(),
             check_relays: true,
             relay_timeout: default_connection_timeout(),

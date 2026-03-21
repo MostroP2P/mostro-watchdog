@@ -52,8 +52,9 @@ other = true
 
 # Health check and monitoring configuration (optional)
 [health]
-# Enable periodic heartbeat notifications (default: true)
-heartbeat_enabled = true
+# Enable periodic heartbeat notifications (default: false)
+# Set to true if you want hourly "system online" messages in your chat
+heartbeat_enabled = false
 
 # Send heartbeat every N seconds (default: 3600 = 1 hour)
 heartbeat_interval = 3600

@@ -1148,7 +1148,7 @@ mod tests {
     fn test_health_config_defaults() {
         let config = config::HealthConfig::default();
 
-        assert!(config.heartbeat_enabled);
+        assert!(!config.heartbeat_enabled); // Disabled by default to avoid flooding chat
         assert_eq!(config.heartbeat_interval, 3600); // 1 hour
         assert!(config.check_relays);
         assert_eq!(config.relay_timeout, 30);
