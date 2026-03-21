@@ -3,12 +3,15 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use teloxide::prelude::*;
+use teloxide::types::MessageId;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 mod config;
+mod db;
 
 use config::Config;
+use db::DisputeMessageStore;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -524,6 +527,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         &config.nostr.relays,
     );
 
+    // Initialize dispute message store
+    let db_path = config_path
+        .parent()
+        .unwrap_or(std::path::Path::new("."))
+        .join("disputes.db");
+    let dispute_store = Arc::new(
+        DisputeMessageStore::new(&db_path)
+            .await
+            .expect("Failed to initialize dispute message store"),
+    );
+
     // Send startup notification
     let startup_msg = format!(
         "🐕 *mostro\\-watchdog* is now online and monitoring for disputes\\.\n\n\
@@ -559,12 +573,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let chat_id = config.telegram.chat_id;
             let alerts_config = alerts_config.clone();
             let health_monitor = health_monitor.clone();
+            let dispute_store = dispute_store.clone();
 
             async move {
                 if let RelayPoolNotification::Event { event, .. } = notification {
                     if event.kind == Kind::Custom(38386) {
                         health_monitor.record_event().await;
-                        handle_dispute_event(&bot, chat_id, &event, &alerts_config).await;
+                        handle_dispute_event(&bot, chat_id, &event, &alerts_config, &dispute_store)
+                            .await;
                     }
                 }
                 Ok(false) // Keep listening
@@ -580,10 +596,12 @@ async fn handle_dispute_event(
     chat_id: i64,
     event: &Event,
     alerts_config: &config::AlertsConfig,
+    dispute_store: &DisputeMessageStore,
 ) {
     let mut dispute_id = String::from("unknown");
     let mut status = String::from("unknown");
     let mut initiator = String::from("unknown");
+    let mut solver_pubkey: Option<String> = None;
 
     for tag in event.tags.iter() {
         let tag_vec: Vec<String> = tag.as_slice().iter().map(|s| s.to_string()).collect();
@@ -592,6 +610,7 @@ async fn handle_dispute_event(
                 "d" => dispute_id = tag_vec[1].clone(),
                 "s" => status = tag_vec[1].clone(),
                 "initiator" => initiator = tag_vec[1].clone(),
+                "solver" => solver_pubkey = Some(tag_vec[1].clone()),
                 _ => {}
             }
         }
@@ -620,6 +639,36 @@ async fn handle_dispute_event(
         return;
     }
 
+    // Check if we have an existing message for this dispute
+    let existing_message = match dispute_store.get_message_id(&dispute_id).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to query dispute store: {}", e);
+            None
+        }
+    };
+
+    // Handle cooperative cancellation: delete the message
+    if status == "canceled" {
+        if let Some((message_id, stored_chat_id)) = existing_message {
+            if let Err(e) = bot
+                .delete_message(ChatId(stored_chat_id), MessageId(message_id))
+                .await
+            {
+                warn!("Failed to delete dispute message: {}", e);
+            } else {
+                info!(
+                    "🗑️ Deleted dispute message for {} (cooperative cancel)",
+                    dispute_id
+                );
+            }
+            if let Err(e) = dispute_store.delete(&dispute_id).await {
+                error!("Failed to remove dispute from store: {}", e);
+            }
+        }
+        return;
+    }
+
     // Generate appropriate message based on status
     let message = match status.as_str() {
         "initiated" => {
@@ -635,41 +684,53 @@ async fn handle_dispute_event(
             )
         }
         "in-progress" => {
+            let solver_info = solver_pubkey
+                .as_ref()
+                .map(|pk| format!("\n👨‍⚖️ *Taken by:* `{}`", escape_markdown_code(pk)))
+                .unwrap_or_default();
             format!(
                 "🔄 *DISPUTE IN PROGRESS*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 👨‍⚖️ *Status:* Taken by solver\n\
+                 📋 *Dispute ID:* `{}`{}\n\
                  ⏰ *Time:* {}\n\n\
                  ℹ️ Dispute is now being handled\\.",
                 escape_markdown_code(&dispute_id),
+                solver_info,
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
         "seller-refunded" => {
+            let solver_info = solver_pubkey
+                .as_ref()
+                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
+                .unwrap_or_default();
             format!(
-                "💰 *DISPUTE RESOLVED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 ✅ *Resolution:* Seller refunded\n\
+                "💰 *DISPUTE RESOLVED \\- SELLER REFUNDED*\n\n\
+                 📋 *Dispute ID:* `{}`{}\n\
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: funds returned to seller\\.",
                 escape_markdown_code(&dispute_id),
+                solver_info,
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
         "settled" => {
+            let solver_info = solver_pubkey
+                .as_ref()
+                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
+                .unwrap_or_default();
             format!(
-                "✅ *DISPUTE RESOLVED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 💸 *Resolution:* Payment to buyer\n\
+                "✅ *DISPUTE RESOLVED \\- SETTLED*\n\n\
+                 📋 *Dispute ID:* `{}`{}\n\
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: buyer receives payment\\.",
                 escape_markdown_code(&dispute_id),
+                solver_info,
                 escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
             )
         }
         "released" => {
             format!(
-                "🔓 *DISPUTE RESOLVED*\n\n\
+                "🔓 *DISPUTE RESOLVED \\- RELEASED*\n\n\
                  📋 *Dispute ID:* `{}`\n\
                  🤝 *Resolution:* Released by seller\n\
                  ⏰ *Time:* {}\n\n\
@@ -692,17 +753,72 @@ async fn handle_dispute_event(
         }
     };
 
-    if let Err(e) = bot
-        .send_message(ChatId(chat_id), &message)
+    // If we have an existing message, update it; otherwise send a new one
+    if let Some((message_id, stored_chat_id)) = existing_message {
+        // Update existing message
+        match bot
+            .edit_message_text(ChatId(stored_chat_id), MessageId(message_id), &message)
+            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+            .await
+        {
+            Ok(_) => {
+                info!(
+                    "✏️ Updated dispute message for {} (status: {})",
+                    dispute_id, status
+                );
+                if let Err(e) = dispute_store.update_status(&dispute_id, &status).await {
+                    error!("Failed to update dispute status in store: {}", e);
+                }
+            }
+            Err(e) => {
+                // If edit fails (e.g., message deleted), send a new one
+                warn!("Failed to edit message, sending new one: {}", e);
+                send_new_dispute_message(
+                    bot,
+                    chat_id,
+                    &dispute_id,
+                    &status,
+                    &message,
+                    dispute_store,
+                )
+                .await;
+            }
+        }
+    } else {
+        // Send new message
+        send_new_dispute_message(bot, chat_id, &dispute_id, &status, &message, dispute_store).await;
+    }
+}
+
+async fn send_new_dispute_message(
+    bot: &Bot,
+    chat_id: i64,
+    dispute_id: &str,
+    status: &str,
+    message: &str,
+    dispute_store: &DisputeMessageStore,
+) {
+    match bot
+        .send_message(ChatId(chat_id), message)
         .parse_mode(teloxide::types::ParseMode::MarkdownV2)
         .await
     {
-        error!("Failed to send Telegram alert: {}", e);
-    } else {
-        info!(
-            "✅ Telegram alert sent for dispute {} (status: {})",
-            dispute_id, status
-        );
+        Ok(sent_message) => {
+            info!(
+                "✅ Telegram alert sent for dispute {} (status: {})",
+                dispute_id, status
+            );
+            // Store the message ID for future updates
+            if let Err(e) = dispute_store
+                .insert(dispute_id, sent_message.id.0, chat_id, status)
+                .await
+            {
+                error!("Failed to store dispute message ID: {}", e);
+            }
+        }
+        Err(e) => {
+            error!("Failed to send Telegram alert: {}", e);
+        }
     }
 }
 
