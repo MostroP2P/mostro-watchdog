@@ -20,7 +20,4 @@ ignore = [
     "RUSTSEC-2025-0134",  # rustls-pemfile
     "RUSTSEC-2026-0002",  # lru
 ]
-
-# Also ignore unmaintained/unsound warnings that are informational
-[informational]
-ignore = ["unmaintained", "unsound"]
+informational_warnings = ["unmaintained", "unsound"]
