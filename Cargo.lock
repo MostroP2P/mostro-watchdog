@@ -1398,7 +1398,7 @@ dependencies = [
 
 [[package]]
 name = "mostro-watchdog"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "http-body-util",
  "hyper 1.8.1",
