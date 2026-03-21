@@ -541,17 +541,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Send startup notification
     let startup_msg = format!(
         "🐕 *mostro\\-watchdog* is now online and monitoring for disputes\\.\n\n\
-         📊 Health monitoring: {}\n\
-         ⏰ Heartbeat interval: {} seconds\n\
-         🔔 Event silence alert: {} seconds",
+         📊 Heartbeat: {}\n\
+         🔔 Event silence alert: {}",
         if health_config.heartbeat_enabled {
-            "enabled"
+            format!("every {} seconds", health_config.heartbeat_interval)
         } else {
-            "disabled"
+            "disabled".to_string()
         },
-        health_config.heartbeat_interval,
         if health_config.event_alert_threshold > 0 {
-            health_config.event_alert_threshold.to_string()
+            format!("{} seconds", health_config.event_alert_threshold)
         } else {
             "disabled".to_string()
         }
