@@ -10,6 +10,9 @@ keywords = ["nostr", "mostro", "telegram", "bot", "notifications"]
 categories = ["command-line-utilities"]
 
 [dependencies]
+# Use vendored OpenSSL for cross-compilation (ARM64)
+openssl = { version = "0.10", features = ["vendored"] }
+
 nostr-sdk = "0.37"
 teloxide = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
