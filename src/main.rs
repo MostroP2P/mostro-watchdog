@@ -348,12 +348,19 @@ fn start_health_tasks(
                 }
 
                 if !failed_relays.is_empty() {
+                    let failed_list: String = failed_relays
+                        .iter()
+                        .map(|url| format!("  • {}", escape_markdown(url)))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+
                     let alert_msg = format!(
                         "🔌 *Relay Connection Alert*\n\n\
-                         ⚠️ Disconnected relays: {}\n\
+                         ⚠️ Disconnected relays: {}\n{}\n\
                          ✅ Connected relays: {}\n\
                          🔄 Attempting reconnection\\.\\.\\.",
                         escape_markdown(&failed_relays.len().to_string()),
+                        failed_list,
                         escape_markdown(&(relays_rc.len() - failed_relays.len()).to_string())
                     );
 
