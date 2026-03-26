@@ -59,6 +59,8 @@ async fn swap_relays(
     new_relays: &[String],
     mostro_pubkey: PublicKey,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let swap_time = Timestamp::now();
+
     client.force_remove_all_relays().await?;
 
     for relay in new_relays {
@@ -70,7 +72,7 @@ async fn swap_relays(
     let dispute_filter = Filter::new()
         .kind(Kind::Custom(38386))
         .author(mostro_pubkey)
-        .since(Timestamp::now());
+        .since(swap_time);
 
     client.subscribe(vec![dispute_filter], None).await?;
 
