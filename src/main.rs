@@ -29,8 +29,8 @@ async fn fetch_nip65_relays(client: &Client, pubkey: PublicKey) -> Option<Vec<St
         .await
         .ok()?;
 
-    // Get the most recent event
-    let event = events.into_iter().next()?;
+    // Get the most recent event by created_at
+    let event = events.into_iter().max_by_key(|e| e.created_at)?;
 
     let relays: Vec<String> = event
         .tags
