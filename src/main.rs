@@ -15,6 +15,70 @@ use db::DisputeMessageStore;
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
+type ActiveRelays = Arc<RwLock<Vec<String>>>;
+
+/// Fetch NIP-65 (kind 10002) relay list metadata from a pubkey via the connected relays.
+/// Returns the list of relay URLs if a kind 10002 event is found, or None.
+async fn fetch_nip65_relays(client: &Client, pubkey: PublicKey) -> Option<Vec<String>> {
+    let filter = Filter::new().kind(Kind::RelayList).author(pubkey).limit(1);
+
+    let timeout = Duration::from_secs(15);
+    let events = client
+        .fetch_events(vec![filter], Some(timeout))
+        .await
+        .ok()?;
+
+    // Get the most recent event by created_at
+    let event = events.into_iter().max_by_key(|e| e.created_at)?;
+
+    let relays: Vec<String> = event
+        .tags
+        .iter()
+        .filter_map(|tag| {
+            let values: Vec<String> = tag.as_slice().iter().map(|s| s.to_string()).collect();
+            if values.first().map(|s| s.as_str()) == Some("r") && values.len() >= 2 {
+                Some(values[1].clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    if relays.is_empty() {
+        None
+    } else {
+        Some(relays)
+    }
+}
+
+/// Swap the client's relays: remove all current relays, add new ones, connect, and re-subscribe.
+/// Returns Ok(()) on success.
+async fn swap_relays(
+    client: &Client,
+    new_relays: &[String],
+    mostro_pubkey: PublicKey,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let swap_time = Timestamp::now();
+
+    client.force_remove_all_relays().await?;
+
+    for relay in new_relays {
+        client.add_relay(relay).await?;
+    }
+
+    client.connect().await;
+
+    let dispute_filter = Filter::new()
+        .kind(Kind::Custom(38386))
+        .author(mostro_pubkey)
+        .since(swap_time);
+
+    client.subscribe(vec![dispute_filter], None).await?;
+
+    Ok(())
+}
+
 /// Health monitor to track system status and send periodic heartbeats
 #[derive(Debug, Clone)]
 struct HealthMonitor {
@@ -190,6 +254,98 @@ fn print_usage() {
     );
 }
 
+/// Start the NIP-65 relay discovery background task.
+/// On first run, fetches the kind 10002 event and swaps relays if found.
+/// Then re-fetches periodically every `refresh_interval` seconds.
+fn start_nip65_task(
+    client: Client,
+    bot: Bot,
+    chat_id: i64,
+    mostro_pubkey: PublicKey,
+    bootstrap_relays: Vec<String>,
+    active_relays: ActiveRelays,
+    refresh_interval: u64,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(Duration::from_secs(refresh_interval));
+        // Run immediately on first tick
+        loop {
+            interval.tick().await;
+
+            info!("🔍 Fetching NIP-65 relay list for Mostro pubkey...");
+
+            match fetch_nip65_relays(&client, mostro_pubkey).await {
+                Some(discovered) => {
+                    let current = active_relays.read().await.clone();
+
+                    let mut sorted_current = current.clone();
+                    sorted_current.sort();
+                    let mut sorted_discovered = discovered.clone();
+                    sorted_discovered.sort();
+
+                    if sorted_current == sorted_discovered {
+                        info!("NIP-65 relay list unchanged ({} relays)", discovered.len());
+                        continue;
+                    }
+
+                    info!(
+                        "NIP-65 relay list changed: {} -> {} relays",
+                        current.len(),
+                        discovered.len()
+                    );
+
+                    match swap_relays(&client, &discovered, mostro_pubkey).await {
+                        Ok(()) => {
+                            *active_relays.write().await = discovered.clone();
+
+                            // Build Telegram notification
+                            let relay_list: String = discovered
+                                .iter()
+                                .map(|url| format!("  • {}", escape_markdown(url)))
+                                .collect::<Vec<_>>()
+                                .join("\n");
+
+                            let msg = format!(
+                                "🔄 *Relay List Updated \\(NIP\\-65\\)*\n\n\
+                                 📡 Now monitoring {} relay\\(s\\):\n{}\n\n\
+                                 ℹ️ Discovered from Mostro's kind 10002 event\\.",
+                                escape_markdown(&discovered.len().to_string()),
+                                relay_list,
+                            );
+
+                            if let Err(e) = bot
+                                .send_message(ChatId(chat_id), &msg)
+                                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                                .await
+                            {
+                                error!("Failed to send relay update notification: {}", e);
+                            }
+
+                            info!("✅ Switched to NIP-65 discovered relays: {:?}", discovered);
+                        }
+                        Err(e) => {
+                            error!("Failed to swap to NIP-65 relays: {}", e);
+                        }
+                    }
+                }
+                None => {
+                    let current = active_relays.read().await.clone();
+                    if current == bootstrap_relays {
+                        warn!(
+                            "No NIP-65 relay list found for Mostro pubkey. Using bootstrap relays as fallback."
+                        );
+                    } else {
+                        info!(
+                            "No NIP-65 relay list found. Keeping current discovered relays ({} relays).",
+                            current.len()
+                        );
+                    }
+                }
+            }
+        }
+    });
+}
+
 /// Start health monitoring background tasks
 fn start_health_tasks(
     health_monitor: Arc<HealthMonitor>,
@@ -197,7 +353,7 @@ fn start_health_tasks(
     chat_id: i64,
     health_config: &config::HealthConfig,
     client: Client,
-    relays: &[String],
+    active_relays: ActiveRelays,
 ) {
     // Heartbeat task
     if health_config.heartbeat_enabled {
@@ -319,7 +475,7 @@ fn start_health_tasks(
     if health_config.check_relays {
         let client_rc = client.clone();
         let bot_rc = bot.clone();
-        let relays_rc = relays.to_vec();
+        let active_relays_rc = active_relays.clone();
         // Derive relay check cadence from relay_timeout (check every 10x the timeout, min 10s)
         let relay_timeout = health_config.relay_timeout;
 
@@ -332,9 +488,10 @@ fn start_health_tasks(
             loop {
                 interval.tick().await;
 
+                let relays = active_relays_rc.read().await.clone();
                 let mut failed_relays = Vec::new();
 
-                for relay_url_str in &relays_rc {
+                for relay_url_str in &relays {
                     match client_rc.pool().relay(relay_url_str).await {
                         Ok(relay) => {
                             if relay.status() != RelayStatus::Connected {
@@ -361,7 +518,7 @@ fn start_health_tasks(
                          🔄 Attempting reconnection\\.\\.\\.",
                         escape_markdown(&failed_relays.len().to_string()),
                         failed_list,
-                        escape_markdown(&(relays_rc.len() - failed_relays.len()).to_string())
+                        escape_markdown(&(relays.len() - failed_relays.len()).to_string())
                     );
 
                     if let Err(e) = bot_rc
@@ -496,16 +653,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
 
-    // Initialize Nostr client
+    // Initialize Nostr client with bootstrap relays
     let client = Client::default();
 
     for relay in &config.nostr.relays {
-        info!("Adding relay: {}", relay);
+        info!("Adding bootstrap relay: {}", relay);
         client.add_relay(relay).await?;
     }
 
     client.connect().await;
-    info!("Connected to {} relay(s)", config.nostr.relays.len());
+    info!(
+        "Connected to {} bootstrap relay(s)",
+        config.nostr.relays.len()
+    );
 
     // Subscribe to dispute events (kind 38386) from the configured Mostro pubkey
     let mostro_pubkey = PublicKey::from_bech32(&config.mostro.pubkey)
@@ -518,7 +678,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     client.subscribe(vec![dispute_filter], None).await?;
 
-    info!("🔍 Subscribed to dispute events. Watching...");
+    info!("🔍 Subscribed to dispute events on bootstrap relays. Watching...");
+
+    // Shared state: active relays (starts with bootstrap, updated by NIP-65 discovery)
+    let active_relays: ActiveRelays = Arc::new(RwLock::new(config.nostr.relays.clone()));
+
+    // Start NIP-65 relay discovery background task
+    start_nip65_task(
+        client.clone(),
+        bot.clone(),
+        config.telegram.chat_id,
+        mostro_pubkey,
+        config.nostr.relays.clone(),
+        active_relays.clone(),
+        config.nostr.nip65_refresh_interval,
+    );
 
     // Initialize health monitor
     let health_monitor = Arc::new(HealthMonitor::new());
@@ -531,7 +705,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.telegram.chat_id,
         &health_config,
         client.clone(),
-        &config.nostr.relays,
+        active_relays.clone(),
     );
 
     // Initialize dispute message store

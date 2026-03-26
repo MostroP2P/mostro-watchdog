@@ -125,8 +125,15 @@ pub struct MostroConfig {
 
 #[derive(Debug, Deserialize)]
 pub struct NostrConfig {
-    /// List of Nostr relay URLs to connect to
+    /// List of Nostr relay URLs used as bootstrap to discover Mostro's NIP-65 relay list
     pub relays: Vec<String>,
+    /// How often (in seconds) to re-fetch the NIP-65 relay list (default: 7200 = 2 hours)
+    #[serde(default = "default_nip65_refresh_interval")]
+    pub nip65_refresh_interval: u64,
+}
+
+fn default_nip65_refresh_interval() -> u64 {
+    7200 // 2 hours
 }
 
 #[derive(Debug, Deserialize)]
@@ -182,6 +189,10 @@ impl Config {
 
         if config.mostro.pubkey.is_empty() {
             return Err("Mostro pubkey cannot be empty".into());
+        }
+
+        if config.nostr.nip65_refresh_interval == 0 {
+            return Err("nip65_refresh_interval must be greater than 0".into());
         }
 
         if let Some(ref health) = config.health {
