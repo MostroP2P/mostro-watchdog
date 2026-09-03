@@ -54,6 +54,8 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 | `src/main.rs` | Entry point, Nostr subscription, event handling, health tasks, Telegram formatting |
 | `src/config.rs` | TOML configuration parsing and validation |
 | `src/db.rs` | SQLite store that maps disputes to sent Telegram messages |
+| `src/version.rs` | Version and commit reporting for the CLI and the `/version` command |
+| `build.rs` | Embeds the git commit hash at build time |
 | `config.example.toml` | Documented configuration template |
 | `.github/workflows/` | CI, Docker, and release pipelines |
 | `*.md` | Feature and operations documentation |
@@ -121,6 +123,10 @@ erode the signal admins rely on.
 The deliberate exceptions are the startup message, which is sent
 unconditionally on every launch, and the heartbeat, which is off by default and
 enabled with `heartbeat_enabled`.
+
+For the same reason, bot commands such as `/version` are answered in private
+chats only. `is_answerable_chat` enforces this; a command sent in a group or
+channel is logged and dropped. Any new command must go through that check.
 
 ### Telegram MarkdownV2 escaping
 

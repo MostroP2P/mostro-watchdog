@@ -7,8 +7,13 @@ RUN apt-get update && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /build
-COPY Cargo.toml Cargo.lock ./
+COPY Cargo.toml Cargo.lock build.rs ./
 COPY src/ src/
+
+# The build context has no .git directory, so pass the commit hash explicitly to
+# have `/version` report it: docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD)
+ARG GIT_COMMIT
+ENV MOSTRO_WATCHDOG_GIT_COMMIT=$GIT_COMMIT
 
 RUN cargo build --release && \
     strip target/release/mostro-watchdog
