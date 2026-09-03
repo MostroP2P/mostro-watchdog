@@ -335,13 +335,14 @@ fn start_health_tasks(
                 let mut failed_relays = Vec::new();
 
                 for relay_url_str in &relays_rc {
-                    match client_rc.pool().relay(relay_url_str).await {
-                        Ok(relay) => {
+                    match client_rc.relay(relay_url_str).await {
+                        Ok(Some(relay)) => {
                             if relay.status() != RelayStatus::Connected {
                                 failed_relays.push(relay_url_str.clone());
                             }
                         }
-                        Err(_) => {
+                        // Unknown to the pool or an invalid URL: treat as disconnected.
+                        Ok(None) | Err(_) => {
                             failed_relays.push(relay_url_str.clone());
                         }
                     }
@@ -516,7 +517,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .author(mostro_pubkey)
         .since(Timestamp::now());
 
-    client.subscribe(vec![dispute_filter], None).await?;
+    // Open the notification stream *before* subscribing: it only delivers what arrives
+    // after this call, so events received while the rest of the startup runs would
+    // otherwise be lost.
+    let mut notifications = client.notifications();
+
+    client.subscribe(dispute_filter).await?;
 
     info!("🔍 Subscribed to dispute events. Watching...");
 
@@ -572,26 +578,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Process events
     let alerts_config = config.alerts.unwrap_or_default();
-    client
-        .handle_notifications(|notification| {
-            let bot = bot.clone();
-            let chat_id = config.telegram.chat_id;
-            let alerts_config = alerts_config.clone();
-            let health_monitor = health_monitor.clone();
-            let dispute_store = dispute_store.clone();
+    let chat_id = config.telegram.chat_id;
 
-            async move {
-                if let RelayPoolNotification::Event { event, .. } = notification {
-                    if event.kind == Kind::Custom(38386) {
-                        health_monitor.record_event().await;
-                        handle_dispute_event(&bot, chat_id, &event, &alerts_config, &dispute_store)
-                            .await;
-                    }
+    // `Client::handle_notifications` was removed in nostr-sdk 0.45: notifications are
+    // now consumed as a stream, which ends when the client shuts down.
+    while let Some(notification) = notifications.next().await {
+        match notification {
+            ClientNotification::Event { event, .. } => {
+                if event.kind == Kind::Custom(38386) {
+                    health_monitor.record_event().await;
+                    handle_dispute_event(&bot, chat_id, &event, &alerts_config, &dispute_store)
+                        .await;
                 }
-                Ok(false) // Keep listening
             }
-        })
-        .await?;
+            ClientNotification::Shutdown => {
+                info!("Nostr client shut down, stopping event loop");
+                break;
+            }
+            ClientNotification::Message { .. } => {}
+        }
+    }
 
     Ok(())
 }
@@ -685,7 +691,7 @@ async fn handle_dispute_event(
                  ⚡ Please take this dispute in Mostrix or your admin client\\.",
                 escape_markdown_code(&dispute_id),
                 escape_markdown(&initiator),
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
         "in-progress" => {
@@ -700,7 +706,7 @@ async fn handle_dispute_event(
                  ℹ️ Dispute is now being handled\\.",
                 escape_markdown_code(&dispute_id),
                 solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
         "seller-refunded" => {
@@ -715,7 +721,7 @@ async fn handle_dispute_event(
                  ✔️ Dispute closed: funds returned to seller\\.",
                 escape_markdown_code(&dispute_id),
                 solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
         "settled" => {
@@ -730,7 +736,7 @@ async fn handle_dispute_event(
                  ✔️ Dispute closed: buyer receives payment\\.",
                 escape_markdown_code(&dispute_id),
                 solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
         "released" => {
@@ -741,7 +747,7 @@ async fn handle_dispute_event(
                  ⏰ *Time:* {}\n\n\
                  ✔️ Dispute closed: trade completed\\.",
                 escape_markdown_code(&dispute_id),
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
         _ => {
@@ -753,7 +759,7 @@ async fn handle_dispute_event(
                  ℹ️ Status changed\\.",
                 escape_markdown_code(&dispute_id),
                 escape_markdown(&status),
-                escape_markdown(&chrono_timestamp(event.created_at.as_u64())),
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
     };
