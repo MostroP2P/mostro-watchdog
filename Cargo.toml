@@ -10,7 +10,7 @@ keywords = ["nostr", "mostro", "telegram", "bot", "notifications"]
 categories = ["command-line-utilities"]
 
 [dependencies]
-nostr-sdk = "0.37"
+nostr-sdk = "0.45.2"
 teloxide = { version = "0.13", features = ["macros"] }
 tokio = { version = "1", features = ["full"] }
 serde = { version = "1", features = ["derive"] }
