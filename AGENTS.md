@@ -85,7 +85,9 @@ remote input reaches the bot.
 - Follow `rustfmt` defaults; never hand-format around it.
 - Handle errors explicitly. Do not swallow them: an ignored `Result` in a
   background task means silent failure in production.
-- Log with `tracing` (`info!`, `warn!`, `error!`), never `println!`.
+- Log with `tracing` (`info!`, `warn!`, `error!`). Reserve `println!` and
+  `eprintln!` for actual CLI output — `--version`, `--help`, and argument
+  errors — where the caller expects plain stdout/stderr, not log formatting.
 - Keep functions focused and files cohesive. `src/main.rs` is already large;
   prefer extracting a new module over growing it further.
 - Prefer returning new values over mutating in place where it does not cost
@@ -104,8 +106,9 @@ noise — relay disconnections, reconnection attempts, relay list changes — is
 logged with `tracing`, never sent to Telegram. False positives in that channel
 erode the signal admins rely on.
 
-Startup and heartbeat messages are the deliberate exceptions, and both are
-configurable.
+The deliberate exceptions are the startup message, which is sent
+unconditionally on every launch, and the heartbeat, which is off by default and
+enabled with `heartbeat_enabled`.
 
 ### Telegram MarkdownV2 escaping
 
