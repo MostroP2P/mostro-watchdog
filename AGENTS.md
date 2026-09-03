@@ -13,13 +13,25 @@ This applies to:
 - Code comments and doc comments (`//`, `///`, `//!`)
 - Log messages, error messages, and any user-facing bot output
 - Documentation: `README.md`, `*.md` files, configuration examples
-- Commit messages, branch names, pull request titles and descriptions
-- Issue reports and code review comments
+- Commit messages and branch names
+- Pull request titles, descriptions, and every comment on a pull request
+- Issue titles, descriptions, and comments
+- Code review comments and replies, including replies to automated reviewers
+- Release notes and changelog entries
 - Test names and test fixtures
 
-Contributors may speak any language among themselves, but anything committed to
-the repository must be in English. This keeps the project readable for the whole
-Mostro community regardless of where a contributor is from.
+In short: every word written into GitHub or into the repository is in English.
+Discussion threads included — if it is visible to someone browsing the project,
+it is in English.
+
+Contributors may speak any language among themselves, in chat or in person; the
+rule is about what gets written down where the project lives. This keeps it
+readable for the whole Mostro community regardless of where a contributor is
+from.
+
+This applies to agents as much as to people: if you are prompted in another
+language, answer the person in that language, but write English into the
+repository, the pull request, and the issue tracker.
 
 ## Project overview
 
