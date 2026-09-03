@@ -7,11 +7,16 @@
 pubkey = "npub1..."
 
 [nostr]
-# Nostr relays to connect to (use the same relays as your mostrod)
+# Bootstrap relays — used to discover Mostro's NIP-65 (kind 10002) relay list.
+# After discovery, the watchdog connects only to the relays advertised by Mostro.
+# If no NIP-65 event is found, these relays are used as fallback.
 relays = [
     "wss://relay.mostro.network",
     "wss://relay.damus.io",
 ]
+
+# How often to re-fetch the NIP-65 relay list, in seconds (default: 7200 = 2 hours)
+# nip65_refresh_interval = 7200
 
 [telegram]
 # Bot token from @BotFather (https://t.me/BotFather)
