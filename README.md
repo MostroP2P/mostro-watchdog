@@ -224,6 +224,30 @@ Or specify it explicitly with `--config` / `-c`.
 5. Add the bot to the group/channel
 6. Get the chat ID (see config.example.toml for instructions)
 
+## Bot Commands
+
+The bot answers these commands in any chat it belongs to:
+
+| Command | Description |
+|---------|-------------|
+| `/version` | Show the running version and the git commit it was built from |
+
+`/version` replies with something like:
+
+```text
+🐕 mostro-watchdog
+
+📦 Version: 0.3.0
+🔖 Commit: a1b2c3d
+```
+
+The commit hash is embedded at build time. Builds made outside a git checkout
+report `unknown`; for Docker, pass it explicitly:
+
+```bash
+docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) -t mostro-watchdog .
+```
+
 ## Alert Format
 
 When a dispute is detected, you'll receive a message like:

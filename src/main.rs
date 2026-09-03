@@ -9,11 +9,11 @@ use tracing::{error, info, warn};
 
 mod config;
 mod db;
+mod version;
 
 use config::Config;
 use db::DisputeMessageStore;
-
-const VERSION: &str = env!("CARGO_PKG_VERSION");
+use version::{version_message, VERSION};
 
 /// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
 type ActiveRelays = Arc<RwLock<Vec<String>>>;
@@ -575,6 +575,50 @@ async fn start_health_server(
     }
 }
 
+/// Commands the bot answers in Telegram.
+#[derive(teloxide::macros::BotCommands, Clone)]
+#[command(
+    rename_rule = "lowercase",
+    description = "mostro-watchdog supports these commands:"
+)]
+enum Command {
+    #[command(description = "show the running version and commit")]
+    Version,
+}
+
+/// Answer a bot command.
+async fn answer_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+    match cmd {
+        Command::Version => {
+            bot.send_message(msg.chat.id, version_message())
+                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+                .await?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Start the Telegram command listener in the background.
+///
+/// It runs alongside the Nostr event loop: long polling for updates must not
+/// block dispute processing.
+fn start_command_listener(bot: Bot) {
+    tokio::spawn(async move {
+        use teloxide::repls::CommandReplExt;
+        use teloxide::utils::command::BotCommands as _;
+
+        // Register the command list so it shows up in Telegram's command menu.
+        if let Err(e) = bot.set_my_commands(Command::bot_commands()).await {
+            warn!("Failed to register bot commands with Telegram: {}", e);
+        }
+
+        info!("Telegram command listener started");
+        <Command as CommandReplExt>::repl(bot, answer_command).await;
+        warn!("Telegram command listener stopped");
+    });
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -606,6 +650,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     }
+
+    // Answer Telegram commands (/version) while the Nostr event loop runs
+    start_command_listener(bot.clone());
 
     // Initialize Nostr client with bootstrap relays
     let client = Client::default();
