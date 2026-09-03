@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use teloxide::prelude::*;
-use teloxide::types::MessageId;
+use teloxide::types::{Chat, MessageId};
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
@@ -586,8 +586,27 @@ enum Command {
     Version,
 }
 
+/// Whether a command sent in this chat may be answered.
+///
+/// Only private chats qualify. The dispute channel is reserved for dispute
+/// events, so an answer sent to a group or channel would be exactly the kind of
+/// non-dispute noise the bot must not produce — and since the bot is only ever a
+/// member of the admin's own chats, replying in private also keeps the answer
+/// with the person who asked.
+fn is_answerable_chat(chat: &Chat) -> bool {
+    chat.is_private()
+}
+
 /// Answer a bot command.
 async fn answer_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+    if !is_answerable_chat(&msg.chat) {
+        info!(
+            "Ignoring command in non-private chat {}: replies are private-only",
+            msg.chat.id
+        );
+        return Ok(());
+    }
+
     match cmd {
         Command::Version => {
             bot.send_message(msg.chat.id, version_message())
@@ -1093,6 +1112,34 @@ fn escape_markdown_code(text: &str) -> String {
 mod tests {
     use super::*;
     use config::AlertsConfig;
+
+    /// Build a `Chat` the way Telegram sends it, since the type has no public
+    /// constructor.
+    fn chat_from_json(json: &str) -> teloxide::types::Chat {
+        serde_json::from_str(json).expect("valid chat payload")
+    }
+
+    #[test]
+    fn answers_commands_in_private_chats() {
+        let chat = chat_from_json(r#"{"id": 42, "type": "private", "first_name": "Admin"}"#);
+
+        assert!(is_answerable_chat(&chat));
+    }
+
+    #[test]
+    fn ignores_commands_in_groups_and_channels() {
+        // The dispute channel is a group or channel: answering there would put
+        // non-dispute traffic into it.
+        for payload in [
+            r#"{"id": -42, "type": "group", "title": "Disputes"}"#,
+            r#"{"id": -42, "type": "supergroup", "title": "Disputes"}"#,
+            r#"{"id": -42, "type": "channel", "title": "Disputes"}"#,
+        ] {
+            let chat = chat_from_json(payload);
+
+            assert!(!is_answerable_chat(&chat), "should ignore: {payload}");
+        }
+    }
 
     #[test]
     fn test_escape_markdown() {

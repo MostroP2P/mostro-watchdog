@@ -226,7 +226,9 @@ Or specify it explicitly with `--config` / `-c`.
 
 ## Bot Commands
 
-The bot answers these commands in any chat it belongs to:
+The bot answers commands **in private chats only**. Commands sent in a group or
+channel are ignored, so the dispute channel keeps carrying dispute alerts and
+nothing else — message the bot directly instead.
 
 | Command | Description |
 |---------|-------------|

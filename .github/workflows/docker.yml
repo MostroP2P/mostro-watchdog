@@ -41,11 +41,19 @@ jobs:
             type=semver,pattern={{major}}.{{minor}}
             type=raw,value=latest
 
+      - name: Resolve short commit hash
+        id: commit
+        run: echo "short_sha=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
           context: .
           push: true
+          # The build context has no .git directory, so the commit the image was
+          # built from has to be passed in for /version to report it.
+          build-args: |
+            GIT_COMMIT=${{ steps.commit.outputs.short_sha }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
           cache-from: type=gha

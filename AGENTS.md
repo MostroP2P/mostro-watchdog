@@ -124,6 +124,10 @@ The deliberate exceptions are the startup message, which is sent
 unconditionally on every launch, and the heartbeat, which is off by default and
 enabled with `heartbeat_enabled`.
 
+For the same reason, bot commands such as `/version` are answered in private
+chats only. `is_answerable_chat` enforces this; a command sent in a group or
+channel is logged and dropped. Any new command must go through that check.
+
 ### Telegram MarkdownV2 escaping
 
 Every dynamic value interpolated into a Telegram message must be escaped:
