@@ -318,7 +318,6 @@ fn start_health_tasks(
     // Relay connectivity check task
     if health_config.check_relays {
         let client_rc = client.clone();
-        let bot_rc = bot.clone();
         let relays_rc = relays.to_vec();
         // Derive relay check cadence from relay_timeout (check every 10x the timeout, min 10s)
         let relay_timeout = health_config.relay_timeout;
@@ -348,34 +347,14 @@ fn start_health_tasks(
                 }
 
                 if !failed_relays.is_empty() {
-                    let failed_list: String = failed_relays
-                        .iter()
-                        .map(|url| format!("  • {}", escape_markdown(url)))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-
-                    let alert_msg = format!(
-                        "🔌 *Relay Connection Alert*\n\n\
-                         ⚠️ Disconnected relays: {}\n{}\n\
-                         ✅ Connected relays: {}\n\
-                         🔄 Attempting reconnection\\.\\.\\.",
-                        escape_markdown(&failed_relays.len().to_string()),
-                        failed_list,
-                        escape_markdown(&(relays_rc.len() - failed_relays.len()).to_string())
+                    // Relay connectivity issues are logged only: the Telegram channel is
+                    // reserved for dispute events, so infrastructure noise stays out of it.
+                    warn!(
+                        "🔌 {} relay(s) disconnected: {} ({} connected). Attempting reconnection...",
+                        failed_relays.len(),
+                        failed_relays.join(", "),
+                        relays_rc.len() - failed_relays.len()
                     );
-
-                    if let Err(e) = bot_rc
-                        .send_message(ChatId(chat_id), &alert_msg)
-                        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                        .await
-                    {
-                        error!("Failed to send relay alert: {}", e);
-                    } else {
-                        warn!(
-                            "🔌 Relay connectivity alert sent ({} failed)",
-                            failed_relays.len()
-                        );
-                    }
 
                     // Attempt to reconnect all failed/terminated relays
                     client_rc.connect().await;
