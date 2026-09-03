@@ -26,7 +26,9 @@ mostro-watchdog includes comprehensive health monitoring to ensure the system is
 
 - **Purpose**: Monitor Nostr relay connectivity and attempt automatic reconnection
 - **Check interval**: Every 5 minutes
-- **Actions**: Detects disconnected relays, sends alerts, attempts reconnection
+- **Actions**: Detects disconnected relays and attempts reconnection
+- **Notifications**: None — issues are written to the application log only, so the
+  Telegram channel stays limited to dispute events
 - **Coverage**: Monitors all configured relays simultaneously
 
 ### 🌐 HTTP Health Endpoint (Optional)
@@ -93,15 +95,6 @@ The `[health]` section is **optional**. If not present, all monitoring features 
 • Mostro daemon status
 • Nostr relay connections
 • Network connectivity
-```
-
-### Relay Connection Alert
-```text
-🔌 Relay Connection Alert
-
-⚠️ Disconnected relays: 2
-✅ Connected relays: 1
-🔄 Attempting reconnection...
 ```
 
 ## HTTP Health Endpoint
