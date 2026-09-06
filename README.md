@@ -3,7 +3,7 @@
 [![CI](https://github.com/MostroP2P/mostro-watchdog/workflows/CI/badge.svg)](https://github.com/MostroP2P/mostro-watchdog/actions/workflows/ci.yml)
 [![Release](https://github.com/MostroP2P/mostro-watchdog/workflows/Release/badge.svg)](https://github.com/MostroP2P/mostro-watchdog/actions/workflows/release.yml)
 [![Latest Release](https://img.shields.io/github/v/release/MostroP2P/mostro-watchdog)](https://github.com/MostroP2P/mostro-watchdog/releases/latest)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
+[![License: GPL v3](https://img.shields.io/badge/License-GPLv3-blue.svg)](https://www.gnu.org/licenses/gpl-3.0)
 
 <p align="center">
   <img src="mascot.png" alt="mostro-watchdog mascot" width="300" />
@@ -287,4 +287,4 @@ Contributions are welcome! Please open an issue first to discuss what you'd like
 
 ## License
 
-[MIT](LICENSE)
+[GNU General Public License v3.0](LICENSE)
