@@ -27,6 +27,11 @@
 - **Expected**: Alert sent with 🔓 DISPUTE RESOLVED message
 - **Verification**: Message contains "Released by seller"
 
+### 5b. Cooperatively Canceled Alert (cooperatively-canceled)
+- **Input**: Event with status "cooperatively-canceled", dispute_id "test123"
+- **Expected**: Alert sent with 🤝 DISPUTE RESOLVED - COOPERATIVELY CANCELED message
+- **Verification**: Message contains "Both parties agreed to cancel"; with `other = false` the alert is still sent
+
 ### 6. Unknown Status Alert
 - **Input**: Event with status "unknown-status", dispute_id "test123"
 - **Expected**: Alert sent with 📡 DISPUTE STATUS UPDATE message
