@@ -1,3 +1,4 @@
+use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::Deserialize;
 use std::path::Path;
 
@@ -8,6 +9,8 @@ pub struct Config {
     pub telegram: TelegramConfig,
     pub alerts: Option<AlertsConfig>,
     pub health: Option<HealthConfig>,
+    /// Serbero alerts; when absent they are off.
+    pub serbero: Option<SerberoConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -30,6 +33,14 @@ pub struct AlertsConfig {
     /// Enable alerts for unknown/other status changes
     #[serde(default = "default_true")]
     pub other: bool,
+    /// Send a new message when Serbero hands a dispute off to a human solver
+    /// or cannot start mediating it
+    #[serde(default = "default_true")]
+    pub serbero_handoff: bool,
+    /// Show Serbero's progress on the dispute's message (edits, no
+    /// notification)
+    #[serde(default = "default_true")]
+    pub serbero_progress: bool,
 }
 
 fn default_true() -> bool {
@@ -45,6 +56,8 @@ impl Default for AlertsConfig {
             settled: true,
             released: true,
             other: true,
+            serbero_handoff: true,
+            serbero_progress: true,
         }
     }
 }
@@ -136,6 +149,93 @@ fn default_nip65_refresh_interval() -> u64 {
     7200 // 2 hours
 }
 
+/// Environment variable that holds the watchdog's own Nostr secret key when
+/// `serbero.private_key_env` is not set.
+pub const DEFAULT_PRIVATE_KEY_ENV: &str = "WATCHDOG_NOSTR_PRIVATE_KEY";
+
+fn default_private_key_env() -> String {
+    DEFAULT_PRIVATE_KEY_ENV.to_string()
+}
+
+/// The `[serbero]` section: relay what Serbero, Mostro's dispute assistant,
+/// reports about each dispute. Serbero writes to the watchdog's own Nostr
+/// key once that key is listed in Serbero's `[[observers]]`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct SerberoConfig {
+    /// Name of the environment variable that holds the watchdog's Nostr
+    /// secret key (nsec or hex). The key itself never goes in this file.
+    #[serde(default = "default_private_key_env")]
+    pub private_key_env: String,
+    /// Serbero's public key (npub or hex). When omitted, it is read from the
+    /// Mostro node's info event (kind 38385, `serbero` tag).
+    pub pubkey: Option<String>,
+}
+
+/// Why the `[serbero]` section cannot be used. The messages name the
+/// environment variable, never its value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SerberoConfigError {
+    #[error("serbero.private_key_env cannot be empty")]
+    EmptyKeyVariable,
+    #[error(
+        "[serbero] is configured, but the environment variable {0} with the watchdog's \
+         Nostr secret key (nsec or hex) is not set"
+    )]
+    MissingKey(String),
+    #[error(
+        "the environment variable {0} does not hold a valid Nostr secret key (expected nsec or hex)"
+    )]
+    InvalidKey(String),
+    #[error("serbero.pubkey is not a valid Nostr public key (expected npub or hex)")]
+    InvalidPubkey,
+}
+
+/// The `[serbero]` section resolved at startup.
+#[derive(Debug, Clone)]
+pub struct SerberoSettings {
+    /// The watchdog's own keys: Serbero encrypts its messages to them.
+    pub keys: Keys,
+    /// Serbero's key when configured; otherwise it is discovered.
+    pub pubkey: Option<PublicKey>,
+}
+
+impl SerberoConfig {
+    /// Checks what can be checked without the environment.
+    pub fn validate(&self) -> Result<(), SerberoConfigError> {
+        if self.private_key_env.trim().is_empty() {
+            return Err(SerberoConfigError::EmptyKeyVariable);
+        }
+        self.pubkey().map(|_| ())
+    }
+
+    /// Serbero's configured key, if any.
+    pub fn pubkey(&self) -> Result<Option<PublicKey>, SerberoConfigError> {
+        self.pubkey
+            .as_deref()
+            .map(|key| PublicKey::parse(key.trim()).map_err(|_| SerberoConfigError::InvalidPubkey))
+            .transpose()
+    }
+
+    /// Reads the watchdog's secret key from the environment through `env`
+    /// (a lookup by variable name) and parses the configured keys.
+    pub fn resolve(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<SerberoSettings, SerberoConfigError> {
+        self.validate()?;
+        let variable = self.private_key_env.trim();
+        let secret =
+            env(variable).ok_or_else(|| SerberoConfigError::MissingKey(variable.into()))?;
+        // The parse error is dropped on purpose: it could quote the value.
+        let keys = Keys::parse(secret.trim())
+            .map_err(|_| SerberoConfigError::InvalidKey(variable.into()))?;
+        Ok(SerberoSettings {
+            keys,
+            pubkey: self.pubkey()?,
+        })
+    }
+}
+
 #[derive(Debug, Deserialize)]
 pub struct TelegramConfig {
     /// Telegram bot token from @BotFather
@@ -195,6 +295,11 @@ impl Config {
             return Err("nip65_refresh_interval must be greater than 0".into());
         }
 
+        if let Some(ref serbero) = config.serbero {
+            // As a string, like the errors above: `main` prints it with `Debug`.
+            serbero.validate().map_err(|e| e.to_string())?;
+        }
+
         if let Some(ref health) = config.health {
             if health.heartbeat_enabled && health.heartbeat_interval == 0 {
                 return Err("heartbeat_interval must be greater than 0".into());
@@ -207,5 +312,187 @@ impl Config {
         }
 
         Ok(config)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nostr_sdk::prelude::ToBech32;
+    use std::io::Write;
+
+    const BASE: &str = r#"
+[mostro]
+pubkey = "npub1..."
+
+[nostr]
+relays = ["wss://relay.mostro.network"]
+
+[telegram]
+bot_token = "123:abc"
+chat_id = -1001
+"#;
+
+    fn load(extra: &str) -> Result<Config, Box<dyn std::error::Error>> {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        write!(file, "{BASE}{extra}").unwrap();
+        Config::load(file.path())
+    }
+
+    fn serbero(private_key_env: &str, pubkey: Option<&str>) -> SerberoConfig {
+        SerberoConfig {
+            private_key_env: private_key_env.into(),
+            pubkey: pubkey.map(Into::into),
+        }
+    }
+
+    #[test]
+    fn the_serbero_section_is_optional() {
+        let config = load("").unwrap();
+
+        assert!(config.serbero.is_none());
+    }
+
+    #[test]
+    fn an_empty_serbero_section_reads_the_default_key_variable() {
+        let config = load("\n[serbero]\n").unwrap();
+
+        let serbero = config.serbero.expect("section present");
+        assert_eq!(serbero.private_key_env, DEFAULT_PRIVATE_KEY_ENV);
+        assert_eq!(serbero.pubkey, None);
+    }
+
+    #[test]
+    fn serbero_alert_toggles_default_to_true() {
+        let config = load("\n[alerts]\ninitiated = false\n").unwrap();
+
+        let alerts = config.alerts.expect("section present");
+        assert!(alerts.serbero_handoff);
+        assert!(alerts.serbero_progress);
+        assert!(AlertsConfig::default().serbero_handoff);
+        assert!(AlertsConfig::default().serbero_progress);
+    }
+
+    #[test]
+    fn serbero_alert_toggles_can_be_turned_off() {
+        let config =
+            load("\n[alerts]\nserbero_handoff = false\nserbero_progress = false\n").unwrap();
+
+        let alerts = config.alerts.expect("section present");
+        assert!(!alerts.serbero_handoff);
+        assert!(!alerts.serbero_progress);
+    }
+
+    #[test]
+    fn the_watchdog_key_is_read_from_the_named_variable_as_nsec_or_hex() {
+        let keys = Keys::generate();
+        let nsec = keys.secret_key().to_bech32().unwrap();
+        let hex = keys.secret_key().to_secret_hex();
+
+        for secret in [
+            nsec,
+            hex,
+            format!("  {}\n", keys.secret_key().to_secret_hex()),
+        ] {
+            let settings = serbero("MY_KEY", None)
+                .resolve(|name| (name == "MY_KEY").then(|| secret.clone()))
+                .unwrap();
+
+            assert_eq!(settings.keys.public_key(), keys.public_key());
+            assert_eq!(settings.pubkey, None);
+        }
+    }
+
+    #[test]
+    fn a_missing_key_variable_is_an_error_that_names_it() {
+        let result = serbero("MY_KEY", None).resolve(|_| None);
+
+        let err = result.unwrap_err();
+        assert_eq!(err, SerberoConfigError::MissingKey("MY_KEY".into()));
+        assert!(err.to_string().contains("MY_KEY"));
+    }
+
+    #[test]
+    fn an_invalid_key_is_an_error_that_does_not_echo_the_value() {
+        let result = serbero("MY_KEY", None).resolve(|_| Some("nsec1notakey".into()));
+
+        let err = result.unwrap_err();
+        assert_eq!(err, SerberoConfigError::InvalidKey("MY_KEY".into()));
+        assert!(!err.to_string().contains("nsec1notakey"));
+    }
+
+    #[test]
+    fn an_empty_key_is_an_error() {
+        let result = serbero("MY_KEY", None).resolve(|_| Some("   ".into()));
+
+        assert_eq!(
+            result.unwrap_err(),
+            SerberoConfigError::InvalidKey("MY_KEY".into())
+        );
+    }
+
+    #[test]
+    fn the_serbero_pubkey_accepts_npub_and_hex() {
+        let serbero_key = Keys::generate().public_key();
+        let watchdog = Keys::generate();
+        let secret = watchdog.secret_key().to_secret_hex();
+
+        for configured in [serbero_key.to_bech32().unwrap(), serbero_key.to_hex()] {
+            let settings = serbero("MY_KEY", Some(&configured))
+                .resolve(|_| Some(secret.clone()))
+                .unwrap();
+
+            assert_eq!(settings.pubkey, Some(serbero_key));
+        }
+    }
+
+    #[test]
+    fn an_invalid_serbero_pubkey_fails_at_load() {
+        let err = load("\n[serbero]\npubkey = \"npub1nope\"\n").unwrap_err();
+
+        assert!(err.to_string().contains("serbero.pubkey"), "{err}");
+        assert_eq!(
+            serbero("MY_KEY", Some("")).validate(),
+            Err(SerberoConfigError::InvalidPubkey)
+        );
+    }
+
+    #[test]
+    fn a_serbero_error_at_load_prints_as_a_sentence() {
+        // `main` prints the error it returns with `Debug`.
+        let err = load("\n[serbero]\npubkey = \"npub1nope\"\n").unwrap_err();
+
+        assert!(
+            format!("{err:?}").contains("serbero.pubkey is not a valid Nostr public key"),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn an_empty_key_variable_name_fails_at_load() {
+        let err = load("\n[serbero]\nprivate_key_env = \"\"\n").unwrap_err();
+
+        assert!(err.to_string().contains("private_key_env"), "{err}");
+    }
+
+    #[test]
+    fn the_example_config_loads_with_serbero_alerts_off() {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("config.example.toml");
+
+        let config = Config::load(&path).unwrap();
+
+        let alerts = config.alerts.expect("[alerts] in the example");
+        assert!(alerts.serbero_handoff);
+        assert!(alerts.serbero_progress);
+        assert!(config.serbero.is_none(), "Serbero alerts are opt-in");
+    }
+
+    #[test]
+    fn loading_the_config_never_reads_the_secret() {
+        // The variable is resolved separately at startup, so a config with
+        // `[serbero]` loads even where the variable is unset (CI, tests).
+        let config = load("\n[serbero]\nprivate_key_env = \"SURELY_UNSET_VARIABLE_42\"\n");
+
+        assert!(config.is_ok());
     }
 }

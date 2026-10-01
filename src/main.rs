@@ -4,15 +4,17 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use teloxide::prelude::*;
 use teloxide::types::{Chat, MessageId};
-use tokio::sync::RwLock;
+use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{error, info, warn};
 
 mod config;
 mod db;
+mod serbero;
 mod version;
 
-use config::Config;
+use config::{Config, SerberoSettings};
 use db::DisputeMessageStore;
+use serbero::alerts::SerberoAlerts;
 use version::{version_message, VERSION};
 
 /// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
@@ -254,12 +256,15 @@ fn print_usage() {
 /// Start the NIP-65 relay discovery background task.
 /// On first run, fetches the kind 10002 event and swaps relays if found.
 /// Then re-fetches periodically every `refresh_interval` seconds.
+/// `relays_changed` is notified after each swap: subscriptions other than
+/// the dispute one are re-sent by their owners.
 fn start_nip65_task(
     client: Client,
     mostro_pubkey: PublicKey,
     bootstrap_relays: Vec<String>,
     active_relays: ActiveRelays,
     refresh_interval: u64,
+    relays_changed: Arc<Notify>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(refresh_interval));
@@ -301,6 +306,9 @@ fn start_nip65_task(
                             error!("Failed to swap to NIP-65 relays: {}", e);
                         }
                     }
+                    // Even a failed swap may have removed relays, and their
+                    // subscriptions with them.
+                    relays_changed.notify_one();
                 }
                 None => {
                     let current = active_relays.read().await.clone();
@@ -652,6 +660,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&config_path)?;
 
     info!("🐕 mostro-watchdog starting...");
+
+    // Fails startup when `[serbero]` is present but the watchdog's key is not.
+    let serbero_settings = resolve_serbero(&config)?;
     info!("Monitoring Mostro pubkey: {}", config.mostro.pubkey);
     info!(
         "Sending alerts to Telegram chat: {}",
@@ -699,7 +710,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Open the notification stream *before* subscribing: it only delivers what arrives
     // after this call, so events received while the rest of the startup runs would
     // otherwise be lost.
-    let mut notifications = client.notifications();
+    let notifications = client.notifications();
 
     client.subscribe(dispute_filter).await?;
 
@@ -708,6 +719,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared state: active relays (starts with bootstrap, updated by NIP-65 discovery)
     let active_relays: ActiveRelays = Arc::new(RwLock::new(config.nostr.relays.clone()));
 
+    // Notified when NIP-65 discovery swaps the relays, so the Serbero DM
+    // subscription follows them.
+    let relays_changed = Arc::new(Notify::new());
+
     // Start NIP-65 relay discovery background task
     start_nip65_task(
         client.clone(),
@@ -715,6 +730,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.nostr.relays.clone(),
         active_relays.clone(),
         config.nostr.nip65_refresh_interval,
+        relays_changed.clone(),
     );
 
     // Initialize health monitor
@@ -767,30 +783,139 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("Failed to send startup message: {}", e);
     }
 
-    // Process events
+    // Keep up with Serbero in the background: its DMs reach the event loop
+    // live as notifications, and caught up through `serbero_backlog`.
+    let (serbero_inbox, serbero_backlog) = match serbero_settings {
+        Some(settings) => {
+            let (inbox, backlog) = serbero::start(
+                &client,
+                settings,
+                mostro_pubkey,
+                relays_changed,
+                Duration::from_secs(config.nostr.nip65_refresh_interval),
+            );
+            (Some(inbox), Some(backlog))
+        }
+        None => (None, None),
+    };
+
     let alerts_config = config.alerts.unwrap_or_default();
     let chat_id = config.telegram.chat_id;
+    let serbero_alerts = SerberoAlerts {
+        store: &dispute_store,
+        telegram: &bot,
+        chat_id,
+        show_progress: alerts_config.serbero_progress,
+        send_handoffs: alerts_config.serbero_handoff,
+    };
 
-    // `Client::handle_notifications` was removed in nostr-sdk 0.45: notifications are
-    // now consumed as a stream, which ends when the client shuts down.
-    while let Some(notification) = notifications.next().await {
-        match notification {
-            ClientNotification::Event { event, .. } => {
-                if event.kind == Kind::Custom(38386) {
-                    health_monitor.record_event().await;
-                    handle_dispute_event(&bot, chat_id, &event, &alerts_config, &dispute_store)
-                        .await;
-                }
-            }
-            ClientNotification::Shutdown => {
-                info!("Nostr client shut down, stopping event loop");
-                break;
-            }
-            ClientNotification::Message { .. } => {}
-        }
-    }
+    run_event_loop(
+        notifications,
+        EventLoop {
+            bot: &bot,
+            chat_id,
+            alerts_config: &alerts_config,
+            dispute_store: &dispute_store,
+            health_monitor: &health_monitor,
+            serbero_alerts: &serbero_alerts,
+            serbero_inbox,
+            serbero_backlog,
+        },
+    )
+    .await;
 
     Ok(())
+}
+
+/// Resolves `[serbero]`: the watchdog's own keys from the environment and
+/// Serbero's key when configured. `None` when Serbero alerts are off.
+fn resolve_serbero(config: &Config) -> Result<Option<SerberoSettings>, Box<dyn std::error::Error>> {
+    let Some(serbero) = &config.serbero else {
+        return Ok(None);
+    };
+    // As a string, like the config errors: `main` prints it with `Debug`.
+    let settings = serbero
+        .resolve(|name| std::env::var(name).ok())
+        .map_err(|e| e.to_string())?;
+    let watchdog = settings.keys.public_key();
+    info!(
+        "🤖 Serbero alerts enabled. Watchdog Nostr pubkey: {} (hex: {}). \
+         Add the hex key to Serbero's [[observers]].",
+        watchdog.to_bech32()?,
+        watchdog.to_hex()
+    );
+    match settings.pubkey {
+        Some(serbero) => info!("Serbero pubkey (configured): {}", serbero.to_hex()),
+        None => info!("Serbero pubkey: read from the Mostro node's info event"),
+    }
+    Ok(Some(settings))
+}
+
+/// What the event loop works with.
+struct EventLoop<'a> {
+    bot: &'a Bot,
+    chat_id: i64,
+    alerts_config: &'a config::AlertsConfig,
+    dispute_store: &'a DisputeMessageStore,
+    health_monitor: &'a HealthMonitor,
+    serbero_alerts: &'a SerberoAlerts<'a, Bot>,
+    serbero_inbox: Option<serbero::SerberoInbox>,
+    serbero_backlog: Option<mpsc::UnboundedReceiver<Vec<Event>>>,
+}
+
+/// Handles dispute events and Serbero DMs one at a time, so a dispute's
+/// alert and Serbero's line on it never race each other. Returns when the
+/// Nostr client shuts down.
+async fn run_event_loop(
+    mut notifications: impl StreamExt<Item = ClientNotification> + Unpin,
+    mut ctx: EventLoop<'_>,
+) {
+    // `Client::handle_notifications` was removed in nostr-sdk 0.45: notifications are
+    // now consumed as a stream, which ends when the client shuts down.
+    loop {
+        tokio::select! {
+            notification = notifications.next() => match notification {
+                Some(ClientNotification::Event { event, .. }) => {
+                    if event.kind == Kind::Custom(38386) {
+                        ctx.health_monitor.record_event().await;
+                        handle_dispute_event(
+                            ctx.bot,
+                            ctx.chat_id,
+                            &event,
+                            ctx.alerts_config,
+                            ctx.dispute_store,
+                        )
+                        .await;
+                    } else if event.kind == Kind::PrivateDirectMessage {
+                        if let Some(inbox) = ctx.serbero_inbox.as_mut() {
+                            inbox.receive(&event, ctx.serbero_alerts).await;
+                        }
+                    }
+                }
+                Some(ClientNotification::Message { .. }) => {}
+                Some(ClientNotification::Shutdown) | None => {
+                    info!("Nostr client shut down, stopping event loop");
+                    break;
+                }
+            },
+            Some(events) = next_serbero_batch(&mut ctx.serbero_backlog) => {
+                if let Some(inbox) = ctx.serbero_inbox.as_mut() {
+                    inbox.receive_batch(events, ctx.serbero_alerts).await;
+                }
+            }
+        }
+    }
+}
+
+/// The next batch of caught-up Serbero DMs. Never resolves when Serbero
+/// alerts are off.
+async fn next_serbero_batch(
+    backlog: &mut Option<mpsc::UnboundedReceiver<Vec<Event>>>,
+) -> Option<Vec<Event>> {
+    match backlog {
+        Some(backlog) => backlog.recv().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn handle_dispute_event(
@@ -955,11 +1080,22 @@ async fn handle_dispute_event(
         }
     };
 
+    // Serbero's latest state for the dispute shows below the alert; the
+    // store keeps the alert without it, to redraw it when the state changes.
+    let shown = serbero::alerts::decorate(
+        dispute_store,
+        &dispute_id,
+        &status,
+        &message,
+        alerts_config.serbero_progress,
+    )
+    .await;
+
     // If we have an existing message, update it; otherwise send a new one
     if let Some((message_id, stored_chat_id)) = existing_message {
         // Update existing message
         match bot
-            .edit_message_text(ChatId(stored_chat_id), MessageId(message_id), &message)
+            .edit_message_text(ChatId(stored_chat_id), MessageId(message_id), &shown)
             .parse_mode(teloxide::types::ParseMode::MarkdownV2)
             .await
         {
@@ -968,7 +1104,10 @@ async fn handle_dispute_event(
                     "✏️ Updated dispute message for {} (status: {})",
                     dispute_id, status
                 );
-                if let Err(e) = dispute_store.update_status(&dispute_id, &status).await {
+                if let Err(e) = dispute_store
+                    .update_status(&dispute_id, &status, &message)
+                    .await
+                {
                     error!("Failed to update dispute status in store: {}", e);
                 }
             }
@@ -980,6 +1119,7 @@ async fn handle_dispute_event(
                     chat_id,
                     &dispute_id,
                     &status,
+                    &shown,
                     &message,
                     dispute_store,
                 )
@@ -988,20 +1128,32 @@ async fn handle_dispute_event(
         }
     } else {
         // Send new message
-        send_new_dispute_message(bot, chat_id, &dispute_id, &status, &message, dispute_store).await;
+        send_new_dispute_message(
+            bot,
+            chat_id,
+            &dispute_id,
+            &status,
+            &shown,
+            &message,
+            dispute_store,
+        )
+        .await;
     }
 }
 
+/// Sends `shown` and stores the message, with `alert` (the text without
+/// Serbero's line) for later redraws.
 async fn send_new_dispute_message(
     bot: &Bot,
     chat_id: i64,
     dispute_id: &str,
     status: &str,
-    message: &str,
+    shown: &str,
+    alert: &str,
     dispute_store: &DisputeMessageStore,
 ) {
     match bot
-        .send_message(ChatId(chat_id), message)
+        .send_message(ChatId(chat_id), shown)
         .parse_mode(teloxide::types::ParseMode::MarkdownV2)
         .await
     {
@@ -1012,7 +1164,7 @@ async fn send_new_dispute_message(
             );
             // Store the message ID for future updates
             if let Err(e) = dispute_store
-                .insert(dispute_id, sent_message.id.0, chat_id, status)
+                .insert(dispute_id, sent_message.id.0, chat_id, status, alert)
                 .await
             {
                 error!("Failed to store dispute message ID: {}", e);
@@ -1139,6 +1291,34 @@ mod tests {
 
             assert!(!is_answerable_chat(&chat), "should ignore: {payload}");
         }
+    }
+
+    #[test]
+    fn a_missing_serbero_key_stops_startup_with_a_readable_error() {
+        let config: Config = toml::from_str(
+            r#"
+            [mostro]
+            pubkey = "npub1..."
+            [nostr]
+            relays = ["wss://relay.mostro.network"]
+            [telegram]
+            bot_token = "123:abc"
+            chat_id = -1001
+            [serbero]
+            private_key_env = "MOSTRO_WATCHDOG_TEST_SURELY_UNSET_KEY"
+            "#,
+        )
+        .expect("valid config");
+
+        let err = resolve_serbero(&config).expect_err("no key in the environment");
+
+        // `main` prints the error it returns with `Debug`.
+        let printed = format!("{err:?}");
+        assert!(
+            printed.contains("MOSTRO_WATCHDOG_TEST_SURELY_UNSET_KEY"),
+            "{printed}"
+        );
+        assert!(printed.contains("is not set"), "{printed}");
     }
 
     #[test]
