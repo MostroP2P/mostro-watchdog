@@ -119,13 +119,37 @@ impl Backoff {
     }
 }
 
+/// Info events in a row that must name no Serbero before a working key is
+/// dropped: a single one may come from a relay holding a stale copy.
+pub const DROP_AFTER_NO_SERBERO: u8 = 2;
+
+/// The trusted key, and how many info events in a row named no Serbero
+/// while it was trusted.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeyState {
+    pub key: Option<PublicKey>,
+    pub no_serbero: u8,
+}
+
 /// The key to trust after a discovery. A node that did not answer keeps
-/// the current key; one that names no Serbero drops it.
-pub fn next_serbero(current: Option<PublicKey>, discovery: Discovery) -> Option<PublicKey> {
+/// the current key.
+pub fn next_key(state: KeyState, discovery: Discovery) -> KeyState {
     match discovery {
-        Discovery::Serbero(serbero) => Some(serbero),
-        Discovery::NoSerbero => None,
-        Discovery::NotFound => current,
+        Discovery::Serbero(key) => KeyState {
+            key: Some(key),
+            no_serbero: 0,
+        },
+        Discovery::NoSerbero => {
+            let no_serbero = state.no_serbero.saturating_add(1);
+            match state.key {
+                Some(key) if no_serbero < DROP_AFTER_NO_SERBERO => KeyState {
+                    key: Some(key),
+                    no_serbero,
+                },
+                _ => KeyState::default(),
+            }
+        }
+        Discovery::NotFound => state,
     }
 }
 
@@ -148,8 +172,12 @@ pub struct SerberoSync {
     /// Notified when relaying a DM failed: catch up again early, so the
     /// failed alert is retried, with a growing delay while failures last.
     pub retry: Arc<Notify>,
-    /// First delay of that retry backoff.
+    /// First delay of that retry backoff, also used to retry discovery
+    /// while no key is known.
     pub first_retry: Duration,
+    /// Info events in a row that named no Serbero while a key was trusted
+    /// (see [`next_key`]); starts at 0.
+    pub no_serbero: u8,
 }
 
 impl SerberoSync {
@@ -158,12 +186,15 @@ impl SerberoSync {
         tokio::spawn(self.run())
     }
 
-    async fn run(self) {
+    async fn run(mut self) {
         let mut interval = tokio::time::interval(self.refresh);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut retries = Backoff::new(self.first_retry, self.refresh);
         let mut retry_at: Option<Instant> = None;
+        let mut key_retries = Backoff::new(self.first_retry, self.refresh);
+        let mut key_at: Option<Instant> = None;
         loop {
+            let wake_at = [retry_at, key_at].into_iter().flatten().min();
             // The first tick is immediate: catch up at startup.
             tokio::select! {
                 _ = interval.tick() => retries.reset(),
@@ -174,19 +205,26 @@ impl SerberoSync {
                     }
                     continue;
                 }
-                () = sleep_until(retry_at) => {}
+                () = sleep_until(wake_at) => {}
             }
             retry_at = None;
             if self.backlog.is_closed() {
                 return;
             }
             self.sync_once().await;
+            // Without a key nothing is relayed: look for one again soon.
+            key_at = if self.trusted.read().await.is_none() {
+                Some(Instant::now() + key_retries.next_delay())
+            } else {
+                key_retries.reset();
+                None
+            };
         }
     }
 
     /// One round: settle which key to trust, send the live subscription
     /// first, then catch up.
-    pub async fn sync_once(&self) {
+    pub async fn sync_once(&mut self) {
         if let Some(serbero) = self.refresh_key().await {
             self.subscribe(serbero).await;
             self.catch_up(serbero).await;
@@ -194,14 +232,22 @@ impl SerberoSync {
     }
 
     /// Updates the trusted key from the config or the node's info event.
-    async fn refresh_key(&self) -> Option<PublicKey> {
+    async fn refresh_key(&mut self) -> Option<PublicKey> {
         let current = *self.trusted.read().await;
         let next = match self.configured {
             Some(configured) => Some(configured),
             None => {
                 let discovery = discover(&self.client, self.mostro, DISCOVERY_TIMEOUT).await;
-                log_discovery(discovery, current);
-                next_serbero(current, discovery)
+                let state = next_key(
+                    KeyState {
+                        key: current,
+                        no_serbero: self.no_serbero,
+                    },
+                    discovery,
+                );
+                log_discovery(discovery, current, state.key);
+                self.no_serbero = state.no_serbero;
+                state.key
             }
         };
         if next != current {
@@ -277,9 +323,12 @@ async fn sleep_until(deadline: Option<Instant>) {
     }
 }
 
-fn log_discovery(discovery: Discovery, current: Option<PublicKey>) {
+fn log_discovery(discovery: Discovery, current: Option<PublicKey>, next: Option<PublicKey>) {
     match (discovery, current) {
         (Discovery::Serbero(_), _) => {}
+        (Discovery::NoSerbero, Some(_)) if next.is_some() => debug!(
+            "The Mostro node's info event names no Serbero; keeping the key until it is confirmed"
+        ),
         (Discovery::NoSerbero, Some(_)) => {
             warn!("The Mostro node no longer announces a Serbero; Serbero alerts are off")
         }
@@ -356,6 +405,7 @@ mod tests {
                 refresh: Duration::from_secs(3600),
                 retry: Arc::new(Notify::new()),
                 first_retry: Duration::from_millis(50),
+                no_serbero: 0,
             };
             (sync, received)
         }
@@ -490,21 +540,43 @@ mod tests {
         setup.shutdown().await;
     }
 
+    fn after(discoveries: &[Discovery]) -> KeyState {
+        discoveries
+            .iter()
+            .fold(KeyState::default(), |state, d| next_key(state, *d))
+    }
+
     #[test]
     fn the_trusted_key_follows_the_node_and_survives_silence() {
-        let current = Keys::generate().public_key();
-        let announced = Keys::generate().public_key();
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+        use Discovery::{NoSerbero, NotFound, Serbero};
 
+        assert_eq!(after(&[Serbero(a)]).key, Some(a));
+        assert_eq!(after(&[Serbero(a), Serbero(b)]).key, Some(b));
+        assert_eq!(after(&[Serbero(a), NotFound]).key, Some(a));
+        assert_eq!(after(&[NotFound]).key, None);
+        assert_eq!(after(&[NoSerbero]).key, None);
+    }
+
+    #[test]
+    fn a_working_key_is_dropped_only_after_two_answers_without_serbero() {
+        let a = Keys::generate().public_key();
+        use Discovery::{NoSerbero, NotFound, Serbero};
+
+        // One answer may come from a relay holding a stale info event.
+        assert_eq!(after(&[Serbero(a), NoSerbero]).key, Some(a));
+        assert_eq!(after(&[Serbero(a), NoSerbero, NoSerbero]).key, None);
+        // An answer naming Serbero again starts the count over.
         assert_eq!(
-            next_serbero(Some(current), Discovery::Serbero(announced)),
-            Some(announced)
+            after(&[Serbero(a), NoSerbero, Serbero(a), NoSerbero]).key,
+            Some(a)
         );
+        // A relay that did not answer is not an answer.
         assert_eq!(
-            next_serbero(Some(current), Discovery::NotFound),
-            Some(current)
+            after(&[Serbero(a), NoSerbero, NotFound, NoSerbero]).key,
+            None
         );
-        assert_eq!(next_serbero(Some(current), Discovery::NoSerbero), None);
-        assert_eq!(next_serbero(None, Discovery::NotFound), None);
     }
 
     #[tokio::test]
@@ -533,7 +605,7 @@ mod tests {
         for event in [&recent, &too_old, &to_someone_else, &from_a_stranger] {
             setup.publish(event).await;
         }
-        let (sync, mut backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let (mut sync, mut backlog) = setup.sync(Some(setup.serbero.public_key()), None);
 
         sync.sync_once().await;
 
@@ -575,10 +647,10 @@ mod tests {
         // Discovery or a config change moves trust from one key to another.
         let setup = Setup::new().await;
         let old_serbero = Keys::generate();
-        let (first, _backlog) = setup.sync(Some(old_serbero.public_key()), None);
+        let (mut first, _backlog) = setup.sync(Some(old_serbero.public_key()), None);
         first.sync_once().await;
         let (second, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
-        let second = SerberoSync {
+        let mut second = SerberoSync {
             trusted: first.trusted.clone(),
             ..second
         };
@@ -602,7 +674,7 @@ mod tests {
     #[tokio::test]
     async fn sending_the_same_subscription_again_keeps_it() {
         let setup = Setup::new().await;
-        let (sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let (mut sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
         let mut notifications = setup.client.notifications();
 
         sync.sync_once().await;
@@ -618,7 +690,7 @@ mod tests {
     #[tokio::test]
     async fn live_dms_arrive_on_the_keys_subscription() {
         let setup = Setup::new().await;
-        let (sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let (mut sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
         let mut notifications = setup.client.notifications();
         sync.sync_once().await;
 
@@ -636,7 +708,7 @@ mod tests {
         let setup = Setup::new().await;
         let hex = setup.serbero.public_key().to_hex();
         setup.publish_info(&[&["serbero", hex.as_str()]]).await;
-        let (sync, _backlog) = setup.sync(None, None);
+        let (mut sync, _backlog) = setup.sync(None, None);
 
         sync.sync_once().await;
 
@@ -654,11 +726,13 @@ mod tests {
         let setup = Setup::new().await;
         let hex = setup.serbero.public_key().to_hex();
         setup.publish_info(&[&["serbero", hex.as_str()]]).await;
-        let (sync, _backlog) = setup.sync(None, None);
+        let (mut sync, _backlog) = setup.sync(None, None);
         sync.sync_once().await;
         tokio::time::sleep(Duration::from_secs(1)).await; // a newer created_at
         setup.publish_info(&[&["pow", "0"]]).await;
 
+        sync.sync_once().await;
+        assert_eq!(*sync.trusted.read().await, Some(setup.serbero.public_key()));
         sync.sync_once().await;
 
         assert_eq!(*sync.trusted.read().await, None);
@@ -671,9 +745,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn discovery_is_retried_until_the_node_announces_serbero() {
+        let setup = Setup::new().await;
+        let (sync, _backlog) = setup.sync(None, None);
+        let trusted = sync.trusted.clone();
+        let task = sync.spawn();
+        // The node announces its Serbero only after the first, empty round.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let hex = setup.serbero.public_key().to_hex();
+        setup.publish_info(&[&["serbero", hex.as_str()]]).await;
+
+        // The hourly round is far away; a missing key is retried sooner.
+        let found = tokio::time::timeout(WAIT, async {
+            loop {
+                if let Some(key) = *trusted.read().await {
+                    return key;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await;
+
+        assert_eq!(found.expect("discovered"), setup.serbero.public_key());
+        task.abort();
+        setup.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn without_a_key_nothing_is_subscribed() {
         let setup = Setup::new().await;
-        let (sync, mut backlog) = setup.sync(None, None);
+        let (mut sync, mut backlog) = setup.sync(None, None);
 
         sync.sync_once().await;
 
@@ -713,6 +814,7 @@ mod tests {
             refresh: Duration::from_secs(3600),
             retry: Arc::new(Notify::new()),
             first_retry: Duration::from_millis(50),
+            no_serbero: 0,
         };
         let mut notifications = client.notifications();
         let task = sync.spawn();

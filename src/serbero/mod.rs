@@ -142,6 +142,7 @@ pub fn start(
         refresh: sync::sync_interval(nip65_refresh),
         retry: retry.clone(),
         first_retry: sync::FIRST_RETRY_DELAY,
+        no_serbero: 0,
     }
     .spawn();
     (SerberoInbox::new(settings.keys, trusted, retry), caught_up)
