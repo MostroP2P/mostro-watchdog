@@ -3,6 +3,7 @@
 //! holds the event loop back: live DMs reach it as notifications and
 //! caught-up ones through the backlog channel.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,9 +15,17 @@ use tracing::{debug, info, warn};
 
 use super::discovery::{discover, Discovery};
 
-/// Fixed id of the live subscription, so sending it again replaces it on
-/// every relay instead of adding another one.
-pub const SUBSCRIPTION_ID: &str = "mostro-watchdog-serbero";
+/// Start of the live subscription's id. The rest names the Serbero key:
+/// nostr-sdk refuses an id it already holds, so a new key needs a new id.
+const SUBSCRIPTION_PREFIX: &str = "mostro-watchdog-serbero";
+
+/// Hex digits of the Serbero key in the subscription id (NIP-01 caps ids at
+/// 64 characters).
+const SUBSCRIPTION_KEY_DIGITS: usize = 16;
+
+/// What nostr-sdk answers when a subscription id is already registered on a
+/// relay: the subscription is in place, nothing failed.
+const ALREADY_SUBSCRIBED: &str = "subscription ID already exists";
 
 /// How far back each catch-up reads. A fixed window rather than "since the
 /// newest DM relayed": an alert whose send failed is not marked as relayed,
@@ -33,9 +42,24 @@ pub const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(10);
 /// The Serbero key whose DMs are trusted; `None` until one is known.
 pub type TrustedSerbero = Arc<RwLock<Option<PublicKey>>>;
 
-/// Id of the live subscription.
-pub fn subscription_id() -> SubscriptionId {
-    SubscriptionId::new(SUBSCRIPTION_ID)
+/// Id of the live subscription to `serbero`'s DMs.
+pub fn subscription_id(serbero: &PublicKey) -> SubscriptionId {
+    let digits: String = serbero
+        .to_hex()
+        .chars()
+        .take(SUBSCRIPTION_KEY_DIGITS)
+        .collect();
+    SubscriptionId::new(format!("{SUBSCRIPTION_PREFIX}-{digits}"))
+}
+
+/// The relays that refused a subscription, and why. A relay that already
+/// holds it is not a refusal.
+pub fn refusals(failed: &HashMap<RelayUrl, String>) -> Vec<(&RelayUrl, &str)> {
+    failed
+        .iter()
+        .filter(|(_, reason)| reason.as_str() != ALREADY_SUBSCRIBED)
+        .map(|(relay, reason)| (relay, reason.as_str()))
+        .collect()
 }
 
 /// Serbero's DMs to the watchdog.
@@ -123,33 +147,43 @@ impl SerberoSync {
         };
         if next != current {
             *self.trusted.write().await = next;
-            match next {
-                Some(serbero) => info!(
+            // The old key's subscription would keep delivering DMs that are
+            // no longer trusted.
+            if let Some(old) = current {
+                self.unsubscribe(old).await;
+            }
+            if let Some(serbero) = next {
+                info!(
                     serbero = %serbero.to_hex(),
                     "🤖 Relaying Serbero's updates to Telegram"
-                ),
-                None => self.unsubscribe().await,
+                );
             }
         }
         next
     }
 
-    /// Sends the live subscription. Sending it again with the same id
-    /// replaces it, which restores it on relays that dropped it.
+    /// Sends the live subscription. Relays that already hold it keep it
+    /// (nostr-sdk refuses a known id); relays that lost it, e.g. after a
+    /// relay swap or a refused REQ, get it again.
     async fn subscribe(&self, serbero: PublicKey) {
         let filter = dm_filter(serbero, self.watchdog).since(Timestamp::now());
-        if let Err(e) = self
+        match self
             .client
             .subscribe(filter)
-            .with_id(subscription_id())
+            .with_id(subscription_id(&serbero))
             .await
         {
-            warn!(error = %e, "Failed to subscribe to Serbero's DMs");
+            Ok(output) => {
+                for (relay, reason) in refusals(&output.failed) {
+                    warn!(%relay, reason, "A relay refused the Serbero DM subscription");
+                }
+            }
+            Err(e) => warn!(error = %e, "Failed to subscribe to Serbero's DMs"),
         }
     }
 
-    async fn unsubscribe(&self) {
-        if let Err(e) = self.client.unsubscribe(&subscription_id()).await {
+    async fn unsubscribe(&self, serbero: PublicKey) {
+        if let Err(e) = self.client.unsubscribe(&subscription_id(&serbero)).await {
             debug!(error = %e, "Failed to close the Serbero DM subscription");
         }
     }
@@ -390,14 +424,81 @@ mod tests {
         assert_eq!(caught_up, vec![recent]);
         assert!(!setup
             .client
-            .subscription(&subscription_id())
+            .subscription(&subscription_id(&setup.serbero.public_key()))
             .await
             .is_empty());
         setup.shutdown().await;
     }
 
+    #[test]
+    fn each_serbero_key_has_its_own_short_subscription_id() {
+        let a = Keys::generate().public_key();
+        let b = Keys::generate().public_key();
+
+        assert_ne!(subscription_id(&a), subscription_id(&b));
+        assert_eq!(subscription_id(&a), subscription_id(&a));
+        assert!(subscription_id(&a).to_string().len() <= 64);
+    }
+
+    #[test]
+    fn a_relay_that_already_holds_the_subscription_did_not_refuse_it() {
+        let held = RelayUrl::parse("wss://held.example").unwrap();
+        let refusing = RelayUrl::parse("wss://refusing.example").unwrap();
+        let failed = HashMap::from([
+            (held, ALREADY_SUBSCRIBED.to_string()),
+            (refusing.clone(), "blocked: not allowed".to_string()),
+        ]);
+
+        assert_eq!(refusals(&failed), vec![(&refusing, "blocked: not allowed")]);
+    }
+
     #[tokio::test]
-    async fn live_dms_arrive_on_the_fixed_subscription() {
+    async fn a_new_serbero_key_replaces_the_live_subscription() {
+        // Discovery or a config change moves trust from one key to another.
+        let setup = Setup::new().await;
+        let old_serbero = Keys::generate();
+        let (first, _backlog) = setup.sync(Some(old_serbero.public_key()), None);
+        first.sync_once().await;
+        let (second, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let second = SerberoSync {
+            trusted: first.trusted.clone(),
+            ..second
+        };
+        let mut notifications = setup.client.notifications();
+
+        second.sync_once().await;
+
+        assert!(setup
+            .client
+            .subscription(&subscription_id(&old_serbero.public_key()))
+            .await
+            .is_empty());
+        let live = setup.dm(&format!("Dispute {DISPUTE} · mediating"), Timestamp::now());
+        setup.publish(&live).await;
+        let (subscription, event) = next_dm(&mut notifications).await;
+        assert_eq!(subscription, subscription_id(&setup.serbero.public_key()));
+        assert_eq!(event, live);
+        setup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn sending_the_same_subscription_again_keeps_it() {
+        let setup = Setup::new().await;
+        let (sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let mut notifications = setup.client.notifications();
+
+        sync.sync_once().await;
+        sync.sync_once().await;
+
+        let live = setup.dm(&format!("Dispute {DISPUTE} · mediating"), Timestamp::now());
+        setup.publish(&live).await;
+        let (_, event) = next_dm(&mut notifications).await;
+        assert_eq!(event, live);
+        setup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn live_dms_arrive_on_the_keys_subscription() {
         let setup = Setup::new().await;
         let (sync, _backlog) = setup.sync(Some(setup.serbero.public_key()), None);
         let mut notifications = setup.client.notifications();
@@ -407,7 +508,7 @@ mod tests {
         setup.publish(&live).await;
 
         let (subscription, event) = next_dm(&mut notifications).await;
-        assert_eq!(subscription, subscription_id());
+        assert_eq!(subscription, subscription_id(&setup.serbero.public_key()));
         assert_eq!(event, live);
         setup.shutdown().await;
     }
@@ -424,7 +525,7 @@ mod tests {
         assert_eq!(*sync.trusted.read().await, Some(setup.serbero.public_key()));
         assert!(!setup
             .client
-            .subscription(&subscription_id())
+            .subscription(&subscription_id(&setup.serbero.public_key()))
             .await
             .is_empty());
         setup.shutdown().await;
@@ -445,7 +546,7 @@ mod tests {
         assert_eq!(*sync.trusted.read().await, None);
         assert!(setup
             .client
-            .subscription(&subscription_id())
+            .subscription(&subscription_id(&setup.serbero.public_key()))
             .await
             .is_empty());
         setup.shutdown().await;
@@ -461,7 +562,7 @@ mod tests {
         assert_eq!(*sync.trusted.read().await, None);
         assert!(setup
             .client
-            .subscription(&subscription_id())
+            .subscription(&subscription_id(&setup.serbero.public_key()))
             .await
             .is_empty());
         assert!(backlog.try_recv().is_err());
