@@ -52,6 +52,9 @@ settled = true
 # Dispute released by seller (default: true)
 released = true
 
+# Both parties cancelled cooperatively during the dispute (default: true)
+cooperatively_canceled = true
+
 # Other/unknown status changes (default: true)
 other = true
 

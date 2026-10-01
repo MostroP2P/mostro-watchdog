@@ -30,6 +30,10 @@ pub struct AlertsConfig {
     /// Enable alerts when dispute is released
     #[serde(default = "default_true")]
     pub released: bool,
+    /// Enable alerts when the parties cancel cooperatively during a dispute
+    /// (`cooperatively-canceled`, emitted by Mostro from mostro-core 0.15.1)
+    #[serde(default = "default_true")]
+    pub cooperatively_canceled: bool,
     /// Enable alerts for unknown/other status changes
     #[serde(default = "default_true")]
     pub other: bool,
@@ -55,6 +59,7 @@ impl Default for AlertsConfig {
             seller_refunded: true,
             settled: true,
             released: true,
+            cooperatively_canceled: true,
             other: true,
             serbero_handoff: true,
             serbero_progress: true,

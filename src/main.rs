@@ -827,6 +827,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Whether an alert is enabled for a kind-38386 dispute `status`, per
+/// `[alerts]` in the config. A status this version does not know falls back
+/// to `other`.
+fn alert_enabled(status: &str, alerts_config: &config::AlertsConfig) -> bool {
+    match status {
+        "initiated" => alerts_config.initiated,
+        "in-progress" => alerts_config.in_progress,
+        "seller-refunded" => alerts_config.seller_refunded,
+        "settled" => alerts_config.settled,
+        "released" => alerts_config.released,
+        "cooperatively-canceled" => alerts_config.cooperatively_canceled,
+        _ => alerts_config.other,
+    }
+}
+
 /// Resolves `[serbero]`: the watchdog's own keys from the environment and
 /// Serbero's key when configured. `None` when Serbero alerts are off.
 fn resolve_serbero(config: &Config) -> Result<Option<SerberoSettings>, Box<dyn std::error::Error>> {
@@ -964,14 +979,7 @@ async fn handle_dispute_event(
     .await;
 
     // Check if this alert type is enabled
-    let alert_enabled = match status.as_str() {
-        "initiated" => alerts_config.initiated,
-        "in-progress" => alerts_config.in_progress,
-        "seller-refunded" => alerts_config.seller_refunded,
-        "settled" => alerts_config.settled,
-        "released" => alerts_config.released,
-        _ => alerts_config.other,
-    };
+    let alert_enabled = alert_enabled(&status, alerts_config);
 
     if !alert_enabled {
         info!(
@@ -1067,6 +1075,17 @@ async fn handle_dispute_event(
                  ✔️ Dispute closed: buyer receives payment\\.",
                 escape_markdown_code(&dispute_id),
                 solver_info,
+                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
+            )
+        }
+        "cooperatively-canceled" => {
+            format!(
+                "🤝 *DISPUTE RESOLVED \\- COOPERATIVELY CANCELED*\n\n\
+                 📋 *Dispute ID:* `{}`\n\
+                 🤝 *Resolution:* Both parties agreed to cancel\n\
+                 ⏰ *Time:* {}\n\n\
+                 ✔️ Dispute closed: funds returned to seller, no solver needed\\.",
+                escape_markdown_code(&dispute_id),
                 escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
             )
         }
@@ -1414,6 +1433,7 @@ mod tests {
         assert!(config.seller_refunded);
         assert!(config.settled);
         assert!(config.released);
+        assert!(config.cooperatively_canceled);
         assert!(config.other);
     }
 
@@ -1427,7 +1447,17 @@ mod tests {
         assert!(should_send_alert("seller-refunded", &config));
         assert!(should_send_alert("settled", &config));
         assert!(should_send_alert("released", &config));
+        assert!(should_send_alert("cooperatively-canceled", &config));
         assert!(should_send_alert("unknown-status", &config)); // maps to other
+
+        // `cooperatively-canceled` has its own switch, not `other`: turning
+        // off unknown statuses must not silence it.
+        config.other = false;
+        assert!(should_send_alert("cooperatively-canceled", &config));
+        config.cooperatively_canceled = false;
+        assert!(!should_send_alert("cooperatively-canceled", &config));
+        config.other = true;
+        config.cooperatively_canceled = true;
 
         // Test specific disabling
         config.initiated = false;
@@ -1439,17 +1469,10 @@ mod tests {
         assert!(should_send_alert("settled", &config)); // still enabled
     }
 
-    /// Helper function to test alert gating logic
-    /// This mirrors the logic in handle_dispute_event
+    /// The production gate itself, not a copy of it: a copy let a status be
+    /// added to `handle_dispute_event` without any test noticing.
     fn should_send_alert(status: &str, alerts_config: &AlertsConfig) -> bool {
-        match status {
-            "initiated" => alerts_config.initiated,
-            "in-progress" => alerts_config.in_progress,
-            "seller-refunded" => alerts_config.seller_refunded,
-            "settled" => alerts_config.settled,
-            "released" => alerts_config.released,
-            _ => alerts_config.other,
-        }
+        alert_enabled(status, alerts_config)
     }
 
     #[test]

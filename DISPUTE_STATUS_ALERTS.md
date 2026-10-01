@@ -35,6 +35,11 @@ The bot monitors these dispute status changes:
 - **Message**: Shows cooperative resolution
 - **Action needed**: None, dispute closed
 
+### 🤝 `cooperatively-canceled`
+- **Description**: Both parties agreed to a cooperative cancel while the dispute was open: the seller is refunded and no solver was needed. Emitted by Mostro nodes on mostro-core 0.15.1 or later; older nodes reported this case as `seller-refunded`.
+- **Message**: Shows the users' own resolution and the refund to the seller
+- **Action needed**: None, dispute closed
+
 ### 📡 `other`
 - **Description**: Unknown or future status types
 - **Message**: Generic status update message
@@ -54,6 +59,7 @@ in_progress = true      # Dispute taken (recommended: true)
 seller_refunded = true  # Seller refunded (recommended: true) 
 settled = true          # Payment to buyer (recommended: true)
 released = true         # Released by seller (recommended: true)
+cooperatively_canceled = true  # Cancelled by both parties (recommended: true)
 other = true           # Unknown statuses (recommended: true)
 ```
 
