@@ -17,8 +17,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `[alerts]` options `serbero_handoff` and `serbero_progress`.
 
 ### Changed
-- `disputes.db` gains a `message_text` column and two Serbero tables; existing
-  databases are migrated on start.
+- `disputes.db` gains a `message_text` column and three tables
+  (`serbero_states`, `serbero_headers`, `dispute_statuses`); existing databases
+  are migrated on start.
+
+### Fixed
+- A config file with a TOML error no longer prints the whole file, Telegram bot
+  token included, at startup: the error shows its message and line only.
 
 ## [v0.1.0] - 2026-02-19
 

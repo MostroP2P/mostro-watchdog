@@ -117,6 +117,9 @@ http_port = 8080
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
 
 # Serbero's public key (npub or hex). When omitted, it is read from the Mostro
-# node's info event (kind 38385, `serbero` tag) and refreshed every
-# nip65_refresh_interval.
+# node's info event (kind 38385, `serbero` tag) and checked again every 10
+# minutes (or every nip65_refresh_interval, if shorter).
 # pubkey = "npub1..."
+#
+# The watchdog hears Serbero only on its own relays (the bootstrap relays above,
+# then the Mostro node's NIP-65 relays): Serbero must publish to at least one.

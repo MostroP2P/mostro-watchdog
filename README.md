@@ -305,6 +305,9 @@ Setup:
    pubkey = "<watchdog hex pubkey>"
    ```
 
+The watchdog hears Serbero only on its own relays (the bootstrap `nostr.relays`, then
+the Mostro node's NIP-65 relays), so Serbero must publish to at least one of them.
+
 Observers receive only the first line of each update, never what the parties wrote.
 Even if the watchdog is registered as a solver by mistake, it reads only that first
 line and drops the rest. See [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts)

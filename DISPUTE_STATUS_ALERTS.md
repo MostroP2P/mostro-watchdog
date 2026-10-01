@@ -174,9 +174,17 @@ variable is missing or does not hold a valid key. Error messages name the
 variable, never its value.
 
 When `pubkey` is omitted, the watchdog reads Serbero's key from the `serbero`
-tag of the Mostro node's info event (kind 38385) and checks it again every
-`nip65_refresh_interval`. If the node announces no Serbero, the watchdog logs a
-warning and keeps running without Serbero alerts.
+tag of the Mostro node's info event (kind 38385) and checks it again every 10
+minutes (or every `nip65_refresh_interval`, if shorter). While no key is known
+it retries sooner, from 30 seconds on. If the node announces no Serbero, the
+watchdog logs a warning and keeps running without Serbero alerts. A key that
+worked is dropped only after two info events in a row name no Serbero, since
+one may be a stale copy on a slow relay.
+
+**Relays.** The watchdog hears Serbero only on its own relays: the bootstrap
+`[nostr] relays`, then the Mostro node's NIP-65 relays once it switches to
+them. Serbero must publish to at least one of these relays, or its messages
+never reach the watchdog (nothing warns about it).
 
 To turn either kind of alert off:
 
@@ -202,10 +210,15 @@ asking for the key to be moved to `[[observers]]`.
   ignored.
 - Each update is relayed at most once per dispute, across relay redeliveries
   and restarts (recorded in `disputes.db`).
-- On every start, and every `nip65_refresh_interval`, the watchdog fetches the
-  last 24 hours of Serbero's messages, so updates sent while it was down are
-  relayed. A handoff alert that Telegram rejected is retried then. A handoff
-  for a dispute the watchdog already saw resolved sends no alert.
+- On every start, every 10 minutes (or every `nip65_refresh_interval`, if
+  shorter) and after each switch of relays, the watchdog fetches the last 24
+  hours of Serbero's messages, so updates sent while it was down are relayed.
+- A handoff alert that Telegram rejected is retried by an early fetch, after
+  30 seconds and then after doubling delays while failures last.
+- A handoff for a dispute the watchdog already saw resolved sends no alert.
+- Updates move a dispute only forward (mediating, then guidance, then
+  handoff): Serbero dates a retried message when it sends it, so a late
+  `mediating` never replaces a handoff.
 
 ## Benefits
 
