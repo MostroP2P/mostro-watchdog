@@ -22,9 +22,19 @@ hyper = { version = "1.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1", features = ["tokio", "server", "http1"] }
 http-body-util = "0.1"
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite"] }
+# Opens Serbero's Mostro protocol v2 DMs (kind 14, NIP-44); no hand-rolled crypto
+mostro-core = "0.16.0"
+# Dispute ids in Mostro messages (already in the tree through mostro-core)
+uuid = "1.26.1"
+thiserror = "2.0.21"
 
 [dev-dependencies]
+futures = "0.3.34"
+# In-process relays (MockRelay) for the Serbero subscription and discovery tests
+nostr-sdk = { version = "0.45.2", features = ["local-relay"] }
 tempfile = "3"
+# Paused clock for the discovery grace tests
+tokio = { version = "1", features = ["test-util"] }
 
 [package.metadata.release]
 # Automatically create and push git tag
