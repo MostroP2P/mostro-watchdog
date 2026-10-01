@@ -884,6 +884,7 @@ async fn run_event_loop(
                             &event,
                             ctx.alerts_config,
                             ctx.dispute_store,
+                            ctx.serbero_inbox.is_some(),
                         )
                         .await;
                     } else if event.kind == Kind::PrivateDirectMessage {
@@ -918,12 +919,15 @@ async fn next_serbero_batch(
     }
 }
 
+/// Sends or updates a dispute's alert. `serbero_enabled` (a `[serbero]`
+/// section) turns on the Serbero bookkeeping and the Serbero line.
 async fn handle_dispute_event(
     bot: &Bot,
     chat_id: i64,
     event: &Event,
     alerts_config: &config::AlertsConfig,
     dispute_store: &DisputeMessageStore,
+    serbero_enabled: bool,
 ) {
     let mut dispute_id = String::from("unknown");
     let mut status = String::from("unknown");
@@ -950,15 +954,14 @@ async fn handle_dispute_event(
 
     // Recorded before the alert toggles and the cooperative-cancel delete,
     // so a late Serbero handoff knows the dispute already ended.
-    if dispute_id != "unknown" {
-        let created_at = event.created_at.as_secs() as i64;
-        if let Err(e) = dispute_store
-            .record_dispute_status(&dispute_id, &status, created_at)
-            .await
-        {
-            error!("Failed to record dispute status: {}", e);
-        }
-    }
+    serbero::alerts::note_dispute_status(
+        dispute_store,
+        serbero_enabled,
+        &dispute_id,
+        &status,
+        event.created_at.as_secs(),
+    )
+    .await;
 
     // Check if this alert type is enabled
     let alert_enabled = match status.as_str() {
@@ -1099,7 +1102,7 @@ async fn handle_dispute_event(
         &dispute_id,
         &status,
         &message,
-        alerts_config.serbero_progress,
+        serbero_enabled && alerts_config.serbero_progress,
     )
     .await;
 

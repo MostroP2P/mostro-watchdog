@@ -168,6 +168,28 @@ pub fn supersedes(update: &HeaderUpdate, stored: Option<&SerberoState>) -> bool 
     (update.update.stage(), seconds(update.created_at)) >= (stored_stage, stored.created_at)
 }
 
+/// Records a dispute's newest kind-38386 status, so a late Serbero handoff
+/// knows the dispute already ended. Only with Serbero alerts on: without
+/// them nothing reads it.
+pub async fn note_dispute_status(
+    store: &DisputeMessageStore,
+    serbero_enabled: bool,
+    dispute_id: &str,
+    status: &str,
+    created_at: u64,
+) {
+    // `handle_dispute_event`'s placeholder for an event without a `d` tag.
+    if !serbero_enabled || dispute_id == "unknown" {
+        return;
+    }
+    if let Err(e) = store
+        .record_dispute_status(dispute_id, status, seconds(created_at))
+        .await
+    {
+        error!(dispute_id, error = %e, "Failed to record the dispute's status");
+    }
+}
+
 /// `base` with Serbero's latest state for the dispute appended, when there
 /// is one and progress is shown. A store error leaves `base` unchanged: the
 /// dispute alert matters more than Serbero's line.
@@ -801,6 +823,29 @@ mod tests {
             closed,
             "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\)"
         );
+    }
+
+    #[tokio::test]
+    async fn dispute_statuses_are_recorded_only_with_serbero_alerts_on() {
+        let fx = Fixture::new().await;
+
+        note_dispute_status(&fx.store, false, DISPUTE, "settled", AT).await;
+        assert_eq!(fx.store.dispute_status(DISPUTE).await.unwrap(), None);
+
+        note_dispute_status(&fx.store, true, DISPUTE, "settled", AT).await;
+        assert_eq!(
+            fx.store.dispute_status(DISPUTE).await.unwrap().as_deref(),
+            Some("settled")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_event_without_a_dispute_id_records_nothing() {
+        let fx = Fixture::new().await;
+
+        note_dispute_status(&fx.store, true, "unknown", "settled", AT).await;
+
+        assert_eq!(fx.store.dispute_status("unknown").await.unwrap(), None);
     }
 
     #[tokio::test]
