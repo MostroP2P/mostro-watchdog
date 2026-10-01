@@ -55,6 +55,15 @@ released = true
 # Other/unknown status changes (default: true)
 other = true
 
+# Serbero alerts (only with the [serbero] section below)
+# A new message when Serbero hands a dispute off to a human solver or cannot
+# start mediating it (default: true)
+serbero_handoff = true
+
+# Show Serbero's progress (mediating, guidance sent, handed off) on the
+# dispute's message; edits do not notify (default: true)
+serbero_progress = true
+
 # Health check and monitoring configuration (optional)
 [health]
 # Enable periodic heartbeat notifications (default: false)
@@ -85,3 +94,29 @@ http_port = 8080
 # HTTP endpoint bind address (default: "127.0.0.1")
 # Set to "0.0.0.0" when running in Docker to allow port mapping
 # http_bind = "0.0.0.0"
+
+# Serbero alerts (optional)
+# Serbero is Mostro's dispute assistant. With this section, the watchdog shows
+# Serbero's progress on each dispute and pings the chat when Serbero hands a
+# dispute off and a human solver must take it over. Without it, nothing changes.
+#
+# Setup:
+# 1. Generate a Nostr key for the watchdog, used for nothing else (for example
+#    `openssl rand -hex 32` or `nak key generate`), and export it before
+#    starting the watchdog:
+#      export WATCHDOG_NOSTR_PRIVATE_KEY=...   # nsec or hex
+# 2. Start the watchdog: it logs its public key in npub and hex.
+# 3. Add the hex public key to Serbero's config and restart Serbero:
+#      [[observers]]
+#      pubkey = "<watchdog hex pubkey>"
+#    Register it as an observer, not as a solver: observers only get the first
+#    line of each mediation update, never what the parties wrote.
+# [serbero]
+# Environment variable holding the watchdog's own Nostr secret key (nsec or hex).
+# Never put the key itself in this file. (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
+# private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+
+# Serbero's public key (npub or hex). When omitted, it is read from the Mostro
+# node's info event (kind 38385, `serbero` tag) and refreshed every
+# nip65_refresh_interval.
+# pubkey = "npub1..."

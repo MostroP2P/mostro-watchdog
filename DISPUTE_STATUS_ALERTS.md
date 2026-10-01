@@ -96,6 +96,117 @@ The `[alerts]` section is **optional**. If not present, all alert types default 
 ✔️ Dispute closed: buyer receives payment.
 ```
 
+## Serbero alerts
+
+[Serbero](https://github.com/MostroP2P/serbero) is Mostro's dispute assistant.
+It takes a dispute as a read-only solver, talks to both parties and, when a
+person is needed, hands the dispute off to the human solvers. While Serbero
+mediates, Mostro shows the dispute as `in-progress`, so without Serbero alerts
+the Telegram group never learns that a dispute was handed off and needs a solver.
+
+With Serbero alerts on, the watchdog:
+
+- shows Serbero's latest step on the dispute's message (an edit, which does not
+  notify);
+- sends a **new message**, which notifies, when Serbero hands a dispute off or
+  cannot start mediating it. It replies to the dispute's message when there is
+  one, and stands alone otherwise (for example when the watchdog started after
+  the dispute's alert went out).
+
+| Serbero says | Line on the dispute's message | New message |
+|---|---|---|
+| `mediating` | 🤖 Serbero: mediating | – |
+| `guidance sent: <path>` | 🤖 Serbero: guided the parties to resolve it themselves (payment arrived) | – |
+| `handed off: <reason>` | 🙋 Serbero: handed off (conflicting claims) — a solver must take it over | 🙋 SERBERO HANDED OFF A DISPUTE |
+| `mediation could not start` | 🙋 Serbero: mediation could not start — a solver must take it over | 🙋 SERBERO COULD NOT START MEDIATION |
+
+The line stays on the message through later status changes. Once the dispute
+is resolved, "a solver must take it over" is dropped (and `mediating` reads
+`mediated`), so the final message stays true.
+
+### Handoff alert
+
+```text
+🙋 SERBERO HANDED OFF A DISPUTE
+
+📋 Dispute ID: `abc123def456`
+💬 Reason: conflicting claims
+⏰ Time: 2026-10-01 15:30:00 UTC
+
+⚡ A solver must take it over in Mostrix (Ctrl+T on Disputes Pending).
+```
+
+Reasons are Serbero's handoff reasons in plain words: `conflicting claims`,
+`fraud signal`, `human requested`, `round limit`, `unresponsive`, and so on.
+
+### Setup
+
+1. Generate a Nostr key for the watchdog, used for nothing else. Any Nostr key
+   tool works, or `openssl rand -hex 32`.
+2. Put the key in an environment variable (nsec or hex) and add a `[serbero]`
+   section to `config.toml`:
+
+   ```bash
+   export WATCHDOG_NOSTR_PRIVATE_KEY=...   # never in config.toml
+   ```
+
+   ```toml
+   [serbero]
+   # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"   # the default
+   # pubkey = "npub1..."   # Serbero's key; read from the Mostro node when omitted
+   ```
+
+3. Start the watchdog. It logs its own public key:
+
+   ```text
+   🤖 Serbero alerts enabled. Watchdog Nostr pubkey: npub1... (hex: 3bf0...). Add the hex key to Serbero's [[observers]].
+   ```
+
+4. Add that hex key to Serbero's config as an **observer** and restart Serbero:
+
+   ```toml
+   [[observers]]
+   pubkey = "<watchdog hex pubkey>"
+   ```
+
+The watchdog fails to start when `[serbero]` is present but the environment
+variable is missing or does not hold a valid key. Error messages name the
+variable, never its value.
+
+When `pubkey` is omitted, the watchdog reads Serbero's key from the `serbero`
+tag of the Mostro node's info event (kind 38385) and checks it again every
+`nip65_refresh_interval`. If the node announces no Serbero, the watchdog logs a
+warning and keeps running without Serbero alerts.
+
+To turn either kind of alert off:
+
+```toml
+[alerts]
+serbero_handoff = false    # no new message on handoffs
+serbero_progress = false   # no Serbero line on dispute messages
+```
+
+### Privacy
+
+Serbero sends observers only the first line of each update, for example
+`Dispute <id> · handed off: conflicting_claims`, never what the parties wrote.
+If the watchdog's key is registered as a solver by mistake, Serbero sends it
+full briefs and transcripts: the watchdog still reads only the first line,
+drops the rest without storing, logging or forwarding it, and logs a warning
+asking for the key to be moved to `[[observers]]`.
+
+### Delivery
+
+- Serbero's messages are Mostro protocol v2 `send-dm` messages (NIP-44,
+  kind 14) signed by Serbero; anything not signed by the trusted Serbero key is
+  ignored.
+- Each update is relayed at most once per dispute, across relay redeliveries
+  and restarts (recorded in `disputes.db`).
+- On every start, and every `nip65_refresh_interval`, the watchdog fetches the
+  last 24 hours of Serbero's messages, so updates sent while it was down are
+  relayed. A handoff alert that Telegram rejected is retried then. A handoff
+  for a dispute the watchdog already saw resolved sends no alert.
+
 ## Benefits
 
 1. **Complete visibility**: Track disputes from creation to resolution
