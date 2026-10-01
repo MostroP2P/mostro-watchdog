@@ -104,6 +104,19 @@ The container expects a config file mounted at `/config/config.toml`. See `confi
 
 The container runs as a non-root user (`watchdog`) for security. No environment variables are required — all configuration is done via the config file.
 
+The one exception is [Serbero alerts](DISPUTE_STATUS_ALERTS.md#serbero-alerts): the watchdog's own Nostr secret key is read from an environment variable (`WATCHDOG_NOSTR_PRIVATE_KEY` by default), never from `config.toml`. Pass it to the container:
+
+```bash
+docker run -d \
+  --name mostro-watchdog \
+  --restart unless-stopped \
+  -e WATCHDOG_NOSTR_PRIVATE_KEY \
+  -v $(pwd)/config.toml:/config/config.toml:ro \
+  ghcr.io/mostrop2p/mostro-watchdog:latest
+```
+
+`-e WATCHDOG_NOSTR_PRIVATE_KEY` without a value copies it from your shell, so the key stays out of your shell history. With Docker Compose, uncomment the `environment` entry in `docker-compose.yml`.
+
 ### Logging
 
 Set the log level via the `RUST_LOG` environment variable:

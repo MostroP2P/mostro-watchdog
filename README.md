@@ -28,6 +28,11 @@ Mostro daemon → Nostr (kind 38386) → mostro-watchdog → Telegram alert
 3. When a new dispute is detected (status: `initiated`), it sends a formatted alert to your Telegram group/channel
 4. Admins see the alert and can take the dispute via Mostrix or their preferred admin client
 
+If your node runs [Serbero](https://github.com/MostroP2P/serbero), Mostro's dispute
+assistant, the watchdog can also follow it: it shows Serbero's progress on each
+dispute's message and pings the group when Serbero hands a dispute off and a human
+solver must take it over. See [Serbero Alerts](#serbero-alerts).
+
 ## Quick Start
 
 ### Prerequisites
@@ -264,6 +269,50 @@ When a dispute is detected, you'll receive a message like:
 ⚡ Please take this dispute in Mostrix or your admin client.
 ```
 
+## Serbero Alerts
+
+[Serbero](https://github.com/MostroP2P/serbero) mediates disputes as a read-only
+solver and hands them to human solvers when needed. While it mediates, Mostro shows
+the dispute as `in-progress`, so the group would never learn that a handoff happened.
+With Serbero alerts on, the watchdog:
+
+- adds Serbero's latest step to the dispute's message, e.g. `🤖 Serbero: mediating`
+  or `🙋 Serbero: handed off (conflicting claims) — a solver must take it over`;
+- sends a new message when Serbero hands a dispute off or cannot start mediating it,
+  as a reply to the dispute's message:
+
+```text
+🙋 SERBERO HANDED OFF A DISPUTE
+
+📋 Dispute ID: abc123def456
+💬 Reason: conflicting claims
+⏰ Time: 2026-10-01 15:30:00 UTC
+
+⚡ A solver must take it over in Mostrix (Ctrl+T on Disputes Pending).
+```
+
+Setup:
+
+1. Generate a Nostr key for the watchdog (e.g. `openssl rand -hex 32`) and export it:
+   `export WATCHDOG_NOSTR_PRIVATE_KEY=...` (nsec or hex; never put it in `config.toml`).
+2. Add a `[serbero]` section to `config.toml` (an empty one is enough; see
+   `config.example.toml`).
+3. Start the watchdog and copy the hex public key it logs.
+4. Add that key to Serbero's config as an observer, then restart Serbero:
+
+   ```toml
+   [[observers]]
+   pubkey = "<watchdog hex pubkey>"
+   ```
+
+The watchdog hears Serbero only on its own relays (the bootstrap `nostr.relays`, then
+the Mostro node's NIP-65 relays), so Serbero must publish to at least one of them.
+
+Observers receive only the first line of each update, never what the parties wrote.
+Even if the watchdog is registered as a solver by mistake, it reads only that first
+line and drops the rest. See [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts)
+for details.
+
 ## Configuration Reference
 
 | Field | Description |
@@ -272,6 +321,10 @@ When a dispute is detected, you'll receive a message like:
 | `nostr.relays` | Array of Nostr relay WebSocket URLs |
 | `telegram.bot_token` | Telegram bot API token |
 | `telegram.chat_id` | Telegram chat/group/channel ID for alerts |
+| `alerts.serbero_handoff` | New message when Serbero hands a dispute off (default: `true`) |
+| `alerts.serbero_progress` | Serbero's progress on dispute messages (default: `true`) |
+| `serbero.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
+| `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |
 
 ## Roadmap
 

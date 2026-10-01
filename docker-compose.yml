@@ -6,6 +6,10 @@ services:
     restart: unless-stopped
     volumes:
       - ./config.toml:/config/config.toml:ro
+    # Uncomment for Serbero alerts: the watchdog's Nostr secret key, taken from
+    # the environment that runs `docker compose` (never put it in this file)
+    # environment:
+    #   - WATCHDOG_NOSTR_PRIVATE_KEY
     # Uncomment to expose the health HTTP endpoint
     # ports:
     #   - "8080:8080"
