@@ -464,6 +464,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_handoff_after_a_cooperative_cancel_sends_no_alert() {
+        // `canceled` deletes the dispute's message, so only the recorded
+        // status says the dispute ended.
+        let fx = Fixture::new().await;
+        fx.store
+            .record_dispute_status(DISPUTE, "canceled", AT as i64 - 10)
+            .await
+            .unwrap();
+
+        let outcome = fx
+            .alerts()
+            .relay(&update(Update::CouldNotStart, AT))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Relayed {
+                redrawn: false,
+                alerted: false
+            }
+        );
+        assert_eq!(fx.telegram.calls(), vec![]);
+    }
+
+    #[tokio::test]
     async fn a_message_in_another_chat_gets_a_standalone_alert() {
         // The alert chat changed since the dispute's message was sent.
         let fx = Fixture::new().await;

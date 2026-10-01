@@ -14,16 +14,21 @@ pub fn dispute_is_open(status: &str) -> bool {
     matches!(status.parse(), Ok(Status::Initiated | Status::InProgress))
 }
 
+/// The cooperative-cancel status of older nodes, which `handle_dispute_event`
+/// treats as the end of the dispute (it deletes the dispute's message).
+const CANCELED_STATUS: &str = "canceled";
+
 /// Whether a dispute is over, by its kind-38386 status. A status this
 /// version does not know is not taken as an outcome.
 pub fn dispute_is_resolved(status: &str) -> bool {
-    matches!(
-        status.parse(),
-        Ok(Status::SellerRefunded
-            | Status::Settled
-            | Status::Released
-            | Status::CooperativelyCanceled)
-    )
+    status == CANCELED_STATUS
+        || matches!(
+            status.parse(),
+            Ok(Status::SellerRefunded
+                | Status::Settled
+                | Status::Released
+                | Status::CooperativelyCanceled)
+        )
 }
 
 /// A Serbero reason or path for people: `conflicting_claims` →
@@ -141,6 +146,9 @@ mod tests {
             "seller-refunded",
             "released",
             "cooperatively-canceled",
+            // What older nodes send on a cooperative cancel; the watchdog
+            // deletes the dispute's message on it.
+            "canceled",
         ] {
             assert!(dispute_is_resolved(resolved), "{resolved}");
         }
