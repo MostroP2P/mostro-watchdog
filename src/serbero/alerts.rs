@@ -156,14 +156,16 @@ fn seconds(created_at: u64) -> i64 {
     i64::try_from(created_at).unwrap_or(i64::MAX)
 }
 
-/// Whether `update` replaces the `stored` state: it was written later, or
-/// in the same second at a later stage of the mediation.
+/// Whether `update` replaces the `stored` state: it is a later stage of the
+/// mediation, or the same stage written later. The stage comes first because
+/// each subject happens once per dispute and Serbero signs a retried notice
+/// when it sends it, so a late `mediating` must never undo a handoff.
 pub fn supersedes(update: &HeaderUpdate, stored: Option<&SerberoState>) -> bool {
     let Some(stored) = stored else {
         return true;
     };
     let stored_stage = Update::from_subject(&stored.subject).map_or(0, |u| u.stage());
-    (seconds(update.created_at), update.update.stage()) >= (stored.created_at, stored_stage)
+    (update.update.stage(), seconds(update.created_at)) >= (stored_stage, stored.created_at)
 }
 
 /// `base` with Serbero's latest state for the dispute appended, when there
@@ -685,26 +687,73 @@ mod tests {
     }
 
     #[test]
-    fn a_later_update_supersedes_the_stored_state() {
+    fn a_later_stage_supersedes_whatever_its_date() {
         let stored = state("mediating", 100);
 
         assert!(supersedes(&update(handed_off("flood"), 101), Some(&stored)));
-        assert!(!supersedes(&update(handed_off("flood"), 99), Some(&stored)));
+        assert!(supersedes(&update(handed_off("flood"), 99), Some(&stored)));
         assert!(supersedes(&update(Update::Mediating, 5), None));
     }
 
     #[test]
-    fn in_the_same_second_the_later_stage_wins() {
-        let mediating = state("mediating", 100);
+    fn a_late_notice_never_moves_a_dispute_back() {
+        // Serbero signs a retried notice when it sends it, so a `mediating`
+        // that failed earlier can arrive after the handoff, with a later date.
+        let stored = state("handed off: conflicting_claims", 1000);
+
+        assert!(!supersedes(&update(Update::Mediating, 1100), Some(&stored)));
+        assert!(!supersedes(
+            &update(Update::GuidanceSent { path: None }, 1100),
+            Some(&stored)
+        ));
+    }
+
+    #[test]
+    fn within_a_stage_the_later_update_wins() {
         let handed = state("handed off: flood", 100);
 
         assert!(supersedes(
-            &update(handed_off("flood"), 100),
-            Some(&mediating)
+            &update(Update::CouldNotStart, 200),
+            Some(&handed)
         ));
-        assert!(!supersedes(&update(Update::Mediating, 100), Some(&handed)));
+        assert!(!supersedes(
+            &update(Update::CouldNotStart, 50),
+            Some(&handed)
+        ));
         // The same update again (a retry) is still the latest.
         assert!(supersedes(&update(handed_off("flood"), 100), Some(&handed)));
+    }
+
+    #[tokio::test]
+    async fn a_late_mediating_notice_keeps_the_handoff_on_the_message() {
+        let fx = Fixture::new().await;
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "base")
+            .await
+            .unwrap();
+        fx.alerts()
+            .relay(&update(handed_off("conflicting_claims"), AT))
+            .await
+            .unwrap();
+
+        let outcome = fx
+            .alerts()
+            .relay(&update(Update::Mediating, AT + 100))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Relayed {
+                redrawn: false,
+                alerted: false
+            }
+        );
+        assert_eq!(fx.telegram.edits().len(), 1);
+        assert_eq!(
+            fx.store.serbero_state(DISPUTE).await.unwrap(),
+            Some(state("handed off: conflicting_claims", AT as i64))
+        );
     }
 
     #[tokio::test]
