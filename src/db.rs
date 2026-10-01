@@ -225,6 +225,45 @@ impl DisputeMessageStore {
         Ok(())
     }
 
+    /// Records a dispute's kind-38386 status unless a newer one is known.
+    /// Kept for every event, whatever the alert toggles: a late Serbero
+    /// handoff must see that the dispute already ended.
+    pub async fn record_dispute_status(
+        &self,
+        dispute_id: &str,
+        status: &str,
+        event_created_at: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            r#"
+            INSERT INTO dispute_statuses (dispute_id, status, event_created_at)
+            VALUES (?, ?, ?)
+            ON CONFLICT(dispute_id) DO UPDATE SET
+                status = excluded.status,
+                event_created_at = excluded.event_created_at
+            WHERE excluded.event_created_at >= dispute_statuses.event_created_at
+            "#,
+        )
+        .bind(dispute_id)
+        .bind(status)
+        .bind(event_created_at)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    /// The newest kind-38386 status seen for a dispute.
+    pub async fn dispute_status(&self, dispute_id: &str) -> Result<Option<String>, sqlx::Error> {
+        let row: Option<(String,)> =
+            sqlx::query_as("SELECT status FROM dispute_statuses WHERE dispute_id = ?")
+                .bind(dispute_id)
+                .fetch_optional(&self.pool)
+                .await?;
+
+        Ok(row.map(|(status,)| status))
+    }
+
     /// Whether this Serbero header was already relayed for the dispute.
     pub async fn serbero_header_handled(
         &self,
@@ -325,6 +364,20 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // The newest status of every dispute, whatever the alert toggles, and
+    // kept when a cooperative cancel deletes the dispute's message.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS dispute_statuses (
+            dispute_id TEXT PRIMARY KEY NOT NULL,
+            status TEXT NOT NULL,
+            event_created_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     // Serbero headers already relayed, so a redelivered or re-fetched DM
     // never alerts twice. Not tied to the messages table: deleting a
     // dispute's message must not make its handoff alert send again.
@@ -410,6 +463,34 @@ mod tests {
         .await
         .unwrap();
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn a_dispute_keeps_its_newest_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DisputeMessageStore::new(&dir.path().join("d.db"))
+            .await
+            .unwrap();
+
+        store
+            .record_dispute_status("d1", "in-progress", 10)
+            .await
+            .unwrap();
+        store
+            .record_dispute_status("d1", "settled", 20)
+            .await
+            .unwrap();
+        // A relay replays an older revision later.
+        store
+            .record_dispute_status("d1", "in-progress", 15)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.dispute_status("d1").await.unwrap().as_deref(),
+            Some("settled")
+        );
+        assert_eq!(store.dispute_status("d2").await.unwrap(), None);
     }
 
     #[tokio::test]

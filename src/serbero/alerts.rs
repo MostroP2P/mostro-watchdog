@@ -128,9 +128,13 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         else {
             return Ok(false);
         };
-        // Caught up after the dispute ended (a restart, the first start):
-        // nobody has to take it over any more.
-        if message.is_some_and(|m| dispute_is_resolved(&m.status)) {
+        // Caught up after the dispute ended (a restart, the first start, a
+        // status alert turned off, a message deleted on a cooperative
+        // cancel): nobody has to take it over any more.
+        let recorded = self.store.dispute_status(&update.dispute_id).await?;
+        let resolved = recorded.as_deref().is_some_and(dispute_is_resolved)
+            || message.is_some_and(|m| dispute_is_resolved(&m.status));
+        if resolved {
             info!(
                 dispute_id = %update.dispute_id,
                 "Dispute already resolved; no Serbero handoff alert"
@@ -429,6 +433,32 @@ mod tests {
                 text: "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\)".into(),
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn a_handoff_after_an_unalerted_resolution_sends_no_alert() {
+        // The settled alert was turned off (or the cooperative cancel
+        // deleted the message): only the recorded status says it ended.
+        let fx = Fixture::new().await;
+        fx.store
+            .record_dispute_status(DISPUTE, "settled", AT as i64 - 10)
+            .await
+            .unwrap();
+
+        let outcome = fx
+            .alerts()
+            .relay(&update(handed_off("conflicting_claims"), AT))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            Outcome::Relayed {
+                redrawn: false,
+                alerted: false
+            }
+        );
+        assert_eq!(fx.telegram.calls(), vec![]);
     }
 
     #[tokio::test]

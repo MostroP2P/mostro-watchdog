@@ -948,6 +948,18 @@ async fn handle_dispute_event(
         dispute_id, status, initiator
     );
 
+    // Recorded before the alert toggles and the cooperative-cancel delete,
+    // so a late Serbero handoff knows the dispute already ended.
+    if dispute_id != "unknown" {
+        let created_at = event.created_at.as_secs() as i64;
+        if let Err(e) = dispute_store
+            .record_dispute_status(&dispute_id, &status, created_at)
+            .await
+        {
+            error!("Failed to record dispute status: {}", e);
+        }
+    }
+
     // Check if this alert type is enabled
     let alert_enabled = match status.as_str() {
         "initiated" => alerts_config.initiated,
