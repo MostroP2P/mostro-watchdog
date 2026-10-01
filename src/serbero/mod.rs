@@ -41,14 +41,17 @@ use telegram::Messenger;
 pub struct SerberoInbox {
     keys: Keys,
     trusted: TrustedSerbero,
+    /// Wakes the sync task for an early catch-up when relaying failed.
+    retry: Arc<Notify>,
     warned_full_messages: bool,
 }
 
 impl SerberoInbox {
-    pub fn new(keys: Keys, trusted: TrustedSerbero) -> Self {
+    pub fn new(keys: Keys, trusted: TrustedSerbero, retry: Arc<Notify>) -> Self {
         Self {
             keys,
             trusted,
+            retry,
             warned_full_messages: false,
         }
     }
@@ -95,8 +98,9 @@ impl SerberoInbox {
                     dispute_id = %update.dispute_id,
                     subject = %subject,
                     error = %e,
-                    "Failed to relay a Serbero update; it is retried when the DM arrives again"
+                    "Failed to relay a Serbero update; an early catch-up retries it"
                 );
+                self.retry.notify_one();
                 None
             }
         }
@@ -122,9 +126,10 @@ pub fn start(
     settings: SerberoSettings,
     mostro: PublicKey,
     relays_changed: Arc<Notify>,
-    refresh: Duration,
+    nip65_refresh: Duration,
 ) -> (SerberoInbox, mpsc::UnboundedReceiver<Vec<Event>>) {
     let trusted: TrustedSerbero = Arc::new(RwLock::new(None));
+    let retry = Arc::new(Notify::new());
     let (backlog, caught_up) = mpsc::unbounded_channel();
     SerberoSync {
         client: client.clone(),
@@ -134,10 +139,12 @@ pub fn start(
         trusted: trusted.clone(),
         backlog,
         relays_changed,
-        refresh,
+        refresh: sync::sync_interval(nip65_refresh),
+        retry: retry.clone(),
+        first_retry: sync::FIRST_RETRY_DELAY,
     }
     .spawn();
-    (SerberoInbox::new(settings.keys, trusted), caught_up)
+    (SerberoInbox::new(settings.keys, trusted, retry), caught_up)
 }
 
 #[cfg(test)]
@@ -155,6 +162,7 @@ mod tests {
         telegram: FakeTelegram,
         serbero: Keys,
         watchdog: Keys,
+        retry: Arc<Notify>,
     }
 
     impl Fixture {
@@ -169,6 +177,7 @@ mod tests {
                 telegram: FakeTelegram::default(),
                 serbero: Keys::generate(),
                 watchdog: Keys::generate(),
+                retry: Arc::new(Notify::new()),
             }
         }
 
@@ -183,7 +192,11 @@ mod tests {
         }
 
         fn inbox(&self, trusted: Option<PublicKey>) -> SerberoInbox {
-            SerberoInbox::new(self.watchdog.clone(), Arc::new(RwLock::new(trusted)))
+            SerberoInbox::new(
+                self.watchdog.clone(),
+                Arc::new(RwLock::new(trusted)),
+                self.retry.clone(),
+            )
         }
 
         fn dm(&self, subject: &str, created_at: u64) -> Event {
@@ -253,6 +266,22 @@ mod tests {
 
         assert_eq!(outcome, None);
         assert!(fx.telegram.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_failed_relay_asks_for_an_early_catch_up() {
+        let fx = Fixture::new().await;
+        let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
+        fx.telegram.set_down(true);
+
+        let outcome = inbox
+            .receive(&fx.dm("handed off: flood", 100), &fx.alerts())
+            .await;
+
+        assert_eq!(outcome, None);
+        tokio::time::timeout(Duration::from_secs(1), fx.retry.notified())
+            .await
+            .expect("the sync task is woken");
     }
 
     #[tokio::test]

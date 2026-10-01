@@ -10,7 +10,7 @@ use std::time::Duration;
 use nostr_sdk::prelude::*;
 use tokio::sync::{mpsc, Notify, RwLock};
 use tokio::task::JoinHandle;
-use tokio::time::MissedTickBehavior;
+use tokio::time::{Instant, MissedTickBehavior};
 use tracing::{debug, info, warn};
 
 use super::discovery::{discover, Discovery};
@@ -32,6 +32,14 @@ const ALREADY_SUBSCRIBED: &str = "subscription ID already exists";
 /// so the next catch-up retries it, and the relayed-header table makes
 /// reading the rest again harmless.
 pub const CATCH_UP_WINDOW: Duration = Duration::from_secs(24 * 60 * 60);
+
+/// Longest pause between two rounds, whatever `nip65_refresh_interval` says:
+/// a round is also how a failed alert gets retried.
+pub const MAX_SYNC_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// First delay before an early round after a failed relay; it doubles on
+/// every further failure, up to the sync interval.
+pub const FIRST_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 /// Upper bound for one catch-up fetch, which waits for every relay.
 pub const CATCH_UP_TIMEOUT: Duration = Duration::from_secs(30);
@@ -75,6 +83,42 @@ pub fn catch_up_since(now: Timestamp) -> Timestamp {
     now - CATCH_UP_WINDOW
 }
 
+/// How often the sync runs: the NIP-65 refresh interval, capped so a failed
+/// alert or a dropped subscription never waits long. Always well inside the
+/// catch-up window, so consecutive rounds overlap.
+pub fn sync_interval(nip65_refresh: Duration) -> Duration {
+    nip65_refresh.min(MAX_SYNC_INTERVAL)
+}
+
+/// Delays that double after each use, up to a cap, until reset.
+#[derive(Debug, Clone)]
+pub struct Backoff {
+    first: Duration,
+    max: Duration,
+    next: Duration,
+}
+
+impl Backoff {
+    pub fn new(first: Duration, max: Duration) -> Self {
+        Self {
+            first,
+            max,
+            next: first.min(max),
+        }
+    }
+
+    /// The delay to wait now; the next one is twice as long, up to the cap.
+    pub fn next_delay(&mut self) -> Duration {
+        let delay = self.next;
+        self.next = self.next.saturating_mul(2).min(self.max);
+        delay
+    }
+
+    pub fn reset(&mut self) {
+        self.next = self.first.min(self.max);
+    }
+}
+
 /// The key to trust after a discovery. A node that did not answer keeps
 /// the current key; one that names no Serbero drops it.
 pub fn next_serbero(current: Option<PublicKey>, discovery: Discovery) -> Option<PublicKey> {
@@ -101,6 +145,11 @@ pub struct SerberoSync {
     /// How often to rediscover the key, resend the subscription and catch
     /// up, for relays that dropped it or delivered nothing.
     pub refresh: Duration,
+    /// Notified when relaying a DM failed: catch up again early, so the
+    /// failed alert is retried, with a growing delay while failures last.
+    pub retry: Arc<Notify>,
+    /// First delay of that retry backoff.
+    pub first_retry: Duration,
 }
 
 impl SerberoSync {
@@ -112,12 +161,22 @@ impl SerberoSync {
     async fn run(self) {
         let mut interval = tokio::time::interval(self.refresh);
         interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+        let mut retries = Backoff::new(self.first_retry, self.refresh);
+        let mut retry_at: Option<Instant> = None;
         loop {
             // The first tick is immediate: catch up at startup.
             tokio::select! {
-                _ = interval.tick() => {}
+                _ = interval.tick() => retries.reset(),
                 () = self.relays_changed.notified() => {}
+                () = self.retry.notified() => {
+                    if retry_at.is_none() {
+                        retry_at = Some(Instant::now() + retries.next_delay());
+                    }
+                    continue;
+                }
+                () = sleep_until(retry_at) => {}
             }
+            retry_at = None;
             if self.backlog.is_closed() {
                 return;
             }
@@ -210,6 +269,14 @@ impl SerberoSync {
     }
 }
 
+/// Sleeps until `deadline`; never wakes without one.
+async fn sleep_until(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
+    }
+}
+
 fn log_discovery(discovery: Discovery, current: Option<PublicKey>) {
     match (discovery, current) {
         (Discovery::Serbero(_), _) => {}
@@ -287,6 +354,8 @@ mod tests {
                 backlog,
                 relays_changed: Arc::new(Notify::new()),
                 refresh: Duration::from_secs(3600),
+                retry: Arc::new(Notify::new()),
+                first_retry: Duration::from_millis(50),
             };
             (sync, received)
         }
@@ -370,6 +439,55 @@ mod tests {
             catch_up_since(now),
             Timestamp::from_secs(1_000_000 - 86_400)
         );
+    }
+
+    #[test]
+    fn the_sync_runs_at_least_every_ten_minutes() {
+        assert_eq!(
+            sync_interval(Duration::from_secs(7200)),
+            Duration::from_secs(600)
+        );
+        assert_eq!(
+            sync_interval(Duration::from_secs(60)),
+            Duration::from_secs(60)
+        );
+        assert_eq!(sync_interval(Duration::MAX), MAX_SYNC_INTERVAL);
+        // Consecutive catch-ups always overlap.
+        assert!(MAX_SYNC_INTERVAL * 2 < CATCH_UP_WINDOW);
+    }
+
+    #[test]
+    fn retry_delays_double_up_to_the_cap_until_reset() {
+        let mut backoff = Backoff::new(Duration::from_secs(30), Duration::from_secs(100));
+
+        let delays: Vec<u64> = (0..4).map(|_| backoff.next_delay().as_secs()).collect();
+        backoff.reset();
+
+        assert_eq!(delays, vec![30, 60, 100, 100]);
+        assert_eq!(backoff.next_delay(), Duration::from_secs(30));
+    }
+
+    #[tokio::test]
+    async fn a_failed_relay_brings_the_next_catch_up_forward() {
+        let setup = Setup::new().await;
+        let earlier = setup.dm(
+            &format!("Dispute {DISPUTE} · handed off: flood"),
+            Timestamp::now() - 60u64,
+        );
+        setup.publish(&earlier).await;
+        let (sync, mut backlog) = setup.sync(Some(setup.serbero.public_key()), None);
+        let retry = sync.retry.clone();
+        let task = sync.spawn();
+        let first = tokio::time::timeout(WAIT, backlog.recv()).await.unwrap();
+        assert_eq!(first, Some(vec![earlier.clone()]));
+
+        // The hourly round is far away; a failed relay must not wait for it.
+        retry.notify_one();
+
+        let again = tokio::time::timeout(WAIT, backlog.recv()).await;
+        assert_eq!(again.expect("an early catch-up"), Some(vec![earlier]));
+        task.abort();
+        setup.shutdown().await;
     }
 
     #[test]
@@ -593,6 +711,8 @@ mod tests {
             backlog,
             relays_changed: Arc::new(Notify::new()),
             refresh: Duration::from_secs(3600),
+            retry: Arc::new(Notify::new()),
+            first_retry: Duration::from_millis(50),
         };
         let mut notifications = client.notifications();
         let task = sync.spawn();
