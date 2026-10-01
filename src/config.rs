@@ -161,6 +161,9 @@ fn default_private_key_env() -> String {
 /// reports about each dispute. Serbero writes to the watchdog's own Nostr
 /// key once that key is listed in Serbero's `[[observers]]`.
 #[derive(Debug, Clone, Deserialize)]
+// A misspelled key, or the secret itself pasted in (`private_key = ...`),
+// must fail instead of being ignored.
+#[serde(deny_unknown_fields)]
 pub struct SerberoConfig {
     /// Name of the environment variable that holds the watchdog's Nostr
     /// secret key (nsec or hex). The key itself never goes in this file.
@@ -177,6 +180,11 @@ pub struct SerberoConfig {
 pub enum SerberoConfigError {
     #[error("serbero.private_key_env cannot be empty")]
     EmptyKeyVariable,
+    #[error(
+        "serbero.private_key_env must name an environment variable, but it holds a \
+         Nostr secret key; move the key into the environment"
+    )]
+    KeyAsVariable,
     #[error(
         "[serbero] is configured, but the environment variable {0} with the watchdog's \
          Nostr secret key (nsec or hex) is not set"
@@ -202,8 +210,13 @@ pub struct SerberoSettings {
 impl SerberoConfig {
     /// Checks what can be checked without the environment.
     pub fn validate(&self) -> Result<(), SerberoConfigError> {
-        if self.private_key_env.trim().is_empty() {
+        let variable = self.private_key_env.trim();
+        if variable.is_empty() {
             return Err(SerberoConfigError::EmptyKeyVariable);
+        }
+        // A key here would be printed as the name of a missing variable.
+        if Keys::parse(variable).is_ok() {
+            return Err(SerberoConfigError::KeyAsVariable);
         }
         self.pubkey().map(|_| ())
     }
@@ -244,6 +257,20 @@ pub struct TelegramConfig {
     pub chat_id: i64,
 }
 
+/// A TOML error as a sentence with its line. Never the `toml` error itself:
+/// its `Debug` output, which `main` prints, carries the whole file, bot token
+/// included.
+fn toml_error(content: &str, error: &toml::de::Error) -> String {
+    let line = error
+        .span()
+        .and_then(|span| content.get(..span.start))
+        .map(|before| before.matches('\n').count() + 1);
+    match line {
+        Some(line) => format!("invalid config at line {line}: {}", error.message()),
+        None => format!("invalid config: {}", error.message()),
+    }
+}
+
 impl Config {
     pub fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
         if !path.exists() {
@@ -276,7 +303,7 @@ impl Config {
         }
 
         let content = std::fs::read_to_string(path)?;
-        let config: Config = toml::from_str(&content)?;
+        let config: Config = toml::from_str(&content).map_err(|e| toml_error(&content, &e))?;
 
         // Validate
         if config.nostr.relays.is_empty() {
@@ -485,6 +512,28 @@ chat_id = -1001
         assert!(alerts.serbero_handoff);
         assert!(alerts.serbero_progress);
         assert!(config.serbero.is_none(), "Serbero alerts are opt-in");
+    }
+
+    #[test]
+    fn a_key_pasted_into_the_serbero_section_is_rejected_without_echoing_it() {
+        let err = load("\n[serbero]\nprivate_key = \"nsec1pastedsecretvalue\"\n").unwrap_err();
+
+        // `main` prints the error it returns with `Debug`.
+        let printed = format!("{err:?}");
+        assert!(printed.contains("unknown field `private_key`"), "{printed}");
+        assert!(printed.contains("line 13"), "{printed}");
+        assert!(!printed.contains("nsec1pastedsecretvalue"), "{printed}");
+    }
+
+    #[test]
+    fn a_key_pasted_as_the_variable_name_is_rejected_without_echoing_it() {
+        let secret = Keys::generate().secret_key().to_secret_hex();
+
+        let err = load(&format!("\n[serbero]\nprivate_key_env = \"{secret}\"\n")).unwrap_err();
+
+        let printed = format!("{err:?}");
+        assert!(printed.contains("private_key_env"), "{printed}");
+        assert!(!printed.contains(&secret), "{printed}");
     }
 
     #[test]
