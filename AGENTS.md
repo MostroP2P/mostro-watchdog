@@ -55,6 +55,7 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 | `src/config.rs` | TOML configuration parsing and validation |
 | `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, plus Serbero's state per dispute |
 | `src/serbero/` | Serbero alerts: decoding Serbero's DMs (`dm.rs`), key discovery (`discovery.rs`), subscription and catch-up (`sync.rs`), relaying to Telegram (`alerts.rs`, `render.rs`, `telegram.rs`) |
+| `src/solver/` | Solver notifications: Mostrix's messages (`protocol.rs`), link codes and Telegram commands (`code.rs`, `commands.rs`), storage (`store.rs`), subscriptions and catch-up (`sync.rs`), batching and delivery (`notifier.rs`, `inbox.rs`) |
 | `src/version.rs` | Version and commit reporting for the CLI and the `/version` command |
 | `build.rs` | Embeds the git commit hash at build time |
 | `config.example.toml` | Documented configuration template |

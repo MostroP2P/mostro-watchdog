@@ -126,3 +126,19 @@ http_port = 8080
 #
 # The watchdog hears Serbero only on its own relays (the bootstrap relays above,
 # then the Mostro node's NIP-65 relays): Serbero must publish to at least one.
+
+# Solver notifications (optional)
+# A solver who links their Mostro solver key (send /link to the bot in a private
+# chat, then enter the code in Mostrix) gets a private message when a party
+# writes to them in a dispute they took. The watchdog never holds a private key
+# of the solver or of a party and never reads the chat. See
+# SOLVER_NOTIFICATIONS.md.
+# [solver_notifications]
+# Environment variable holding the watchdog's own Nostr secret key (nsec or hex).
+# Use the same one as [serbero] so the watchdog has a single key.
+# (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
+# private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+
+# Seconds to wait for the solver's own-message receipt before notifying; also
+# groups a burst of messages into one notification. (default: 20, at most 600)
+# grace_period = 20

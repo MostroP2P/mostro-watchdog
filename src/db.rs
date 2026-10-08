@@ -107,6 +107,12 @@ impl DisputeMessageStore {
         Ok(())
     }
 
+    /// The connection pool, for stores that keep their own tables in the
+    /// same database.
+    pub fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     /// Get the message ID for a dispute.
     pub async fn get_message_id(
         &self,

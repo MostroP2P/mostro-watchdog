@@ -79,6 +79,11 @@ impl FakeTelegram {
             .collect()
     }
 
+    /// Forgets the calls made so far.
+    pub fn clear(&self) {
+        self.calls.lock().unwrap().clear();
+    }
+
     pub fn set_down(&self, down: bool) {
         self.down.store(down, Ordering::SeqCst);
     }

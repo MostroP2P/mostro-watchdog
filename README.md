@@ -33,6 +33,10 @@ assistant, the watchdog can also follow it: it shows Serbero's progress on each
 dispute's message and pings the group when Serbero hands a dispute off and a human
 solver must take it over. See [Serbero Alerts](#serbero-alerts).
 
+Solvers can also link their Mostro solver key to the bot and get a private message
+when a party writes to them in a dispute they took, without giving the watchdog any
+private key. See [Solver Notifications](#solver-notifications).
+
 ## Quick Start
 
 ### Prerequisites
@@ -238,6 +242,9 @@ nothing else — message the bot directly instead.
 | Command | Description |
 |---------|-------------|
 | `/version` | Show the running version and the git commit it was built from |
+| `/link` | Link your Mostro solver key to get dispute chat notifications ([details](#solver-notifications)) |
+| `/unlink` | Unlink your solver keys from this chat |
+| `/status` | Show the solver keys linked to this chat |
 
 `/version` replies with something like:
 
@@ -315,6 +322,35 @@ Even if the watchdog is registered as a solver by mistake, it reads only that fi
 line and drops the rest. See [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts)
 for details.
 
+## Solver Notifications
+
+A solver who takes a dispute in Mostrix can get a private Telegram message when a
+party writes to them in that dispute's chat:
+
+```text
+📩 New message from the buyer
+
+📋 Dispute ID: abc123def456
+
+Open Mostrix to read and answer.
+```
+
+The watchdog stays a notification bot. It never holds the solver's or a party's
+private key, never reads a chat message and never sends one. Mostrix tells it which
+conversations to watch, using their public keys only, and announces the solver's
+own messages so they are not notified.
+
+Setup:
+
+1. Export a Nostr key for the watchdog (`export WATCHDOG_NOSTR_PRIVATE_KEY=...`, the
+   same one Serbero alerts use) and add a `[solver_notifications]` section to
+   `config.toml` (an empty one is enough; see `config.example.toml`).
+2. Each solver sends `/link` to the bot in a private chat and enters the code and the
+   watchdog key it replies with in Mostrix.
+
+See [SOLVER_NOTIFICATIONS.md](SOLVER_NOTIFICATIONS.md) for how it works, the protocol
+Mostrix speaks, and its limits.
+
 ## Configuration Reference
 
 | Field | Description |
@@ -327,6 +363,8 @@ for details.
 | `alerts.serbero_progress` | Serbero's progress on dispute messages (default: `true`) |
 | `serbero.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
 | `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |
+| `solver_notifications.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
+| `solver_notifications.grace_period` | Seconds to wait for the solver's `sent` receipt before notifying (default: `20`, at most `600`) |
 
 ## Roadmap
 

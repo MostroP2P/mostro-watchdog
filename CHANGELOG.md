@@ -18,11 +18,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Serbero takeover alert: a new message when a solver takes over a dispute
   Serbero held, and Serbero's line on the dispute's message reads "a solver
   took it over". Sent with `serbero_handoff`.
+- Solver notifications: with a `[solver_notifications]` section, a solver who
+  links their key with `/link` and Mostrix gets a private Telegram message
+  when a party writes to them in a dispute chat. No private key leaves
+  Mostrix and the watchdog never reads the chat. New commands `/link`,
+  `/unlink` and `/status`. See [SOLVER_NOTIFICATIONS.md](SOLVER_NOTIFICATIONS.md).
 
 ### Changed
 - `disputes.db` gains a `message_text` column and four tables
   (`serbero_states`, `serbero_headers`, `dispute_statuses`,
   `serbero_takeovers`); existing databases are migrated on start.
+- `disputes.db` gains the `solver_*` tables for solver notifications.
 
 ### Fixed
 - A config file with a TOML error no longer prints the whole file, Telegram bot

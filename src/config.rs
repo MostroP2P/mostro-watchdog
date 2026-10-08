@@ -1,6 +1,7 @@
 use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::Deserialize;
 use std::path::Path;
+use std::time::Duration;
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -11,6 +12,9 @@ pub struct Config {
     pub health: Option<HealthConfig>,
     /// Serbero alerts; when absent they are off.
     pub serbero: Option<SerberoConfig>,
+    /// Private notifications to solvers about their dispute chats; when
+    /// absent they are off.
+    pub solver_notifications: Option<SolverNotificationsConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -215,14 +219,7 @@ pub struct SerberoSettings {
 impl SerberoConfig {
     /// Checks what can be checked without the environment.
     pub fn validate(&self) -> Result<(), SerberoConfigError> {
-        let variable = self.private_key_env.trim();
-        if variable.is_empty() {
-            return Err(SerberoConfigError::EmptyKeyVariable);
-        }
-        // A key here would be printed as the name of a missing variable.
-        if Keys::parse(variable).is_ok() {
-            return Err(SerberoConfigError::KeyAsVariable);
-        }
+        check_key_variable(&self.private_key_env).map_err(SerberoConfigError::from)?;
         self.pubkey().map(|_| ())
     }
 
@@ -241,15 +238,147 @@ impl SerberoConfig {
         env: impl Fn(&str) -> Option<String>,
     ) -> Result<SerberoSettings, SerberoConfigError> {
         self.validate()?;
-        let variable = self.private_key_env.trim();
-        let secret =
-            env(variable).ok_or_else(|| SerberoConfigError::MissingKey(variable.into()))?;
-        // The parse error is dropped on purpose: it could quote the value.
-        let keys = Keys::parse(secret.trim())
-            .map_err(|_| SerberoConfigError::InvalidKey(variable.into()))?;
+        let keys = read_key(&self.private_key_env, env).map_err(SerberoConfigError::from)?;
         Ok(SerberoSettings {
             keys,
             pubkey: self.pubkey()?,
+        })
+    }
+}
+
+/// Why the watchdog's own key cannot be read from the environment. Never
+/// carries the value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum KeyProblem {
+    EmptyVariable,
+    KeyAsVariable,
+    Missing(String),
+    Invalid(String),
+}
+
+impl From<KeyProblem> for SerberoConfigError {
+    fn from(problem: KeyProblem) -> Self {
+        match problem {
+            KeyProblem::EmptyVariable => Self::EmptyKeyVariable,
+            KeyProblem::KeyAsVariable => Self::KeyAsVariable,
+            KeyProblem::Missing(variable) => Self::MissingKey(variable),
+            KeyProblem::Invalid(variable) => Self::InvalidKey(variable),
+        }
+    }
+}
+
+/// Checks that `variable` names an environment variable.
+fn check_key_variable(variable: &str) -> Result<(), KeyProblem> {
+    let variable = variable.trim();
+    if variable.is_empty() {
+        return Err(KeyProblem::EmptyVariable);
+    }
+    // A key here would be printed as the name of a missing variable.
+    if Keys::parse(variable).is_ok() {
+        return Err(KeyProblem::KeyAsVariable);
+    }
+    Ok(())
+}
+
+/// Reads the watchdog's secret key from `variable` through `env` (a lookup by
+/// variable name).
+fn read_key(variable: &str, env: impl Fn(&str) -> Option<String>) -> Result<Keys, KeyProblem> {
+    check_key_variable(variable)?;
+    let variable = variable.trim();
+    let secret = env(variable).ok_or_else(|| KeyProblem::Missing(variable.into()))?;
+    // The parse error is dropped on purpose: it could quote the value.
+    Keys::parse(secret.trim()).map_err(|_| KeyProblem::Invalid(variable.into()))
+}
+
+/// Seconds the watchdog waits for a `sent` receipt before notifying a solver
+/// when `grace_period` is not set.
+pub const DEFAULT_GRACE_PERIOD_SECS: u64 = 20;
+
+/// Longest accepted `grace_period`: longer would make notifications late.
+pub const MAX_GRACE_PERIOD_SECS: u64 = 600;
+
+fn default_grace_period() -> u64 {
+    DEFAULT_GRACE_PERIOD_SECS
+}
+
+/// The `[solver_notifications]` section: tell solvers in private when a
+/// party writes in the chat of a dispute they took (SOLVER_NOTIFICATIONS.md).
+#[derive(Debug, Clone, Deserialize)]
+// A misspelled key, or the secret itself pasted in, must fail instead of
+// being ignored.
+#[serde(deny_unknown_fields)]
+pub struct SolverNotificationsConfig {
+    /// Name of the environment variable that holds the watchdog's Nostr
+    /// secret key (nsec or hex). The key itself never goes in this file.
+    #[serde(default = "default_private_key_env")]
+    pub private_key_env: String,
+    /// Seconds to wait for a `sent` receipt before notifying.
+    #[serde(default = "default_grace_period")]
+    pub grace_period: u64,
+}
+
+/// Why the `[solver_notifications]` section cannot be used. The messages
+/// name the environment variable, never its value.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SolverConfigError {
+    #[error("solver_notifications.private_key_env cannot be empty")]
+    EmptyKeyVariable,
+    #[error(
+        "solver_notifications.private_key_env must name an environment variable, but it \
+         holds a Nostr secret key; move the key into the environment"
+    )]
+    KeyAsVariable,
+    #[error(
+        "[solver_notifications] is configured, but the environment variable {0} with the \
+         watchdog's Nostr secret key (nsec or hex) is not set"
+    )]
+    MissingKey(String),
+    #[error(
+        "the environment variable {0} does not hold a valid Nostr secret key (expected nsec or hex)"
+    )]
+    InvalidKey(String),
+    #[error("solver_notifications.grace_period must be at most {MAX_GRACE_PERIOD_SECS} seconds")]
+    GracePeriodTooLong,
+}
+
+impl From<KeyProblem> for SolverConfigError {
+    fn from(problem: KeyProblem) -> Self {
+        match problem {
+            KeyProblem::EmptyVariable => Self::EmptyKeyVariable,
+            KeyProblem::KeyAsVariable => Self::KeyAsVariable,
+            KeyProblem::Missing(variable) => Self::MissingKey(variable),
+            KeyProblem::Invalid(variable) => Self::InvalidKey(variable),
+        }
+    }
+}
+
+/// The `[solver_notifications]` section resolved at startup.
+#[derive(Debug, Clone)]
+pub struct SolverNotificationsSettings {
+    /// The watchdog's own keys: Mostrix encrypts its messages to them.
+    pub keys: Keys,
+    pub grace_period: Duration,
+}
+
+impl SolverNotificationsConfig {
+    /// Checks what can be checked without the environment.
+    pub fn validate(&self) -> Result<(), SolverConfigError> {
+        check_key_variable(&self.private_key_env)?;
+        if self.grace_period > MAX_GRACE_PERIOD_SECS {
+            return Err(SolverConfigError::GracePeriodTooLong);
+        }
+        Ok(())
+    }
+
+    /// Reads the watchdog's secret key from the environment through `env`.
+    pub fn resolve(
+        &self,
+        env: impl Fn(&str) -> Option<String>,
+    ) -> Result<SolverNotificationsSettings, SolverConfigError> {
+        self.validate()?;
+        Ok(SolverNotificationsSettings {
+            keys: read_key(&self.private_key_env, env)?,
+            grace_period: Duration::from_secs(self.grace_period),
         })
     }
 }
@@ -330,6 +459,10 @@ impl Config {
         if let Some(ref serbero) = config.serbero {
             // As a string, like the errors above: `main` prints it with `Debug`.
             serbero.validate().map_err(|e| e.to_string())?;
+        }
+
+        if let Some(ref solver) = config.solver_notifications {
+            solver.validate().map_err(|e| e.to_string())?;
         }
 
         if let Some(ref health) = config.health {
@@ -548,5 +681,66 @@ chat_id = -1001
         let config = load("\n[serbero]\nprivate_key_env = \"SURELY_UNSET_VARIABLE_42\"\n");
 
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn an_empty_solver_notifications_section_uses_the_defaults() {
+        let config = load("\n[solver_notifications]\n").unwrap();
+
+        let section = config.solver_notifications.expect("section present");
+        assert_eq!(section.private_key_env, DEFAULT_PRIVATE_KEY_ENV);
+        assert_eq!(section.grace_period, DEFAULT_GRACE_PERIOD_SECS);
+        assert!(load("").unwrap().solver_notifications.is_none());
+    }
+
+    #[test]
+    fn a_grace_period_over_ten_minutes_is_rejected() {
+        let err = load("\n[solver_notifications]\ngrace_period = 601\n").unwrap_err();
+
+        assert!(format!("{err}").contains("grace_period"), "{err}");
+        assert!(load("\n[solver_notifications]\ngrace_period = 600\n").is_ok());
+    }
+
+    #[test]
+    fn a_key_pasted_into_the_solver_section_is_rejected_without_echoing_it() {
+        let err = load("\n[solver_notifications]\nprivate_key = \"nsec1pastedsecretvalue\"\n")
+            .unwrap_err();
+
+        let printed = format!("{err:?}");
+        assert!(printed.contains("unknown field `private_key`"), "{printed}");
+        assert!(!printed.contains("nsec1pastedsecretvalue"), "{printed}");
+    }
+
+    #[test]
+    fn solver_notifications_read_the_watchdog_key_from_the_environment() {
+        let section = SolverNotificationsConfig {
+            private_key_env: "SOLVER_KEY".into(),
+            grace_period: 5,
+        };
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+
+        let settings = section
+            .resolve(|name| (name == "SOLVER_KEY").then(|| secret.clone()))
+            .unwrap();
+
+        assert_eq!(settings.keys.public_key(), keys.public_key());
+        assert_eq!(settings.grace_period, Duration::from_secs(5));
+    }
+
+    #[test]
+    fn a_missing_solver_key_names_the_variable_never_a_value() {
+        let section = SolverNotificationsConfig {
+            private_key_env: "SOLVER_KEY".into(),
+            grace_period: 5,
+        };
+
+        let missing = section.resolve(|_| None).unwrap_err();
+        let invalid = section.resolve(|_| Some("not-a-key".into())).unwrap_err();
+
+        assert_eq!(missing, SolverConfigError::MissingKey("SOLVER_KEY".into()));
+        assert!(missing.to_string().contains("[solver_notifications]"));
+        assert_eq!(invalid, SolverConfigError::InvalidKey("SOLVER_KEY".into()));
+        assert!(!invalid.to_string().contains("not-a-key"));
     }
 }
