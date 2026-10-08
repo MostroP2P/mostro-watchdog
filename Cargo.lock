@@ -1660,7 +1660,7 @@ dependencies = [
 
 [[package]]
 name = "mostro-watchdog"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "futures",
  "http-body-util",
