@@ -60,7 +60,7 @@ other = true
 
 # Serbero alerts (only with the [serbero] section below)
 # A new message when Serbero hands a dispute off to a human solver or cannot
-# start mediating it (default: true)
+# start mediating it, and another when a solver takes it over (default: true)
 serbero_handoff = true
 
 # Show Serbero's progress (mediating, guidance sent, handed off) on the

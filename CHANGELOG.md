@@ -15,11 +15,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   takes it over. Only the first line of each update is read. See
   [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts).
 - `[alerts]` options `serbero_handoff` and `serbero_progress`.
+- Serbero takeover alert: a new message when a solver takes over a dispute
+  Serbero held, and Serbero's line on the dispute's message reads "a solver
+  took it over". Sent with `serbero_handoff`.
 
 ### Changed
-- `disputes.db` gains a `message_text` column and three tables
-  (`serbero_states`, `serbero_headers`, `dispute_statuses`); existing databases
-  are migrated on start.
+- `disputes.db` gains a `message_text` column and four tables
+  (`serbero_states`, `serbero_headers`, `dispute_statuses`,
+  `serbero_takeovers`); existing databases are migrated on start.
 
 ### Fixed
 - A config file with a TOML error no longer prints the whole file, Telegram bot

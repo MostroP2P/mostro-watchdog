@@ -3,7 +3,7 @@
 
 use super::dm::{HeaderUpdate, Update};
 use super::render::{
-    dispute_is_open, dispute_is_resolved, needs_human_alert, status_line, with_status_line,
+    dispute_is_resolved, needs_human_alert, status_line, with_status_line, DisputeStage,
 };
 use super::telegram::Messenger;
 use crate::db::{DisputeMessageStore, SerberoState, StoredMessage};
@@ -38,7 +38,8 @@ pub struct SerberoAlerts<'a, M> {
     /// `[alerts] serbero_progress`: show Serbero's state on the dispute's
     /// message.
     pub show_progress: bool,
-    /// `[alerts] serbero_handoff`: send a message when a solver is needed.
+    /// `[alerts] serbero_handoff`: send a message when a solver is needed
+    /// and when one takes the dispute over.
     pub send_handoffs: bool,
 }
 
@@ -57,9 +58,12 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         }
         let is_latest = self.record_state(update, &subject).await?;
         let message = self.store.get_message(&update.dispute_id).await?;
-        let redrawn =
-            is_latest && self.show_progress && self.redraw(update, message.as_ref()).await;
-        let alerted = self.send_handoffs && self.alert(update, message.as_ref()).await?;
+        let taken_over = self.store.taken_over(&update.dispute_id).await?;
+        let redrawn = is_latest
+            && self.show_progress
+            && self.redraw(update, message.as_ref(), taken_over).await;
+        let alerted =
+            self.send_handoffs && !taken_over && self.alert(update, message.as_ref()).await?;
         self.store
             .mark_serbero_header_handled(&update.dispute_id, &subject, seconds(update.created_at))
             .await?;
@@ -86,7 +90,12 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
     /// Shows `update` on the dispute's message. Edits do not notify, so a
     /// failure is logged and not retried: the line also shows on the
     /// dispute's next alert.
-    async fn redraw(&self, update: &HeaderUpdate, message: Option<&StoredMessage>) -> bool {
+    async fn redraw(
+        &self,
+        update: &HeaderUpdate,
+        message: Option<&StoredMessage>,
+        taken_over: bool,
+    ) -> bool {
         // No message yet: the state shows on the dispute's first alert.
         let Some(message) = message else {
             return false;
@@ -98,7 +107,10 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
             );
             return false;
         };
-        let line = status_line(&update.update, dispute_is_open(&message.status));
+        let line = status_line(
+            &update.update,
+            DisputeStage::of(&message.status, taken_over),
+        );
         let text = with_status_line(base, Some(&line));
         match self
             .telegram
@@ -117,8 +129,8 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         }
     }
 
-    /// Asks the team for a solver when the update needs one. Returns whether
-    /// a message was sent.
+    /// Asks the team for a solver when the update needs one and no solver
+    /// took the dispute over yet. Returns whether a message was sent.
     async fn alert(
         &self,
         update: &HeaderUpdate,
@@ -141,18 +153,22 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
             );
             return Ok(false);
         }
-        // A reply shows the dispute's alert as context; it is only possible
-        // in the chat that message lives in.
-        let reply_to = message
-            .filter(|m| m.chat_id == self.chat_id)
-            .map(|m| m.message_id);
+        let reply_to = reply_target(message, self.chat_id);
         self.telegram.send(self.chat_id, &text, reply_to).await?;
         Ok(true)
     }
 }
 
+/// The dispute's message to reply to. A reply shows the dispute's alert as
+/// context; it is only possible in the chat that message lives in.
+pub(super) fn reply_target(message: Option<&StoredMessage>, chat_id: i64) -> Option<i32> {
+    message
+        .filter(|m| m.chat_id == chat_id)
+        .map(|m| m.message_id)
+}
+
 /// Event times are capped at the time they were read, so they fit.
-fn seconds(created_at: u64) -> i64 {
+pub(super) fn seconds(created_at: u64) -> i64 {
     i64::try_from(created_at).unwrap_or(i64::MAX)
 }
 
@@ -166,28 +182,6 @@ pub fn supersedes(update: &HeaderUpdate, stored: Option<&SerberoState>) -> bool 
     };
     let stored_stage = Update::from_subject(&stored.subject).map_or(0, |u| u.stage());
     (update.update.stage(), seconds(update.created_at)) >= (stored_stage, stored.created_at)
-}
-
-/// Records a dispute's newest kind-38386 status, so a late Serbero handoff
-/// knows the dispute already ended. Only with Serbero alerts on: without
-/// them nothing reads it.
-pub async fn note_dispute_status(
-    store: &DisputeMessageStore,
-    serbero_enabled: bool,
-    dispute_id: &str,
-    status: &str,
-    created_at: u64,
-) {
-    // `handle_dispute_event`'s placeholder for an event without a `d` tag.
-    if !serbero_enabled || dispute_id == "unknown" {
-        return;
-    }
-    if let Err(e) = store
-        .record_dispute_status(dispute_id, status, seconds(created_at))
-        .await
-    {
-        error!(dispute_id, error = %e, "Failed to record the dispute's status");
-    }
 }
 
 /// `base` with Serbero's latest state for the dispute appended, when there
@@ -210,8 +204,15 @@ pub async fn decorate(
             None
         }
     };
-    let line = update.map(|u| status_line(&u, dispute_is_open(status)));
-    with_status_line(base, line.as_deref())
+    let Some(update) = update else {
+        return base.to_owned();
+    };
+    let taken_over = store.taken_over(dispute_id).await.unwrap_or_else(|e| {
+        error!(dispute_id, error = %e, "Failed to read whether a solver took the dispute over");
+        false
+    });
+    let line = status_line(&update, DisputeStage::of(status, taken_over));
+    with_status_line(base, Some(&line))
 }
 
 #[cfg(test)]
@@ -826,26 +827,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn dispute_statuses_are_recorded_only_with_serbero_alerts_on() {
+    async fn a_handoff_after_a_takeover_sends_no_alert() {
+        // Caught up after a solver already took the dispute over.
         let fx = Fixture::new().await;
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "base")
+            .await
+            .unwrap();
+        fx.store.record_takeover(DISPUTE, AT as i64).await.unwrap();
 
-        note_dispute_status(&fx.store, false, DISPUTE, "settled", AT).await;
-        assert_eq!(fx.store.dispute_status(DISPUTE).await.unwrap(), None);
+        let outcome = fx
+            .alerts()
+            .relay(&update(handed_off("conflicting_claims"), AT - 10))
+            .await
+            .unwrap();
 
-        note_dispute_status(&fx.store, true, DISPUTE, "settled", AT).await;
         assert_eq!(
-            fx.store.dispute_status(DISPUTE).await.unwrap().as_deref(),
-            Some("settled")
+            outcome,
+            Outcome::Relayed {
+                redrawn: true,
+                alerted: false
+            }
+        );
+        assert_eq!(
+            fx.telegram.calls(),
+            vec![Call::Edit {
+                chat_id: CHAT,
+                message_id: 42,
+                text: "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over".into(),
+            }]
         );
     }
 
     #[tokio::test]
-    async fn an_event_without_a_dispute_id_records_nothing() {
+    async fn dispute_alerts_say_a_solver_took_over() {
         let fx = Fixture::new().await;
+        fx.store
+            .save_serbero_state(DISPUTE, &state("handed off: conflicting_claims", 5))
+            .await
+            .unwrap();
+        fx.store.record_takeover(DISPUTE, 10).await.unwrap();
 
-        note_dispute_status(&fx.store, true, "unknown", "settled", AT).await;
+        let shown = decorate(&fx.store, DISPUTE, "in-progress", "base", true).await;
 
-        assert_eq!(fx.store.dispute_status("unknown").await.unwrap(), None);
+        assert_eq!(
+            shown,
+            "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over"
+        );
     }
 
     #[tokio::test]

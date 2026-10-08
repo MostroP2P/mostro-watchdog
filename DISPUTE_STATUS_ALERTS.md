@@ -117,7 +117,9 @@ With Serbero alerts on, the watchdog:
 - sends a **new message**, which notifies, when Serbero hands a dispute off or
   cannot start mediating it. It replies to the dispute's message when there is
   one, and stands alone otherwise (for example when the watchdog started after
-  the dispute's alert went out).
+  the dispute's alert went out);
+- sends another **new message** when a solver takes the dispute over from
+  Serbero, so the group sees the handoff answered.
 
 | Serbero says | Line on the dispute's message | New message |
 |---|---|---|
@@ -126,9 +128,11 @@ With Serbero alerts on, the watchdog:
 | `handed off: <reason>` | 🙋 Serbero: handed off (conflicting claims) — a solver must take it over | 🙋 SERBERO HANDED OFF A DISPUTE |
 | `mediation could not start` | 🙋 Serbero: mediation could not start — a solver must take it over | 🙋 SERBERO COULD NOT START MEDIATION |
 
-The line stays on the message through later status changes. Once the dispute
-is resolved, "a solver must take it over" is dropped (and `mediating` reads
-`mediated`), so the final message stays true.
+The line stays on the message through later status changes. Once a solver
+takes the dispute over, "a solver must take it over" becomes "a solver took it
+over" (and `mediating` reads `mediated`). Once the dispute is resolved without
+a takeover, "a solver must take it over" is dropped, so the final message stays
+true.
 
 ### Handoff alert
 
@@ -144,6 +148,32 @@ is resolved, "a solver must take it over" is dropped (and `mediating` reads
 
 Reasons are Serbero's handoff reasons in plain words: `conflicting claims`,
 `fraud signal`, `human requested`, `round limit`, `unresponsive`, and so on.
+
+### Takeover alert
+
+Sent once per dispute when a solver takes over a dispute Serbero held, whether
+after a handoff or while Serbero was still mediating:
+
+```text
+👨‍⚖️ SOLVER TOOK OVER FROM SERBERO
+
+📋 Dispute ID: `abc123def456`
+⏰ Time: 2026-10-01 15:42:00 UTC
+
+ℹ️ A solver is now handling the dispute.
+```
+
+Mostro's dispute events do not name the solver, so the watchdog spots a
+takeover as a second, later `in-progress` event for a dispute Serbero reported
+on (Serbero, a read-only solver, cannot take a dispute twice). It is not
+announced when:
+
+- it happens while the watchdog is stopped: the watchdog only sees dispute
+  events published while it runs, like every other dispute alert;
+- it is seen before any update from Serbero about that dispute.
+
+The takeover also updates Serbero's line on the dispute's message, even with
+the `in_progress` alert turned off.
 
 ### Setup
 
@@ -196,7 +226,7 @@ To turn either kind of alert off:
 
 ```toml
 [alerts]
-serbero_handoff = false    # no new message on handoffs
+serbero_handoff = false    # no new message on handoffs or takeovers
 serbero_progress = false   # no Serbero line on dispute messages
 ```
 

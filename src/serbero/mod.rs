@@ -7,7 +7,8 @@
 //! `docs/messages.md` §3): `mediating`, `mediation could not start`,
 //! `handed off: <reason>` and `guidance sent: <path>`. The watchdog shows
 //! that state on the dispute's Telegram message and sends a new message,
-//! which notifies, when a solver must take the dispute over.
+//! which notifies, when a solver must take the dispute over, and another
+//! when a solver did take it over from Serbero (`takeover`).
 //!
 //! Only the first line of a DM is ever read. If Serbero sends the watchdog
 //! full solver messages (registered as a solver by mistake), the rest,
@@ -19,6 +20,7 @@ pub mod discovery;
 pub mod dm;
 pub mod render;
 pub mod sync;
+pub mod takeover;
 pub mod telegram;
 #[cfg(test)]
 mod testing;
