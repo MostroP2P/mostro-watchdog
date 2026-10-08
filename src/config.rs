@@ -38,7 +38,7 @@ pub struct AlertsConfig {
     #[serde(default = "default_true")]
     pub other: bool,
     /// Send a new message when Serbero hands a dispute off to a human solver
-    /// or cannot start mediating it
+    /// or cannot start mediating it, and when a solver takes it over
     #[serde(default = "default_true")]
     pub serbero_handoff: bool,
     /// Show Serbero's progress on the dispute's message (edits, no

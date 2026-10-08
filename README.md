@@ -278,6 +278,8 @@ With Serbero alerts on, the watchdog:
 
 - adds Serbero's latest step to the dispute's message, e.g. `🤖 Serbero: mediating`
   or `🙋 Serbero: handed off (conflicting claims) — a solver must take it over`;
+- sends a new message when a solver then takes the dispute over from Serbero
+  (`👨‍⚖️ SOLVER TOOK OVER FROM SERBERO`), so the chat follows the dispute end to end;
 - sends a new message when Serbero hands a dispute off or cannot start mediating it,
   as a reply to the dispute's message:
 
@@ -321,7 +323,7 @@ for details.
 | `nostr.relays` | Array of Nostr relay WebSocket URLs |
 | `telegram.bot_token` | Telegram bot API token |
 | `telegram.chat_id` | Telegram chat/group/channel ID for alerts |
-| `alerts.serbero_handoff` | New message when Serbero hands a dispute off (default: `true`) |
+| `alerts.serbero_handoff` | New message when Serbero hands a dispute off and when a solver takes it over (default: `true`) |
 | `alerts.serbero_progress` | Serbero's progress on dispute messages (default: `true`) |
 | `serbero.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
 | `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |

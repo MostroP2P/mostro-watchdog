@@ -3,7 +3,7 @@
 //! This allows updating or deleting messages when dispute status changes.
 //! It also keeps what Serbero last reported about each dispute and which of
 //! its updates were already relayed, so restarts and relay redeliveries
-//! never repeat an alert.
+//! never repeat an alert, and which disputes a solver took over from it.
 
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePool, SqlitePoolOptions};
 use std::path::Path;
@@ -35,6 +35,14 @@ pub struct SerberoState {
     /// The canonical header subject, e.g. `handed off: conflicting_claims`.
     pub subject: String,
     /// When Serbero wrote it (event `created_at`, Unix seconds).
+    pub created_at: i64,
+}
+
+/// A dispute's newest kind-38386 status.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordedStatus {
+    pub status: String,
+    /// The event's `created_at`, Unix seconds.
     pub created_at: i64,
 }
 
@@ -255,13 +263,56 @@ impl DisputeMessageStore {
 
     /// The newest kind-38386 status seen for a dispute.
     pub async fn dispute_status(&self, dispute_id: &str) -> Result<Option<String>, sqlx::Error> {
-        let row: Option<(String,)> =
-            sqlx::query_as("SELECT status FROM dispute_statuses WHERE dispute_id = ?")
+        Ok(self.recorded_status(dispute_id).await?.map(|r| r.status))
+    }
+
+    /// The newest kind-38386 status seen for a dispute, with its event time.
+    pub async fn recorded_status(
+        &self,
+        dispute_id: &str,
+    ) -> Result<Option<RecordedStatus>, sqlx::Error> {
+        let row: Option<(String, i64)> = sqlx::query_as(
+            "SELECT status, event_created_at FROM dispute_statuses WHERE dispute_id = ?",
+        )
+        .bind(dispute_id)
+        .fetch_optional(&self.pool)
+        .await?;
+
+        Ok(row.map(|(status, created_at)| RecordedStatus { status, created_at }))
+    }
+
+    /// Records that a solver took the dispute over from Serbero. Returns
+    /// whether this is news: `false` when a takeover was already recorded.
+    pub async fn record_takeover(
+        &self,
+        dispute_id: &str,
+        event_created_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO serbero_takeovers
+                (dispute_id, event_created_at, recorded_at)
+            VALUES (?, ?, ?)
+            "#,
+        )
+        .bind(dispute_id)
+        .bind(event_created_at)
+        .bind(now_secs())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Whether a solver took the dispute over from Serbero.
+    pub async fn taken_over(&self, dispute_id: &str) -> Result<bool, sqlx::Error> {
+        let (count,): (i64,) =
+            sqlx::query_as("SELECT COUNT(*) FROM serbero_takeovers WHERE dispute_id = ?")
                 .bind(dispute_id)
-                .fetch_optional(&self.pool)
+                .fetch_one(&self.pool)
                 .await?;
 
-        Ok(row.map(|(status,)| status))
+        Ok(count > 0)
     }
 
     /// Whether this Serbero header was already relayed for the dispute.
@@ -395,6 +446,20 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Disputes a solver took over from Serbero, so the takeover message goes
+    // out once and Serbero's line stops asking for a solver.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS serbero_takeovers (
+            dispute_id TEXT PRIMARY KEY NOT NULL,
+            event_created_at INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -491,6 +556,45 @@ mod tests {
             Some("settled")
         );
         assert_eq!(store.dispute_status("d2").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_dispute_status_is_recorded_with_its_event_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DisputeMessageStore::new(&dir.path().join("d.db"))
+            .await
+            .unwrap();
+
+        store
+            .record_dispute_status("d1", "in-progress", 10)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.recorded_status("d1").await.unwrap(),
+            Some(RecordedStatus {
+                status: "in-progress".into(),
+                created_at: 10,
+            })
+        );
+        assert_eq!(store.recorded_status("d2").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_takeover_is_recorded_once_and_survives_restarts() {
+        let dir = tempdir().unwrap();
+        let db_path = dir.path().join("t.db");
+        let store = DisputeMessageStore::new(&db_path).await.unwrap();
+
+        assert!(!store.taken_over("d1").await.unwrap());
+        assert!(store.record_takeover("d1", 20).await.unwrap());
+        // A second takeover of the same dispute is not new.
+        assert!(!store.record_takeover("d1", 30).await.unwrap());
+        store.pool.close().await;
+
+        let store = DisputeMessageStore::new(&db_path).await.unwrap();
+        assert!(store.taken_over("d1").await.unwrap());
+        assert!(!store.taken_over("d2").await.unwrap());
     }
 
     #[tokio::test]
