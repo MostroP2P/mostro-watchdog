@@ -23,7 +23,7 @@ pub mod sync;
 pub mod takeover;
 pub mod telegram;
 #[cfg(test)]
-mod testing;
+pub(crate) mod testing;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -10,6 +10,7 @@ use tracing::{error, info, warn};
 mod config;
 mod db;
 mod serbero;
+mod solver;
 mod version;
 
 use config::{Config, SerberoSettings};
@@ -256,15 +257,15 @@ fn print_usage() {
 /// Start the NIP-65 relay discovery background task.
 /// On first run, fetches the kind 10002 event and swaps relays if found.
 /// Then re-fetches periodically every `refresh_interval` seconds.
-/// `relays_changed` is notified after each swap: subscriptions other than
-/// the dispute one are re-sent by their owners.
+/// Each of `relays_changed` is notified after each swap: subscriptions
+/// other than the dispute one are re-sent by their owners, one `Notify` each.
 fn start_nip65_task(
     client: Client,
     mostro_pubkey: PublicKey,
     bootstrap_relays: Vec<String>,
     active_relays: ActiveRelays,
     refresh_interval: u64,
-    relays_changed: Arc<Notify>,
+    relays_changed: Vec<Arc<Notify>>,
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(Duration::from_secs(refresh_interval));
@@ -308,7 +309,9 @@ fn start_nip65_task(
                     }
                     // Even a failed swap may have removed relays, and their
                     // subscriptions with them.
-                    relays_changed.notify_one();
+                    for owner in &relays_changed {
+                        owner.notify_one();
+                    }
                 }
                 None => {
                     let current = active_relays.read().await.clone();
@@ -592,6 +595,12 @@ async fn start_health_server(
 enum Command {
     #[command(description = "show the running version and commit")]
     Version,
+    #[command(description = "link your Mostro solver key to get dispute chat notifications")]
+    Link,
+    #[command(description = "unlink your solver keys from this chat")]
+    Unlink,
+    #[command(description = "show the solver keys linked to this chat")]
+    Status,
 }
 
 /// Whether a command sent in this chat may be answered.
@@ -605,8 +614,13 @@ fn is_answerable_chat(chat: &Chat) -> bool {
     chat.is_private()
 }
 
-/// Answer a bot command.
-async fn answer_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<()> {
+/// Answer a bot command. `solver` is `None` without `[solver_notifications]`.
+async fn answer_command(
+    bot: Bot,
+    msg: Message,
+    cmd: Command,
+    solver: Option<&solver::commands::SolverCommands>,
+) -> ResponseResult<()> {
     if !is_answerable_chat(&msg.chat) {
         info!(
             "Ignoring command in non-private chat {}: replies are private-only",
@@ -615,13 +629,19 @@ async fn answer_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<
         return Ok(());
     }
 
-    match cmd {
-        Command::Version => {
-            bot.send_message(msg.chat.id, version_message())
-                .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-                .await?;
+    let chat_id = msg.chat.id.0;
+    let text = match (cmd, solver) {
+        (Command::Version, _) => version_message(),
+        (Command::Link | Command::Unlink | Command::Status, None) => {
+            solver::commands::DISABLED_TEXT.to_owned()
         }
-    }
+        (Command::Link, Some(solver)) => solver.link(chat_id, Timestamp::now().as_secs()).await,
+        (Command::Unlink, Some(solver)) => solver.unlink(chat_id).await,
+        (Command::Status, Some(solver)) => solver.status(chat_id).await,
+    };
+    bot.send_message(msg.chat.id, text)
+        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
+        .await?;
 
     Ok(())
 }
@@ -630,7 +650,7 @@ async fn answer_command(bot: Bot, msg: Message, cmd: Command) -> ResponseResult<
 ///
 /// It runs alongside the Nostr event loop: long polling for updates must not
 /// block dispute processing.
-fn start_command_listener(bot: Bot) {
+fn start_command_listener(bot: Bot, solver: Option<solver::commands::SolverCommands>) {
     tokio::spawn(async move {
         use teloxide::repls::CommandReplExt;
         use teloxide::utils::command::BotCommands as _;
@@ -641,7 +661,11 @@ fn start_command_listener(bot: Bot) {
         }
 
         info!("Telegram command listener started");
-        <Command as CommandReplExt>::repl(bot, answer_command).await;
+        let handler = move |bot: Bot, msg: Message, cmd: Command| {
+            let solver = solver.clone();
+            async move { answer_command(bot, msg, cmd, solver.as_ref()).await }
+        };
+        <Command as CommandReplExt>::repl(bot, handler).await;
         warn!("Telegram command listener stopped");
     });
 }
@@ -661,8 +685,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     info!("🐕 mostro-watchdog starting...");
 
-    // Fails startup when `[serbero]` is present but the watchdog's key is not.
+    // Fails startup when `[serbero]` or `[solver_notifications]` is present
+    // but the watchdog's key is not.
     let serbero_settings = resolve_serbero(&config)?;
+    let solver_settings = solver::resolve(&config)?;
     info!("Monitoring Mostro pubkey: {}", config.mostro.pubkey);
     info!(
         "Sending alerts to Telegram chat: {}",
@@ -680,9 +706,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             return Err(e.into());
         }
     }
-
-    // Answer Telegram commands (/version) while the Nostr event loop runs
-    start_command_listener(bot.clone());
 
     // Initialize Nostr client with bootstrap relays
     let client = Client::default();
@@ -719,9 +742,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Shared state: active relays (starts with bootstrap, updated by NIP-65 discovery)
     let active_relays: ActiveRelays = Arc::new(RwLock::new(config.nostr.relays.clone()));
 
-    // Notified when NIP-65 discovery swaps the relays, so the Serbero DM
-    // subscription follows them.
+    // Notified when NIP-65 discovery swaps the relays, so the Serbero and
+    // solver subscriptions follow them.
     let relays_changed = Arc::new(Notify::new());
+    let solver_relays_changed = Arc::new(Notify::new());
 
     // Start NIP-65 relay discovery background task
     start_nip65_task(
@@ -730,7 +754,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         config.nostr.relays.clone(),
         active_relays.clone(),
         config.nostr.nip65_refresh_interval,
-        relays_changed.clone(),
+        vec![relays_changed.clone(), solver_relays_changed.clone()],
     );
 
     // Initialize health monitor
@@ -756,6 +780,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         DisputeMessageStore::new(&db_path)
             .await
             .expect("Failed to initialize dispute message store"),
+    );
+    let solver_store = match solver_settings {
+        Some(_) => Some(solver::store::SolverStore::new(dispute_store.pool()).await?),
+        None => None,
+    };
+
+    // Answer Telegram commands while the Nostr event loop runs
+    start_command_listener(
+        bot.clone(),
+        solver_settings
+            .as_ref()
+            .zip(solver_store.clone())
+            .map(|(settings, store)| {
+                solver::commands::SolverCommands::new(store, settings.keys.public_key())
+            }),
     );
 
     // Send startup notification
@@ -799,6 +838,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => (None, None),
     };
 
+    // Watch the dispute chats solvers delegate to the watchdog.
+    let (solver_inbox, solver_backlog) = match solver_settings.zip(solver_store) {
+        Some((settings, store)) => {
+            let (inbox, backlog) = solver::start(
+                &client,
+                settings,
+                mostro_pubkey,
+                store,
+                solver_relays_changed,
+                Duration::from_secs(config.nostr.nip65_refresh_interval),
+            );
+            (Some(inbox), Some(backlog))
+        }
+        None => (None, None),
+    };
+
     let alerts_config = config.alerts.unwrap_or_default();
     let chat_id = config.telegram.chat_id;
     let serbero_alerts = SerberoAlerts {
@@ -820,6 +875,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             serbero_alerts: &serbero_alerts,
             serbero_inbox,
             serbero_backlog,
+            solver_inbox,
+            solver_backlog,
         },
     )
     .await;
@@ -866,6 +923,9 @@ fn resolve_serbero(config: &Config) -> Result<Option<SerberoSettings>, Box<dyn s
     Ok(Some(settings))
 }
 
+/// How often held solver notifications are checked for an ended grace period.
+const SOLVER_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
+
 /// What the event loop works with.
 struct EventLoop<'a> {
     bot: &'a Bot,
@@ -876,6 +936,8 @@ struct EventLoop<'a> {
     serbero_alerts: &'a SerberoAlerts<'a, Bot>,
     serbero_inbox: Option<serbero::SerberoInbox>,
     serbero_backlog: Option<mpsc::UnboundedReceiver<Vec<Event>>>,
+    solver_inbox: Option<solver::inbox::SolverInbox>,
+    solver_backlog: Option<mpsc::UnboundedReceiver<Vec<Event>>>,
 }
 
 /// Handles dispute events and Serbero DMs one at a time, so a dispute's
@@ -885,6 +947,9 @@ async fn run_event_loop(
     mut notifications: impl StreamExt<Item = ClientNotification> + Unpin,
     mut ctx: EventLoop<'_>,
 ) {
+    // Held solver notifications are sent once their grace period is over.
+    let mut solver_tick = tokio::time::interval(SOLVER_FLUSH_INTERVAL);
+    solver_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     // `Client::handle_notifications` was removed in nostr-sdk 0.45: notifications are
     // now consumed as a stream, which ends when the client shuts down.
     loop {
@@ -902,9 +967,15 @@ async fn run_event_loop(
                             ctx.serbero_inbox.is_some().then_some(ctx.serbero_alerts),
                         )
                         .await;
+                        if let Some(solver) = ctx.solver_inbox.as_ref() {
+                            solver.on_dispute_event(&event).await;
+                        }
                     } else if event.kind == Kind::PrivateDirectMessage {
                         if let Some(inbox) = ctx.serbero_inbox.as_mut() {
                             inbox.receive(&event, ctx.serbero_alerts).await;
+                        }
+                        if let Some(solver) = ctx.solver_inbox.as_mut() {
+                            solver.receive(&event, ctx.bot, Timestamp::now().as_secs()).await;
                         }
                     }
                 }
@@ -914,18 +985,28 @@ async fn run_event_loop(
                     break;
                 }
             },
-            Some(events) = next_serbero_batch(&mut ctx.serbero_backlog) => {
+            Some(events) = next_batch(&mut ctx.serbero_backlog) => {
                 if let Some(inbox) = ctx.serbero_inbox.as_mut() {
                     inbox.receive_batch(events, ctx.serbero_alerts).await;
+                }
+            }
+            Some(events) = next_batch(&mut ctx.solver_backlog) => {
+                if let Some(solver) = ctx.solver_inbox.as_mut() {
+                    solver.receive_batch(events, ctx.bot, Timestamp::now().as_secs()).await;
+                }
+            }
+            _ = solver_tick.tick(), if ctx.solver_inbox.is_some() => {
+                if let Some(solver) = ctx.solver_inbox.as_mut() {
+                    solver.flush(ctx.bot, Timestamp::now().as_secs()).await;
                 }
             }
         }
     }
 }
 
-/// The next batch of caught-up Serbero DMs. Never resolves when Serbero
-/// alerts are off.
-async fn next_serbero_batch(
+/// The next batch of caught-up events from a background sync. Never resolves
+/// when that sync is off.
+async fn next_batch(
     backlog: &mut Option<mpsc::UnboundedReceiver<Vec<Event>>>,
 ) -> Option<Vec<Event>> {
     match backlog {
