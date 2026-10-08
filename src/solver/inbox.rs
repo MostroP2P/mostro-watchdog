@@ -11,6 +11,7 @@ use tracing::{debug, error, info, warn};
 use super::notifier::{notification_text, Batch, Pending};
 use super::protocol::{parse_solver_dm, Received, Rejected, SolverMessage};
 use super::store::{Redeemed, SolverStore, Watched, WatchedConversation, MOSTRIX_SCOPE};
+use super::sync::DISPUTE_KIND;
 use crate::serbero::render::dispute_is_resolved;
 use crate::serbero::telegram::Messenger;
 use crate::{escape_markdown, escape_markdown_code};
@@ -62,20 +63,27 @@ impl SolverInbox {
         }
     }
 
-    /// Handles a kind 14 event: a chat event of a watched conversation, or a
-    /// message from a solver's Mostrix. Anything else is ignored. Errors are
+    /// Handles a kind 14 event: a message from a solver's Mostrix, or a chat
+    /// event of a watched conversation. Anything else is ignored. Errors are
     /// logged; the event loop goes on.
     pub async fn receive<M: Messenger>(&mut self, event: &Event, telegram: &M, now: u64) {
         if event.kind != Kind::PrivateDirectMessage {
             return;
         }
-        let result = match self.store.conversations(&event.pubkey).await {
-            Ok(watches) if !watches.is_empty() => self.hold(event, &watches, now).await,
-            Ok(_) if is_tagged_to(event, &self.keys.public_key()) => {
-                self.receive_dm(event, telegram, now).await
-            }
-            Ok(_) => Ok(()),
-            Err(e) => Err(e),
+        // Mostrix's messages come first: a watch may name any key,
+        // including the public one that signs a solver's messages, and must
+        // not turn those messages into chat events. Anything else tagged to
+        // the watchdog is still a chat event: a party may tag the public
+        // watchdog key to keep its messages from being notified.
+        let parsed = is_tagged_to(event, &self.keys.public_key())
+            .then(|| parse_solver_dm(event, &self.keys))
+            .flatten();
+        let result = match parsed {
+            Some(parsed) => self.receive_dm(event, parsed, telegram, now).await,
+            None => match self.store.conversations(&event.pubkey).await {
+                Ok(watches) => self.hold(event, &watches, now).await,
+                Err(e) => Err(e),
+            },
         };
         if let Err(e) = result {
             error!(event_id = %event.id, error = %e, "Failed to handle a solver notification event");
@@ -83,7 +91,9 @@ impl SolverInbox {
     }
 
     /// Handles caught-up events oldest first, so `watch` and `unwatch`
-    /// apply in order and links come before what follows them.
+    /// apply in order and links come before what follows them. Mostro's
+    /// dispute events go before the rest: a resolved dispute's chat is
+    /// never held.
     pub async fn receive_batch<M: Messenger>(
         &mut self,
         mut events: Vec<Event>,
@@ -91,7 +101,13 @@ impl SolverInbox {
         now: u64,
     ) {
         events.sort_by_key(|event| (event.created_at, event.id));
-        for event in &events {
+        let (disputes, rest): (Vec<Event>, Vec<Event>) = events
+            .into_iter()
+            .partition(|event| event.kind == Kind::Custom(DISPUTE_KIND));
+        for event in &disputes {
+            self.on_dispute_event(event).await;
+        }
+        for event in &rest {
             self.receive(event, telegram, now).await;
         }
     }
@@ -127,16 +143,16 @@ impl SolverInbox {
     async fn receive_dm<M: Messenger>(
         &mut self,
         event: &Event,
+        parsed: Result<Received, Rejected>,
         telegram: &M,
         now: u64,
     ) -> Result<(), sqlx::Error> {
         if self.store.is_handled(&event.id, MOSTRIX_SCOPE).await? {
             return Ok(());
         }
-        let applied = match parse_solver_dm(event, &self.keys) {
-            None => Applied::Done,
-            Some(Ok(received)) => self.apply(received, telegram, now).await?,
-            Some(Err(rejected)) => {
+        let applied = match parsed {
+            Ok(received) => self.apply(received, telegram, now).await?,
+            Err(rejected) => {
                 self.log_rejected(&rejected).await?;
                 Applied::Done
             }
@@ -744,6 +760,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_caught_up_resolution_ends_the_watch_before_its_chat_is_held() {
+        // The watchdog was stopped while the dispute was resolved.
+        let mut fx = Fixture::new().await;
+        let buyer = fx.watching().await;
+        let settled = EventBuilder::new(Kind::Custom(38386), "")
+            .tags([
+                Tag::identifier(DISPUTE),
+                Tag::parse(["s", "settled"]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(T0 + 20))
+            .finalize(&fx.mostro)
+            .unwrap();
+        let before = chat_event(&buyer, T0 + 10, 1);
+        let after = chat_event(&buyer, T0 + 30, 2);
+
+        fx.inbox
+            .receive_batch(vec![after, before, settled], &fx.telegram, T0 + 40)
+            .await;
+        fx.inbox.flush(&fx.telegram, T0 + 100).await;
+
+        assert!(fx.telegram.calls().is_empty(), "{:?}", fx.telegram.calls());
+        assert!(fx.store.watched_sign_pubkeys().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn a_refused_notification_is_retried() {
         let mut fx = Fixture::new().await;
         let buyer = fx.watching().await;
@@ -875,6 +916,52 @@ mod tests {
             "{:?}",
             fx.telegram.sends()
         );
+    }
+
+    #[tokio::test]
+    async fn a_watch_naming_a_solvers_key_does_not_swallow_their_messages() {
+        // The author of Mostrix's messages is public: it is on the relays.
+        let mut fx = Fixture::new().await;
+        fx.watching().await;
+        let attacker = Keys::generate();
+        fx.link(&attacker, CHAT + 1, "BBBB-BBBB").await;
+        let hijack = fx.mostrix_from(&attacker, &watch_json(&fx.solver.public_key()), T0 + 5);
+        fx.receive(&hijack, T0 + 5).await;
+        fx.telegram.clear();
+
+        let seller = Keys::generate();
+        let watch = fx.mostrix(&watch_json(&seller.public_key()), T0 + 10);
+        fx.receive(&watch, T0 + 10).await;
+        fx.inbox.flush(&fx.telegram, T0 + 60).await;
+
+        assert!(fx
+            .store
+            .watched_sign_pubkeys()
+            .await
+            .unwrap()
+            .contains(&seller.public_key()));
+        assert!(fx.telegram.calls().is_empty(), "{:?}", fx.telegram.calls());
+    }
+
+    #[tokio::test]
+    async fn a_party_tagging_the_watchdog_is_still_notified() {
+        // The watchdog's key is public; a party may tag it to hide.
+        let mut fx = Fixture::new().await;
+        let buyer = fx.watching().await;
+        let tagged = EventBuilder::new(Kind::PrivateDirectMessage, "ciphertext")
+            .tags([
+                Tag::public_key(Keys::generate().public_key()),
+                Tag::public_key(fx.watchdog.public_key()),
+            ])
+            .custom_created_at(Timestamp::from(T0 + 10))
+            .finalize(&buyer)
+            .unwrap();
+
+        fx.receive(&tagged, T0 + 10).await;
+        fx.receive(&tagged, T0 + 11).await;
+        fx.inbox.flush(&fx.telegram, T0 + 60).await;
+
+        assert_eq!(fx.telegram.calls(), vec![notified(1)]);
     }
 
     #[tokio::test]

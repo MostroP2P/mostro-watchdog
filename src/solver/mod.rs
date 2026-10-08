@@ -61,6 +61,7 @@ pub fn start(
     SolverSync {
         client: client.clone(),
         watchdog: settings.keys.public_key(),
+        mostro,
         store: store.clone(),
         backlog,
         relays_changed,

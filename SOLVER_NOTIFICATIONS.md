@@ -27,9 +27,11 @@ conversations to watch.
    every dispute they already hold), Mostrix sends `watch` with the public
    `K_sign` of each conversation of that dispute.
 3. **Notify.** The watchdog follows kind 14 events signed by those keys. When
-   one arrives it waits `grace_period` seconds, then tells the solver:
-   `📩 New message from the buyer in dispute <id>`. Messages from the same
-   party within the wait are grouped into one notification.
+   one arrives it waits `grace_period` seconds, then tells the solver which
+   party wrote, with the dispute id, and asks them to open Mostrix (see the
+   example in the [README](README.md#solver-notifications)). Messages from
+   the same party within the wait are grouped into one notification, whose
+   header reads `N new messages from the buyer`.
 4. **Skip the solver's own messages.** Both sides of a conversation sign with
    the same `K_sign`, so the watchdog cannot tell who wrote a message. Before
    Mostrix publishes a message of the solver, it sends the watchdog a `sent`
@@ -154,8 +156,11 @@ once.
   relays (the bootstrap `[nostr] relays`, then the Mostro node's NIP-65
   relays) and catches up on the last day at startup and every 10 minutes, so a
   `watch` sent while it was stopped still applies.
-- A notification that Telegram refuses is retried a minute later, up to three
-  times.
+- Each round also fetches Mostro's latest kind-38386 status of every watched
+  dispute, however old, so a dispute resolved while the watchdog was stopped
+  stops being watched.
+- A notification that Telegram refuses is retried a minute later; it is tried
+  at most three times in total.
 
 ## Limits
 

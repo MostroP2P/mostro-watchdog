@@ -359,6 +359,20 @@ impl SolverStore {
             .collect())
     }
 
+    /// The disputes a linked solver watches, each once.
+    pub async fn watched_dispute_ids(&self) -> Result<Vec<String>, sqlx::Error> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            r#"
+            SELECT DISTINCT c.dispute_id FROM solver_conversations c
+            JOIN solver_links l ON l.solver_pubkey = c.solver_pubkey
+            ORDER BY c.dispute_id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
+    }
+
     /// Records that `solver` wrote chat event `event_id`. Returns `false`
     /// when the solver already holds [`MAX_RECEIPTS_PER_SOLVER`] receipts.
     pub async fn record_receipt(
@@ -765,6 +779,32 @@ mod tests {
                 watched_disputes: 1
             }]
         );
+    }
+
+    #[tokio::test]
+    async fn watched_disputes_are_listed_once_each() {
+        let fx = fixture().await;
+        let (solver, other) = (Keys::generate().public_key(), Keys::generate().public_key());
+        fx.link(&solver, CHAT).await;
+        fx.link(&other, CHAT + 1).await;
+        let both = [conversation(Party::Buyer), conversation(Party::Seller)];
+        for key in [&solver, &other] {
+            fx.store
+                .apply_watch(key, DISPUTE, &both, 100)
+                .await
+                .unwrap();
+        }
+        let second = dispute(2);
+        fx.store
+            .apply_watch(&solver, &second, &[conversation(Party::Buyer)], 100)
+            .await
+            .unwrap();
+
+        let ids = fx.store.watched_dispute_ids().await.unwrap();
+
+        let mut expected = vec![second, DISPUTE.to_owned()];
+        expected.sort();
+        assert_eq!(ids, expected);
     }
 
     #[tokio::test]

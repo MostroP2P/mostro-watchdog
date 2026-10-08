@@ -26,6 +26,12 @@ const CHAT_SUBSCRIPTION: &str = "mostro-watchdog-solver-chats";
 /// Keys per chat subscription: relays refuse a REQ with too many authors.
 pub const MAX_AUTHORS_PER_FILTER: usize = 200;
 
+/// Mostro's dispute status events.
+pub const DISPUTE_KIND: u16 = 38386;
+
+/// Dispute ids per status request, for the same reason.
+pub const MAX_DISPUTES_PER_FILTER: usize = 200;
+
 /// Messages written to the watchdog: Mostrix's, from any key, since a key
 /// is linked by its first message.
 pub fn dm_filter(watchdog: PublicKey) -> Filter {
@@ -47,6 +53,21 @@ pub fn chat_filters(sign_pubkeys: &[PublicKey]) -> Vec<Filter> {
         .collect()
 }
 
+/// Mostro's latest status of each watched dispute, in chunks of at most
+/// [`MAX_DISPUTES_PER_FILTER`] ids. No `since`: a dispute may have ended
+/// long before a stopped watchdog comes back.
+pub fn dispute_filters(mostro: PublicKey, dispute_ids: &[String]) -> Vec<Filter> {
+    dispute_ids
+        .chunks(MAX_DISPUTES_PER_FILTER)
+        .map(|chunk| {
+            Filter::new()
+                .kind(Kind::Custom(DISPUTE_KIND))
+                .author(mostro)
+                .identifiers(chunk.iter().cloned())
+        })
+        .collect()
+}
+
 fn chat_subscription_id(chunk: usize) -> SubscriptionId {
     SubscriptionId::new(format!("{CHAT_SUBSCRIPTION}-{chunk}"))
 }
@@ -54,6 +75,8 @@ fn chat_subscription_id(chunk: usize) -> SubscriptionId {
 pub struct SolverSync {
     pub client: Client,
     pub watchdog: PublicKey,
+    /// Whose dispute events can end a watch.
+    pub mostro: PublicKey,
     pub store: SolverStore,
     pub backlog: mpsc::UnboundedSender<Vec<Event>>,
     /// Notified when NIP-65 discovery swaps the relays.
@@ -148,13 +171,24 @@ impl SolverSync {
         }
     }
 
-    /// Fetches the last day of Mostrix's messages and watched chats and
-    /// hands them to the event loop, which skips what it already handled.
+    /// Fetches the last day of Mostrix's messages and watched chats, and the
+    /// status of the watched disputes, and hands them to the event loop,
+    /// which skips what it already handled. The live dispute subscription
+    /// starts at launch, so a dispute resolved while the watchdog was
+    /// stopped is only seen here.
     async fn catch_up(&self) {
         let since = catch_up_since(Timestamp::now());
+        let watched_disputes = match self.store.watched_dispute_ids().await {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(error = %e, "Failed to read the watched disputes");
+                Vec::new()
+            }
+        };
         let filters = std::iter::once(dm_filter(self.watchdog))
             .chain(chat_filters(&self.followed))
-            .map(|filter| filter.since(since));
+            .map(|filter| filter.since(since))
+            .chain(dispute_filters(self.mostro, &watched_disputes));
         let mut caught_up = Vec::new();
         for filter in filters {
             match self
@@ -194,6 +228,7 @@ mod tests {
         publisher: Client,
         store: SolverStore,
         watchdog: Keys,
+        mostro: Keys,
         solver: Keys,
     }
 
@@ -229,6 +264,7 @@ mod tests {
                 relay,
                 store,
                 watchdog: Keys::generate(),
+                mostro: Keys::generate(),
                 solver,
             }
         }
@@ -238,6 +274,7 @@ mod tests {
             let sync = SolverSync {
                 client: self.client.clone(),
                 watchdog: self.watchdog.public_key(),
+                mostro: self.mostro.public_key(),
                 store: self.store.clone(),
                 backlog,
                 relays_changed: Arc::new(Notify::new()),
@@ -318,6 +355,39 @@ mod tests {
         assert!(dms.get("authors").is_none());
         assert_eq!(chats["kinds"], serde_json::json!([14]));
         assert_eq!(chats["authors"], serde_json::json!([sign.to_hex()]));
+    }
+
+    /// Mostro's status event for `dispute_id`, dated `at`.
+    fn dispute_event(mostro: &Keys, dispute_id: &str, status: &str, at: Timestamp) -> Event {
+        EventBuilder::new(Kind::Custom(DISPUTE_KIND), "")
+            .tags([
+                Tag::identifier(dispute_id),
+                Tag::parse(["s", status]).unwrap(),
+            ])
+            .custom_created_at(at)
+            .finalize(mostro)
+            .unwrap()
+    }
+
+    #[test]
+    fn the_dispute_filters_read_mostros_status_of_watched_disputes() {
+        let mostro = Keys::generate().public_key();
+        let ids: Vec<String> = (0..MAX_DISPUTES_PER_FILTER + 1)
+            .map(|n| format!("dispute-{n}"))
+            .collect();
+
+        let filters = dispute_filters(mostro, &ids);
+
+        assert_eq!(filters.len(), 2);
+        let first = serde_json::to_value(&filters[0]).unwrap();
+        assert_eq!(first["kinds"], serde_json::json!([DISPUTE_KIND]));
+        assert_eq!(first["authors"], serde_json::json!([mostro.to_hex()]));
+        assert_eq!(
+            first["#d"].as_array().map(Vec::len),
+            Some(MAX_DISPUTES_PER_FILTER)
+        );
+        assert!(first.get("since").is_none());
+        assert!(dispute_filters(mostro, &[]).is_empty());
     }
 
     #[test]
@@ -403,6 +473,30 @@ mod tests {
         let ids: Vec<EventId> = caught_up.iter().map(|e| e.id).collect();
         assert!(ids.contains(&missed_chat.id), "{ids:?}");
         assert!(ids.contains(&missed_dm.id), "{ids:?}");
+        setup.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn the_catch_up_brings_the_status_of_watched_disputes_of_any_age() {
+        // A dispute resolved while the watchdog was stopped, days ago.
+        let setup = Setup::new().await;
+        setup.watch(&Keys::generate(), 1).await;
+        let days_ago = Timestamp::now() - Duration::from_secs(3 * 24 * 3600);
+        let resolved = dispute_event(&setup.mostro, DISPUTE, "settled", days_ago);
+        let unwatched = dispute_event(&setup.mostro, "other-dispute", "settled", days_ago);
+        setup.publish(&resolved).await;
+        setup.publish(&unwatched).await;
+        let (mut sync, mut backlog) = setup.sync();
+
+        sync.sync_once().await;
+
+        let caught_up = tokio::time::timeout(WAIT, backlog.recv())
+            .await
+            .expect("a batch")
+            .expect("the channel is open");
+        let ids: Vec<EventId> = caught_up.iter().map(|e| e.id).collect();
+        assert!(ids.contains(&resolved.id), "{ids:?}");
+        assert!(!ids.contains(&unwatched.id), "{ids:?}");
         setup.shutdown().await;
     }
 
