@@ -165,10 +165,15 @@ after a handoff or while Serbero was still mediating:
 
 Mostro's dispute events do not name the solver, so the watchdog spots a
 takeover as a second, later `in-progress` event for a dispute Serbero reported
-on (Serbero, a read-only solver, cannot take a dispute twice). A takeover that
-happens while the watchdog is stopped is announced when it starts again, unless
-the dispute was resolved meanwhile. A takeover seen before any update from
-Serbero about that dispute is not announced.
+on (Serbero, a read-only solver, cannot take a dispute twice). It is not
+announced when:
+
+- it happens while the watchdog is stopped: the watchdog only sees dispute
+  events published while it runs, like every other dispute alert;
+- it is seen before any update from Serbero about that dispute.
+
+The takeover also updates Serbero's line on the dispute's message, even with
+the `in_progress` alert turned off.
 
 ### Setup
 
