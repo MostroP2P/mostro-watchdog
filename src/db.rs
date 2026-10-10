@@ -114,22 +114,6 @@ impl DisputeMessageStore {
     }
 
     /// Get the message ID for a dispute.
-    pub async fn get_message_id(
-        &self,
-        dispute_id: &str,
-    ) -> Result<Option<(i32, i64)>, sqlx::Error> {
-        let result: Option<(i32, i64)> = sqlx::query_as(
-            r#"
-            SELECT message_id, chat_id FROM dispute_messages WHERE dispute_id = ?
-            "#,
-        )
-        .bind(dispute_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(result)
-    }
-
     /// The stored message for a dispute.
     pub async fn get_message(
         &self,
@@ -486,9 +470,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Get the message ID
-        let result = store.get_message_id("dispute-123").await.unwrap();
-        assert_eq!(result, Some((456, -100123)));
+        let message = store.get_message("dispute-123").await.unwrap().unwrap();
+        assert_eq!((message.message_id, message.chat_id), (456, -100123));
 
         // Update status
         store
@@ -498,8 +481,7 @@ mod tests {
 
         // Delete
         store.delete("dispute-123").await.unwrap();
-        let result = store.get_message_id("dispute-123").await.unwrap();
-        assert_eq!(result, None);
+        assert_eq!(store.get_message("dispute-123").await.unwrap(), None);
     }
 
     /// The schema released before Serbero alerts (v0.3.0).

@@ -97,7 +97,7 @@ pub async fn handle_dispute_event<M: Messenger>(
     // alert toggles.
     if let Some(serbero) = serbero {
         serbero
-            .note_dispute_status(&dispute_id, &status, created_at)
+            .note_dispute_status(&dispute_id, &status, created_at, mode == AlertMode::Live)
             .await;
     }
     // Recorded with or without Serbero: the next catch-up compares
@@ -109,9 +109,26 @@ pub async fn handle_dispute_event<M: Messenger>(
         error!("Failed to record the dispute's status: {}", e);
     }
 
-    if mode == AlertMode::CatchUp && !is_news(previous.as_ref(), seconds(created_at)) {
+    // Check if we have an existing message for this dispute
+    let existing_message = match dispute_store.get_message(&dispute_id).await {
+        Ok(result) => result,
+        Err(e) => {
+            error!("Failed to query dispute store: {}", e);
+            None
+        }
+    };
+
+    let shown_status = existing_message.as_ref().map(|m| m.status.as_str());
+    if mode == AlertMode::CatchUp
+        && !is_news(
+            previous.as_ref(),
+            seconds(created_at),
+            &status,
+            shown_status,
+        )
+    {
         debug!(
-            "Caught-up status '{}' for dispute {} is already recorded, skipping",
+            "Caught-up status '{}' for dispute {} is already shown, skipping",
             status, dispute_id
         );
         return;
@@ -126,16 +143,8 @@ pub async fn handle_dispute_event<M: Messenger>(
         return;
     }
 
-    // Check if we have an existing message for this dispute
-    let existing_message = match dispute_store.get_message_id(&dispute_id).await {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Failed to query dispute store: {}", e);
-            None
-        }
-    };
-
     // A catch-up may only bring the dispute's message up to date.
+    let existing_message = existing_message.map(|m| (m.message_id, m.chat_id));
     if mode == AlertMode::CatchUp && existing_message.is_none() {
         info!(
             "Caught-up status '{}' for dispute {} has no channel message, not posting it",
@@ -232,10 +241,19 @@ pub async fn handle_dispute_event<M: Messenger>(
     }
 }
 
-/// Whether an event dated `created_at` is newer than the recorded status.
-/// Nothing recorded means nothing was shown yet, so it is news.
-fn is_news(previous: Option<&crate::db::RecordedStatus>, created_at: i64) -> bool {
-    previous.is_none_or(|p| created_at > p.created_at)
+/// Whether a caught-up `status` dated `created_at` has something to show:
+/// it is newer than the recorded status, or it is the recorded status and
+/// the message does not show it yet (an edit that failed; the status is
+/// recorded before the edit). Nothing recorded means nothing was shown.
+fn is_news(
+    previous: Option<&crate::db::RecordedStatus>,
+    created_at: i64,
+    status: &str,
+    shown_status: Option<&str>,
+) -> bool {
+    previous.is_none_or(|p| {
+        created_at > p.created_at || (created_at == p.created_at && shown_status != Some(status))
+    })
 }
 
 /// Event times fit; saturate instead of wrapping if one does not.
@@ -506,6 +524,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_caught_up_status_whose_edit_failed_is_retried_by_the_next_catch_up() {
+        let fx = Fixture::new().await;
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+        fx.telegram.clear();
+        let settled = fx.dispute_event("settled", TAKEN + 3_600);
+        fx.telegram.edits_fail.store(true, Ordering::SeqCst);
+        fx.handle(&settled, AlertMode::CatchUp).await;
+        assert!(fx.telegram.calls().is_empty());
+        fx.telegram.edits_fail.store(false, Ordering::SeqCst);
+
+        // The same event, fetched again by the next periodic catch-up.
+        fx.handle(&settled, AlertMode::CatchUp).await;
+
+        assert!(fx.telegram.sends().is_empty());
+        assert!(matches!(
+            fx.telegram.edits().as_slice(),
+            [Call::Edit { message_id: 1, text, .. }] if text.contains("SETTLED")
+        ));
+        assert_eq!(fx.stored_status().await.as_deref(), Some("settled"));
+    }
+
+    #[tokio::test]
     async fn a_live_status_sends_a_new_message_and_then_edits_it() {
         let fx = Fixture::new().await;
 
@@ -604,9 +645,32 @@ mod tests {
             status: "in-progress".into(),
             created_at: 100,
         };
-        assert!(is_news(None, 100));
-        assert!(is_news(Some(&recorded), 101));
-        assert!(!is_news(Some(&recorded), 100));
-        assert!(!is_news(Some(&recorded), 99));
+        assert!(is_news(None, 100, "in-progress", None));
+        assert!(is_news(
+            Some(&recorded),
+            101,
+            "settled",
+            Some("in-progress")
+        ));
+        assert!(!is_news(
+            Some(&recorded),
+            99,
+            "initiated",
+            Some("in-progress")
+        ));
+        // The recorded status, already shown.
+        assert!(!is_news(
+            Some(&recorded),
+            100,
+            "in-progress",
+            Some("in-progress")
+        ));
+        // The recorded status, not shown yet: the edit failed before.
+        assert!(is_news(
+            Some(&recorded),
+            100,
+            "in-progress",
+            Some("initiated")
+        ));
     }
 }
