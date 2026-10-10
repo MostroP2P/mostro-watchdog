@@ -151,23 +151,17 @@ person is needed, hands the dispute off to the human solvers. While Serbero
 mediates, Mostro shows the dispute as `in-progress`, so without Serbero alerts
 the Telegram group never learns that a dispute was handed off and needs a solver.
 
-With Serbero alerts on, the watchdog:
+With Serbero alerts on, the watchdog adds each of Serbero's steps to the
+dispute's timeline and moves its header, an edit of the dispute's one message.
+It never sends a separate message for them: edits do not notify, and the
+channel holds one message per dispute.
 
-- adds each of Serbero's steps to the dispute's timeline (an edit, which does
-  not notify);
-- sends a **new message**, which notifies, when Serbero hands a dispute off or
-  cannot start mediating it. It replies to the dispute's message when there is
-  one, and stands alone otherwise (for example when the watchdog started after
-  the dispute's alert went out);
-- sends another **new message** when a solver takes the dispute over from
-  Serbero, so the group sees the handoff answered (`takeover_message`).
-
-| Serbero says | Step on the timeline | Header while it holds | New message |
-|---|---|---|---|
-| `mediating` | 🤖 Serbero mediating | 🤖 WITH SERBERO · mediating | – |
-| `guidance sent: <path>` | 🤖 Serbero guided the parties · payment arrived | 🤖 WITH SERBERO · guided the parties | – |
-| `handed off: <reason>` | 🙋 Serbero handed off · conflicting claims | 🙋 NEEDS A SOLVER · handed off · conflicting claims | 🙋 SERBERO HANDED OFF A DISPUTE |
-| `mediation could not start` | 🙋 Serbero could not start mediation | 🙋 NEEDS A SOLVER · mediation could not start | 🙋 SERBERO COULD NOT START MEDIATION |
+| Serbero says | Step on the timeline | Header while it holds |
+|---|---|---|
+| `mediating` | 🤖 Serbero mediating | 🤖 WITH SERBERO · mediating |
+| `guidance sent: <path>` | 🤖 Serbero guided the parties · payment arrived | 🤖 WITH SERBERO · guided the parties |
+| `handed off: <reason>` | 🙋 Serbero handed off · conflicting claims | 🙋 NEEDS A SOLVER · handed off · conflicting claims |
+| `mediation could not start` | 🙋 Serbero could not start mediation | 🙋 NEEDS A SOLVER · mediation could not start |
 
 The steps stay on the timeline through later status changes. The header stops
 asking for a solver once one takes the dispute over or the dispute is
@@ -176,47 +170,16 @@ late (a catch-up, a relay delay) takes its place on the timeline by its own
 time, and a late notice of an earlier mediation stage never moves the header
 back.
 
-### Handoff alert
-
-```text
-🙋 SERBERO HANDED OFF A DISPUTE
-
-📋 Dispute ID: `abc123def456`
-💬 Reason: conflicting claims
-⏰ Time: 2026-10-01 15:30:00 UTC
-
-⚡ A solver must take it over in Mostrix (Ctrl+T on Disputes Pending).
-```
-
 Reasons are Serbero's handoff reasons in plain words: `conflicting claims`,
 `fraud signal`, `human requested`, `round limit`, `unresponsive`, and so on.
 
-### Takeover alert
+### Takeover
 
-Sent once per dispute when a solver takes over a dispute Serbero held, whether
-after a handoff or while Serbero was still mediating:
-
-```text
-👨‍⚖️ SOLVER TOOK OVER FROM SERBERO
-
-📋 Dispute ID: `abc123def456`
-⏰ Time: 2026-10-01 15:42:00 UTC
-
-ℹ️ A solver is now handling the dispute.
-```
-
-Mostro's dispute events do not name the solver, so the watchdog spots a
-takeover as a second, later `in-progress` event for a dispute Serbero reported
-on (Serbero, a read-only solver, cannot take a dispute twice). It is not
-announced when:
-
-- it happens while the watchdog is stopped: the watchdog only sees dispute
-  events published while it runs, like every other dispute alert;
-- it is seen before any update from Serbero about that dispute.
-
-The takeover also shows on the dispute's timeline (`👨‍⚖️ Taken over by ‹name›`)
-and in its header, even with the `in_progress` alert or `takeover_message`
-turned off.
+Mostro's dispute events do not name the solver, so a solver taking a dispute
+over from Serbero shows as a later `in-progress` event for the dispute. It
+joins the timeline as `👨‍⚖️ Taken over by ‹name›` and the header stops asking
+for a solver (`👨‍⚖️ WITH A SOLVER · ‹name›`), even with the `in_progress`
+alert turned off.
 
 ### Setup
 
@@ -265,12 +228,10 @@ one may be a stale copy on a slow relay.
 them. Serbero must publish to at least one of these relays, or its messages
 never reach the watchdog (nothing warns about it).
 
-To turn either kind of alert off:
+To keep Serbero's steps off the dispute's timeline:
 
 ```toml
 [alerts]
-serbero_handoff = false    # no new message on handoffs
-takeover_message = false   # no new message on takeovers
 serbero_progress = false   # no Serbero steps on the dispute's timeline
 ```
 
@@ -293,9 +254,10 @@ asking for the key to be moved to `[[observers]]`.
 - On every start, every 10 minutes (or every `nip65_refresh_interval`, if
   shorter) and after each switch of relays, the watchdog fetches the last 24
   hours of Serbero's messages, so updates sent while it was down are relayed.
-- A handoff alert that Telegram rejected is retried by an early fetch, after
-  30 seconds and then after doubling delays while failures last.
-- A handoff for a dispute the watchdog already saw resolved sends no alert.
+- An update the watchdog could not show (Telegram rejected the edit of the
+  dispute's message) or could not record (a database error) is retried by an
+  early fetch, after 30 seconds and then after doubling delays while failures
+  last. The step joins the timeline once however many times it is retried.
 - Updates move a dispute only forward (mediating, then guidance, then
   handoff): Serbero dates a retried message when it sends it, so a late
   `mediating` never replaces a handoff.

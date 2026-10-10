@@ -269,7 +269,7 @@ impl SolverInbox {
             }
         };
         let (chat_id, text) = text;
-        if let Err(e) = telegram.send(chat_id, &text, None).await {
+        if let Err(e) = telegram.send(chat_id, &text).await {
             warn!(chat_id, error = %e, "Failed to answer a solver link on Telegram");
         }
         Ok(())
@@ -308,7 +308,7 @@ impl SolverInbox {
             return;
         };
         let text = notification_text(watch.party, &watch.dispute_id, from_party.len());
-        match telegram.send(watch.chat_id, &text, None).await {
+        match telegram.send(watch.chat_id, &text).await {
             Ok(_) => {
                 info!(
                     dispute_id = %watch.dispute_id,
@@ -577,7 +577,6 @@ mod tests {
         Call::Send {
             chat_id: CHAT,
             text: notification_text(super::super::protocol::Party::Buyer, DISPUTE, count),
-            reply_to: None,
         }
     }
 

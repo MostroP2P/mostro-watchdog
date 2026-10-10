@@ -4,18 +4,16 @@
 use std::future::Future;
 
 use teloxide::prelude::*;
-use teloxide::types::{MessageId, ParseMode, ReplyParameters};
+use teloxide::types::{MessageId, ParseMode};
 use teloxide::{ApiError, RequestError};
 
 /// Sends and edits MarkdownV2 messages.
 pub trait Messenger: Sync {
-    /// Sends `text`, as a reply to message `reply_to` when given. Returns
-    /// the id of the sent message.
+    /// Sends `text`. Returns the id of the sent message.
     fn send(
         &self,
         chat_id: i64,
         text: &str,
-        reply_to: Option<i32>,
     ) -> impl Future<Output = Result<i32, RequestError>> + Send;
 
     /// Replaces the text of message `message_id`.
@@ -28,23 +26,11 @@ pub trait Messenger: Sync {
 }
 
 impl Messenger for Bot {
-    async fn send(
-        &self,
-        chat_id: i64,
-        text: &str,
-        reply_to: Option<i32>,
-    ) -> Result<i32, RequestError> {
-        let request = self
-            .send_message(ChatId(chat_id), text)
-            .parse_mode(ParseMode::MarkdownV2);
-        let request = match reply_to {
-            // Still sent if the dispute's message was deleted meanwhile.
-            Some(id) => request.reply_parameters(
-                ReplyParameters::new(MessageId(id)).allow_sending_without_reply(),
-            ),
-            None => request,
-        };
-        request.await.map(|sent| sent.id.0)
+    async fn send(&self, chat_id: i64, text: &str) -> Result<i32, RequestError> {
+        self.send_message(ChatId(chat_id), text)
+            .parse_mode(ParseMode::MarkdownV2)
+            .await
+            .map(|sent| sent.id.0)
     }
 
     async fn edit(&self, chat_id: i64, message_id: i32, text: &str) -> Result<(), RequestError> {

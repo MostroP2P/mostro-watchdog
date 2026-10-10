@@ -884,10 +884,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let serbero_alerts = SerberoAlerts {
         store: &dispute_store,
         telegram: &bot,
-        chat_id,
         show_progress: alerts_config.serbero_progress,
-        send_handoffs: alerts_config.serbero_handoff,
-        send_takeovers: alerts_config.takeover_message,
         names: names.clone(),
     };
 
@@ -1055,7 +1052,6 @@ impl<M: Messenger> EventLoop<'_, M> {
             self.alerts_config,
             self.dispute_store,
             self.names,
-            self.serbero_inbox.is_some().then_some(self.serbero_alerts),
         )
         .await;
     }
@@ -1228,10 +1224,7 @@ mod tests {
             SerberoAlerts {
                 store: &self.store,
                 telegram: &self.telegram,
-                chat_id: CHAT,
                 show_progress: false,
-                send_handoffs: false,
-                send_takeovers: false,
                 names: Names::default(),
             }
         }
@@ -1340,11 +1333,6 @@ mod tests {
         assert!(sent[0].contains("OPEN · needs a solver") && sent[0].contains(fresh_id));
         assert!(fx.telegram.edits().is_empty());
         assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
-        // Still recorded, for a late Serbero handoff.
-        assert_eq!(
-            fx.store.dispute_status(DISPUTE).await.unwrap().as_deref(),
-            Some("in-progress")
-        );
         fx.shutdown().await;
     }
 

@@ -6,9 +6,8 @@
 //! writes the watchdog one line per mediation step (serbero
 //! `docs/messages.md` §3): `mediating`, `mediation could not start`,
 //! `handed off: <reason>` and `guidance sent: <path>`. The watchdog shows
-//! that state on the dispute's Telegram message and sends a new message,
-//! which notifies, when a solver must take the dispute over, and another
-//! when a solver did take it over from Serbero (`takeover`).
+//! each as a step on the dispute's one Telegram message, edited in place;
+//! it never sends a message of its own for them.
 //!
 //! Only the first line of a DM is ever read. If Serbero sends the watchdog
 //! full solver messages (registered as a solver by mistake), the rest,
@@ -20,7 +19,6 @@ pub mod discovery;
 pub mod dm;
 pub mod render;
 pub mod sync;
-pub mod takeover;
 pub mod telegram;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -85,11 +83,10 @@ impl SerberoInbox {
                         subject = %subject,
                         "Serbero update already relayed"
                     ),
-                    Outcome::Relayed { redrawn, alerted } => info!(
+                    Outcome::Relayed { redrawn } => info!(
                         dispute_id = %update.dispute_id,
                         subject = %subject,
                         redrawn,
-                        alerted,
                         "🤖 Serbero update relayed"
                     ),
                 }
@@ -189,10 +186,7 @@ mod tests {
             SerberoAlerts {
                 store: &self.store,
                 telegram: &self.telegram,
-                chat_id: CHAT,
                 show_progress: true,
-                send_handoffs: true,
-                send_takeovers: true,
                 names: Names::default(),
             }
         }
@@ -225,14 +219,13 @@ mod tests {
             .receive(&fx.dm("handed off: conflicting_claims", 100), &fx.alerts())
             .await;
 
-        assert_eq!(
-            outcome,
-            Some(Outcome::Relayed {
-                redrawn: false,
-                alerted: true
-            })
-        );
-        assert_eq!(fx.telegram.sends().len(), 1);
+        assert_eq!(outcome, Some(Outcome::Relayed { redrawn: false }));
+        assert!(fx.telegram.calls().is_empty());
+        assert!(fx
+            .store
+            .serbero_header_handled(DISPUTE, "handed off: conflicting_claims")
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -276,7 +269,13 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_relay_asks_for_an_early_catch_up() {
+        // Telegram rejects the edit of the dispute's message.
         let fx = Fixture::new().await;
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "base")
+            .await
+            .unwrap();
+        fx.store.set_sent_at(DISPUTE, 1).await.unwrap();
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
         fx.telegram.set_down(true);
 
@@ -322,6 +321,6 @@ mod tests {
         assert!(
             edits[1].contains("Serbero mediating\n🙋 `00:03:20` Serbero handed off · round limit")
         );
-        assert_eq!(fx.telegram.sends().len(), 1);
+        assert!(fx.telegram.sends().is_empty());
     }
 }

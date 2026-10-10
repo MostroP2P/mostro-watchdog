@@ -133,8 +133,9 @@ enabled with `heartbeat_enabled`.
 A dispute has one channel message, rendered from its timeline
 (`dispute_timeline`) and edited in place. Anything that happens to a dispute
 appends a step and redraws the message; nothing formats a dispute's state on
-its own. New messages, which notify, are sent only for a live dispute status
-and for the Serbero handoff and takeover pings.
+its own. A new message, which notifies, is sent only for a live dispute
+status; Serbero's steps and a solver's takeover are edits of that message,
+never messages of their own.
 
 For the same reason, bot commands such as `/version` are answered in private
 chats only. `is_answerable_chat` enforces this; a command sent in a group or

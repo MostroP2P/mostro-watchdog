@@ -1,12 +1,12 @@
-//! Relaying Serbero's updates: what to record, which dispute message to
-//! redraw and when to ask the team for a solver.
+//! Relaying Serbero's updates: what to record and which dispute message to
+//! redraw. Nothing here sends a new message: a Serbero update is a step on
+//! the dispute's timeline, shown by editing the dispute's one message.
 
 use super::dm::{HeaderUpdate, Update};
-use super::render::{dispute_is_resolved, needs_human_alert};
 use super::telegram::Messenger;
-use crate::db::{DisputeMessageStore, SerberoState, StoredMessage};
-use crate::timeline::{self, EntryKind, Names};
-use tracing::{info, warn};
+use crate::db::{DisputeMessageStore, SerberoState};
+use crate::timeline::{self, EntryKind, Names, RedrawError};
+use tracing::info;
 
 /// Why an update could not be relayed. It is not recorded as relayed, so
 /// the next delivery of the same DM tries again.
@@ -23,25 +23,17 @@ pub enum AlertError {
 pub enum Outcome {
     /// Already relayed: a redelivery, a re-fetch or a restart.
     Duplicate,
-    /// Recorded. `redrawn` when the dispute's message now shows it,
-    /// `alerted` when a new message asked for a solver.
-    Relayed { redrawn: bool, alerted: bool },
+    /// Recorded. `redrawn` when the dispute's message now shows it.
+    Relayed { redrawn: bool },
 }
 
 /// Relays Serbero updates to Telegram.
 pub struct SerberoAlerts<'a, M> {
     pub store: &'a DisputeMessageStore,
     pub telegram: &'a M,
-    /// The configured alert chat.
-    pub chat_id: i64,
     /// `[alerts] serbero_progress`: show Serbero's state on the dispute's
     /// message.
     pub show_progress: bool,
-    /// `[alerts] serbero_handoff`: send a message when a solver is needed.
-    pub send_handoffs: bool,
-    /// `[alerts] takeover_message`: send a message when a solver takes the
-    /// dispute over from Serbero.
-    pub send_takeovers: bool,
     /// How solvers are named on the timeline.
     pub names: Names,
 }
@@ -58,8 +50,10 @@ fn timeline_step(update: &Update) -> (EntryKind, Option<&str>) {
 
 impl<M: Messenger> SerberoAlerts<'_, M> {
     /// Relays one update, at most once per dispute and subject. The update
-    /// is marked as relayed only once its alert went out, so a failed send
-    /// is retried when the DM arrives again (catch-up, restart).
+    /// is marked as relayed only once the dispute's message shows it, so a
+    /// redraw Telegram rejected is retried when the DM arrives again (an
+    /// early catch-up, the next periodic one, a restart). The timeline step
+    /// is kept once however many times that happens.
     pub async fn relay(&self, update: &HeaderUpdate) -> Result<Outcome, AlertError> {
         let subject = update.update.subject();
         if self
@@ -83,16 +77,12 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
                     seconds(update.created_at),
                 )
                 .await?;
-            self.redraw(&update.dispute_id).await
+            self.redraw(&update.dispute_id).await?
         };
-        let message = self.store.get_message(&update.dispute_id).await?;
-        let taken_over = self.store.taken_over(&update.dispute_id).await?;
-        let alerted =
-            self.send_handoffs && !taken_over && self.alert(update, message.as_ref()).await?;
         self.store
             .mark_serbero_header_handled(&update.dispute_id, &subject, seconds(update.created_at))
             .await?;
-        Ok(Outcome::Relayed { redrawn, alerted })
+        Ok(Outcome::Relayed { redrawn })
     }
 
     /// Saves `update` as the dispute's state unless a later one is stored.
@@ -113,60 +103,23 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
     }
 
     /// Shows the dispute's timeline, with the step just added, on its
-    /// message. Edits do not notify, so a failure is logged and not
-    /// retried: the step also shows on the next redraw.
-    async fn redraw(&self, dispute_id: &str) -> bool {
+    /// message. The message is the only place the step shows, so a failed
+    /// edit is an error: the update stays unrelayed and is retried.
+    async fn redraw(&self, dispute_id: &str) -> Result<bool, AlertError> {
         match timeline::redraw(self.store, self.telegram, &self.names, dispute_id).await {
-            Ok(Some(_)) => true,
+            Ok(Some(_)) => Ok(true),
             // No message yet: the step shows on the dispute's first alert.
-            Ok(None) => false,
-            Err(e) => {
-                warn!(
+            Ok(None) => {
+                info!(
                     dispute_id,
-                    error = %e,
-                    "Failed to show Serbero's update on the dispute message"
+                    "No dispute message yet; Serbero's step waits for it"
                 );
-                false
+                Ok(false)
             }
+            Err(RedrawError::Store(e)) => Err(AlertError::Store(e)),
+            Err(RedrawError::Telegram(e)) => Err(AlertError::Telegram(e)),
         }
     }
-
-    /// Asks the team for a solver when the update needs one and no solver
-    /// took the dispute over yet. Returns whether a message was sent.
-    async fn alert(
-        &self,
-        update: &HeaderUpdate,
-        message: Option<&StoredMessage>,
-    ) -> Result<bool, AlertError> {
-        let Some(text) = needs_human_alert(&update.dispute_id, &update.update, update.created_at)
-        else {
-            return Ok(false);
-        };
-        // Caught up after the dispute ended (a restart, the first start, a
-        // status alert turned off, a message deleted on a cooperative
-        // cancel): nobody has to take it over any more.
-        let recorded = self.store.dispute_status(&update.dispute_id).await?;
-        let resolved = recorded.as_deref().is_some_and(dispute_is_resolved)
-            || message.is_some_and(|m| dispute_is_resolved(&m.status));
-        if resolved {
-            info!(
-                dispute_id = %update.dispute_id,
-                "Dispute already resolved; no Serbero handoff alert"
-            );
-            return Ok(false);
-        }
-        let reply_to = reply_target(message, self.chat_id);
-        self.telegram.send(self.chat_id, &text, reply_to).await?;
-        Ok(true)
-    }
-}
-
-/// The dispute's message to reply to. A reply shows the dispute's alert as
-/// context; it is only possible in the chat that message lives in.
-pub(super) fn reply_target(message: Option<&StoredMessage>, chat_id: i64) -> Option<i32> {
-    message
-        .filter(|m| m.chat_id == chat_id)
-        .map(|m| m.message_id)
 }
 
 /// Event times are capped at the time they were read, so they fit.
@@ -224,10 +177,7 @@ mod tests {
             SerberoAlerts {
                 store: &self.store,
                 telegram: &self.telegram,
-                chat_id: CHAT,
                 show_progress: true,
-                send_handoffs: true,
-                send_takeovers: true,
                 names: Names::default(),
             }
         }
@@ -267,7 +217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handoff_redraws_the_dispute_message_and_replies_with_an_alert() {
+    async fn a_handoff_redraws_the_dispute_message_and_sends_nothing_new() {
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "in-progress", "🔄 *DISPUTE IN PROGRESS*")
@@ -281,26 +231,45 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: true
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         assert!(matches!(
             fx.telegram.calls().as_slice(),
-            [
-                Call::Edit { chat_id: CHAT, message_id: 42, text },
-                Call::Send { chat_id: CHAT, text: alert, reply_to: Some(42) },
-            ] if text.contains("*Status:* 🙋 NEEDS A SOLVER · handed off · conflicting claims")
-                && text.contains("🙋 `00:00:00` Serbero handed off · conflicting claims")
-                && *alert == needs_human_alert(DISPUTE, &handed_off("conflicting_claims"), AT).unwrap()
+            [Call::Edit { chat_id: CHAT, message_id: 42, text }]
+                if text.contains("*Status:* 🙋 NEEDS A SOLVER · handed off · conflicting claims")
+                    && text.contains("🙋 `00:00:00` Serbero handed off · conflicting claims")
         ));
         assert_eq!(
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: conflicting_claims", AT as i64))
         );
+    }
+
+    #[tokio::test]
+    async fn no_serbero_update_sends_a_new_message() {
+        // Everything Serbero reports is a step on the dispute's message,
+        // with or without that message; nothing else reaches the channel.
+        let updates = [
+            Update::Mediating,
+            Update::GuidanceSent {
+                path: Some("payment_arrived".into()),
+            },
+            handed_off("conflicting_claims"),
+            Update::CouldNotStart,
+        ];
+        for (i, kind) in updates.into_iter().enumerate() {
+            let fx = Fixture::new().await;
+            if i % 2 == 0 {
+                fx.store
+                    .insert(DISPUTE, 42, CHAT, "in-progress", "base")
+                    .await
+                    .unwrap();
+                fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
+            }
+
+            fx.alerts().relay(&update(kind, AT)).await.unwrap();
+
+            assert!(fx.telegram.sends().is_empty(), "{:?}", fx.telegram.calls());
+        }
     }
 
     #[tokio::test]
@@ -318,13 +287,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: false
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         assert!(matches!(
             fx.telegram.calls().as_slice(),
             [Call::Edit { chat_id: CHAT, message_id: 42, text }]
@@ -347,12 +310,12 @@ mod tests {
         let again = fx.alerts().relay(&handoff).await.unwrap();
 
         assert_eq!(again, Outcome::Duplicate);
-        assert_eq!(fx.telegram.sends().len(), 1);
+        assert!(fx.telegram.sends().is_empty());
         assert_eq!(fx.telegram.edits().len(), 1);
     }
 
     #[tokio::test]
-    async fn a_restart_does_not_repeat_an_alert() {
+    async fn a_restart_does_not_relay_a_header_again() {
         let fx = Fixture::new().await;
         let handoff = update(Update::CouldNotStart, AT);
         fx.alerts().relay(&handoff).await.unwrap();
@@ -364,10 +327,7 @@ mod tests {
         let alerts = SerberoAlerts {
             store: &store,
             telegram: &telegram,
-            chat_id: CHAT,
             show_progress: true,
-            send_handoffs: true,
-            send_takeovers: true,
             names: Names::default(),
         };
 
@@ -376,8 +336,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handoff_for_a_dispute_without_a_message_is_sent_on_its_own() {
-        // The watchdog started after the dispute's alert went out.
+    async fn a_handoff_for_a_dispute_without_a_message_only_records_the_state() {
+        // The watchdog started after the dispute's alert went out. No
+        // message of its own goes out: the channel is the dispute's message.
         let fx = Fixture::new().await;
 
         let outcome = fx
@@ -386,21 +347,8 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: true
-            }
-        );
-        assert_eq!(
-            fx.telegram.calls(),
-            vec![Call::Send {
-                chat_id: CHAT,
-                text: needs_human_alert(DISPUTE, &handed_off("human_requested"), AT).unwrap(),
-                reply_to: None,
-            }]
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: false });
+        assert!(fx.telegram.calls().is_empty());
         // The state is kept for the dispute's next alert.
         assert_eq!(
             fx.store.serbero_state(DISPUTE).await.unwrap(),
@@ -409,8 +357,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handoff_for_a_resolved_dispute_sends_no_alert() {
-        // Caught up after the dispute was settled: nobody has to act.
+    async fn a_handoff_for_a_resolved_dispute_only_redraws() {
+        // Caught up after the dispute was settled: the step joins the
+        // timeline and nothing else happens.
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "settled", "base")
@@ -423,13 +372,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: false
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         assert_eq!(fx.telegram.sends(), vec![]);
         assert!(
             matches!(
@@ -443,122 +386,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_handoff_after_an_unalerted_resolution_sends_no_alert() {
-        // The settled alert was turned off (or the cooperative cancel
-        // deleted the message): only the recorded status says it ended.
-        let fx = Fixture::new().await;
-        fx.store
-            .record_dispute_status(DISPUTE, "settled", AT as i64 - 10)
-            .await
-            .unwrap();
-
-        let outcome = fx
-            .alerts()
-            .relay(&update(handed_off("conflicting_claims"), AT))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: false
-            }
-        );
-        assert_eq!(fx.telegram.calls(), vec![]);
-    }
-
-    #[tokio::test]
-    async fn a_handoff_after_a_cooperative_cancel_sends_no_alert() {
-        // `canceled` deletes the dispute's message, so only the recorded
-        // status says the dispute ended.
-        let fx = Fixture::new().await;
-        fx.store
-            .record_dispute_status(DISPUTE, "canceled", AT as i64 - 10)
-            .await
-            .unwrap();
-
-        let outcome = fx
-            .alerts()
-            .relay(&update(Update::CouldNotStart, AT))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: false
-            }
-        );
-        assert_eq!(fx.telegram.calls(), vec![]);
-    }
-
-    #[tokio::test]
-    async fn a_message_in_another_chat_gets_a_standalone_alert() {
-        // The alert chat changed since the dispute's message was sent.
-        let fx = Fixture::new().await;
-        fx.store
-            .insert(DISPUTE, 42, -999, "in-progress", "base")
-            .await
-            .unwrap();
-
-        fx.alerts()
-            .relay(&update(Update::CouldNotStart, AT))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            fx.telegram.sends(),
-            vec![Call::Send {
-                chat_id: CHAT,
-                text: needs_human_alert(DISPUTE, &Update::CouldNotStart, AT).unwrap(),
-                reply_to: None,
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn a_failed_alert_is_retried_on_the_next_delivery() {
-        let fx = Fixture::new().await;
-        let handoff = update(handed_off("uncertain"), AT);
-        fx.telegram.set_down(true);
-
-        let first = fx.alerts().relay(&handoff).await;
-        fx.telegram.set_down(false);
-        let second = fx.alerts().relay(&handoff).await.unwrap();
-
-        assert!(matches!(first, Err(AlertError::Telegram(_))));
-        assert_eq!(
-            second,
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: true
-            }
-        );
-        assert_eq!(fx.telegram.sends().len(), 1);
-    }
-
-    #[tokio::test]
-    async fn a_failed_redraw_does_not_hold_the_alert_back() {
+    async fn a_failed_redraw_is_retried_on_the_next_delivery() {
+        // The message is the only place a handoff shows, so an edit that
+        // Telegram rejected leaves the update unrelayed; the next delivery
+        // (an early catch-up) edits again, and the step is kept once.
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
+        let handoff = update(handed_off("uncertain"), AT);
         fx.telegram.set_down(true);
 
-        let outcome = fx.alerts().relay(&update(Update::Mediating, AT)).await;
+        let first = fx.alerts().relay(&handoff).await;
+        assert!(matches!(first, Err(AlertError::Telegram(_))), "{first:?}");
+        assert!(!fx
+            .store
+            .serbero_header_handled(DISPUTE, "handed off: uncertain")
+            .await
+            .unwrap());
+        fx.telegram.set_down(false);
 
-        // Progress has no alert to retry, so the update counts as relayed.
-        assert_eq!(
-            outcome.unwrap(),
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: false
-            }
-        );
+        let second = fx.alerts().relay(&handoff).await.unwrap();
+
+        assert_eq!(second, Outcome::Relayed { redrawn: true });
+        assert!(fx.telegram.sends().is_empty());
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { message_id: 42, text, .. }]
+                if text.matches("Serbero handed off · uncertain").count() == 1
+        ));
     }
 
     #[tokio::test]
@@ -582,13 +440,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: false
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         let edits = edit_texts(&fx.telegram);
         assert_eq!(edits.len(), 2);
         assert!(edits[1].contains("*Status:* 🙋 NEEDS A SOLVER · handed off · round limit"));
@@ -602,7 +454,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turned_off_alerts_still_record_the_state() {
+    async fn turned_off_progress_still_records_the_state() {
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
@@ -611,7 +463,6 @@ mod tests {
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         let alerts = SerberoAlerts {
             show_progress: false,
-            send_handoffs: false,
             ..fx.alerts()
         };
 
@@ -620,13 +471,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: false,
-                alerted: false
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: false });
         assert!(fx.telegram.calls().is_empty());
         assert!(fx.store.serbero_state(DISPUTE).await.unwrap().is_some());
     }
@@ -643,23 +488,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: true
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         assert!(matches!(
-            fx.telegram.edits().as_slice(),
+            fx.telegram.calls().as_slice(),
             [Call::Edit { message_id: 42, text, .. }] if text.contains("Serbero handed off · flood")
-        ));
-        assert!(matches!(
-            fx.telegram.sends().as_slice(),
-            [Call::Send {
-                reply_to: Some(42),
-                ..
-            }]
         ));
     }
 
@@ -710,13 +542,7 @@ mod tests {
             .unwrap();
         fx.store.close().await;
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: true
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         for call in fx.telegram.calls() {
             assert!(!format!("{call:?}").contains("PARTY-SECRET"), "{call:?}");
             assert!(!format!("{call:?}").contains("Buyer"), "{call:?}");
@@ -787,13 +613,7 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: false
-            }
-        );
+        assert_eq!(outcome, Outcome::Relayed { redrawn: true });
         let edits = edit_texts(&fx.telegram);
         assert_eq!(edits.len(), 2);
         // Shown on the timeline, after the handoff, without the header
@@ -805,36 +625,5 @@ mod tests {
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: conflicting_claims", AT as i64))
         );
-    }
-
-    #[tokio::test]
-    async fn a_handoff_after_a_takeover_sends_no_alert() {
-        // Caught up after a solver already took the dispute over.
-        let fx = Fixture::new().await;
-        fx.store
-            .insert(DISPUTE, 42, CHAT, "in-progress", "base")
-            .await
-            .unwrap();
-        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
-        fx.store.record_takeover(DISPUTE, AT as i64).await.unwrap();
-
-        let outcome = fx
-            .alerts()
-            .relay(&update(handed_off("conflicting_claims"), AT - 10))
-            .await
-            .unwrap();
-
-        assert_eq!(
-            outcome,
-            Outcome::Relayed {
-                redrawn: true,
-                alerted: false
-            }
-        );
-        assert!(matches!(
-            fx.telegram.calls().as_slice(),
-            [Call::Edit { chat_id: CHAT, message_id: 42, text }]
-                if text.contains("Serbero handed off · conflicting claims")
-        ));
     }
 }
