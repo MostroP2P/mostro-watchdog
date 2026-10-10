@@ -153,8 +153,8 @@ impl DisputeMessageStore {
     }
 
     /// Adds a step to a dispute's timeline. Returns whether it is new: the
-    /// same step at the same event time (a redelivery, a re-fetch, a
-    /// restart) is kept once.
+    /// same step with the same detail at the same event time (a
+    /// redelivery, a re-fetch, a restart) is kept once.
     pub async fn append_timeline(
         &self,
         dispute_id: &str,
@@ -171,7 +171,7 @@ impl DisputeMessageStore {
         )
         .bind(dispute_id)
         .bind(kind)
-        .bind(detail)
+        .bind(detail.unwrap_or_default())
         .bind(event_created_at)
         .bind(now_secs())
         .execute(&self.pool)
@@ -180,14 +180,14 @@ impl DisputeMessageStore {
         Ok(result.rows_affected() > 0)
     }
 
-    /// A dispute's timeline in event order. Steps can arrive out of order
-    /// (catch-up, relay delays), so the order comes from the event time,
-    /// never from the arrival.
+    /// A dispute's timeline by event time, then by kind and detail. Steps
+    /// can arrive out of order (catch-up, relay delays), so the order never
+    /// comes from the arrival; `timeline::entries` breaks ties by lifecycle.
     pub async fn timeline(&self, dispute_id: &str) -> Result<Vec<TimelineRow>, sqlx::Error> {
-        let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+        let rows: Vec<(String, String, i64)> = sqlx::query_as(
             r#"
             SELECT kind, detail, event_created_at FROM dispute_timeline
-            WHERE dispute_id = ? ORDER BY event_created_at, kind
+            WHERE dispute_id = ? ORDER BY event_created_at, kind, detail
             "#,
         )
         .bind(dispute_id)
@@ -198,7 +198,7 @@ impl DisputeMessageStore {
             .into_iter()
             .map(|(kind, detail, created_at)| TimelineRow {
                 kind,
-                detail,
+                detail: (!detail.is_empty()).then_some(detail),
                 created_at,
             })
             .collect())
@@ -225,6 +225,18 @@ impl DisputeMessageStore {
         .execute(&self.pool)
         .await?;
 
+        Ok(())
+    }
+
+    /// Dates a message as sent at `created_at`. Test fixtures only: the
+    /// timeline backfill dates a legacy message's status by it.
+    #[cfg(test)]
+    pub async fn set_sent_at(&self, dispute_id: &str, created_at: i64) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE dispute_messages SET created_at = ? WHERE dispute_id = ?")
+            .bind(created_at)
+            .bind(dispute_id)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -518,16 +530,18 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .await?;
 
     // Everything known about each dispute, in event order, shown as the
-    // dispute's message. The key keeps a redelivered step once.
+    // dispute's message. The key keeps a redelivered step once; the detail
+    // is part of it (empty when none) so two different steps of one kind
+    // in the same second are both kept.
     sqlx::query(
         r#"
         CREATE TABLE IF NOT EXISTS dispute_timeline (
             dispute_id TEXT NOT NULL,
             kind TEXT NOT NULL,
-            detail TEXT,
+            detail TEXT NOT NULL DEFAULT '',
             event_created_at INTEGER NOT NULL,
             recorded_at INTEGER NOT NULL,
-            PRIMARY KEY (dispute_id, kind, event_created_at)
+            PRIMARY KEY (dispute_id, kind, event_created_at, detail)
         )
         "#,
     )
@@ -776,6 +790,19 @@ mod tests {
             .append_timeline("d1", "opened", Some("buyer"), 10)
             .await
             .unwrap());
+        assert!(!store
+            .append_timeline("d1", "serbero_mediating", None, 20)
+            .await
+            .unwrap());
+        // Two different steps of one kind in the same second: both kept.
+        assert!(store
+            .append_timeline("d1", "status", Some("frozen"), 25)
+            .await
+            .unwrap());
+        assert!(store
+            .append_timeline("d1", "status", Some("thawed"), 25)
+            .await
+            .unwrap());
         store
             .append_timeline("d2", "opened", Some("seller"), 5)
             .await
@@ -791,6 +818,8 @@ mod tests {
             vec![
                 row("opened", Some("buyer"), 10),
                 row("serbero_mediating", None, 20),
+                row("status", Some("frozen"), 25),
+                row("status", Some("thawed"), 25),
                 row("resolved", Some("released"), 30),
             ]
         );

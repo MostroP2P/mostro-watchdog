@@ -81,6 +81,20 @@ impl EntryKind {
         self.serbero_stage().is_some()
     }
 
+    /// The order of steps that share a second (Nostr times are whole
+    /// seconds): a dispute opens, is taken, is mediated, then ends.
+    fn rank(self) -> u8 {
+        match self {
+            Self::Opened => 0,
+            Self::Taken => 1,
+            Self::SerberoMediating => 2,
+            Self::SerberoGuided => 3,
+            Self::SerberoHandedOff | Self::SerberoCouldNotStart => 4,
+            Self::Status => 5,
+            Self::Resolved | Self::Canceled => 6,
+        }
+    }
+
     /// Where a Serbero step stands in a mediation: each happens once per
     /// dispute, so a late notice of an earlier stage never moves the
     /// dispute back (the same order as `dm::Update::stage`).
@@ -113,10 +127,13 @@ impl Entry {
     }
 }
 
-/// The steps of stored rows, in their order. A row written by a newer
-/// version with a kind this one does not know is skipped and logged.
+/// The steps of stored rows, by event time and then by lifecycle, so a
+/// resolution dated the same second as the take still ends the dispute. A
+/// row written by a newer version with a kind this one does not know is
+/// skipped and logged.
 pub fn entries(rows: &[TimelineRow]) -> Vec<Entry> {
-    rows.iter()
+    let mut entries: Vec<Entry> = rows
+        .iter()
         .filter_map(|row| match EntryKind::parse(&row.kind) {
             Some(kind) => Some(Entry::new(kind, row.detail.as_deref(), row.created_at)),
             None => {
@@ -124,7 +141,59 @@ pub fn entries(rows: &[TimelineRow]) -> Vec<Entry> {
                 None
             }
         })
-        .collect()
+        .collect();
+    entries.sort_by_key(|entry| (entry.created_at, entry.kind.rank()));
+    entries
+}
+
+/// The step a kind-38386 `status` adds, with who opened the dispute and
+/// the `solver` tag when Mostro sends one.
+pub fn status_step(
+    status: &str,
+    initiator: Option<&str>,
+    solver: Option<&str>,
+) -> (EntryKind, Option<String>) {
+    match status {
+        "initiated" => (EntryKind::Opened, initiator.map(str::to_owned)),
+        "in-progress" => (EntryKind::Taken, solver.map(str::to_owned)),
+        "released" | "cooperatively-canceled" => (EntryKind::Resolved, Some(status.to_owned())),
+        "settled" | "seller-refunded" => (
+            EntryKind::Resolved,
+            Some(match solver {
+                Some(solver) => format!("{status}:{solver}"),
+                None => status.to_owned(),
+            }),
+        ),
+        "canceled" => (EntryKind::Canceled, None),
+        other => (EntryKind::Status, Some(other.to_owned())),
+    }
+}
+
+/// Opens the timeline of a message sent before the timeline existed: a
+/// `dispute_messages` row with no steps gets its stored status, dated when
+/// the message was sent, so the next step is not the whole story. Called
+/// before any step is added for the dispute.
+pub async fn backfill(store: &DisputeMessageStore, dispute_id: &str) -> Result<(), sqlx::Error> {
+    let Some(message) = store.get_message(dispute_id).await? else {
+        return Ok(());
+    };
+    if !store.timeline(dispute_id).await?.is_empty() {
+        return Ok(());
+    }
+    let (kind, detail) = status_step(&message.status, None, None);
+    store
+        .append_timeline(
+            dispute_id,
+            kind.as_str(),
+            detail.as_deref(),
+            message.created_at,
+        )
+        .await?;
+    info!(
+        dispute_id,
+        "Opened the timeline of a message sent before timelines"
+    );
+    Ok(())
 }
 
 /// How solvers are named on the timeline: `[alerts] solver_names`, or a
@@ -718,6 +787,110 @@ mod tests {
         assert!(text.contains("`id.with-dots_and_more`"));
         assert!(text.contains("Opened by buyer\\_1\n"));
         assert!(text.contains("Status: on\\-hold \\(v2\\.1\\)\n"));
+    }
+
+    #[test]
+    fn steps_in_the_same_second_keep_the_lifecycle_order() {
+        let rows: Vec<TimelineRow> = [
+            ("resolved", Some("released"), 10),
+            ("taken", None, 10),
+            ("serbero_mediating", None, 10),
+            ("opened", Some("buyer"), 10),
+        ]
+        .into_iter()
+        .map(|(kind, detail, created_at)| TimelineRow {
+            kind: kind.into(),
+            detail: detail.map(Into::into),
+            created_at,
+        })
+        .collect();
+
+        let parsed = entries(&rows);
+
+        let kinds: Vec<EntryKind> = parsed.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EntryKind::Opened,
+                EntryKind::Taken,
+                EntryKind::SerberoMediating,
+                EntryKind::Resolved
+            ]
+        );
+        assert_eq!(
+            header_of(&parsed, &Names::default()),
+            "✅ RESOLVED · released by seller"
+        );
+    }
+
+    #[test]
+    fn each_status_maps_to_its_step() {
+        let step = |status: &str| status_step(status, Some("buyer"), Some(SOLVER));
+
+        assert_eq!(step("initiated"), (EntryKind::Opened, Some("buyer".into())));
+        assert_eq!(step("in-progress"), (EntryKind::Taken, Some(SOLVER.into())));
+        assert_eq!(
+            step("released"),
+            (EntryKind::Resolved, Some("released".into()))
+        );
+        assert_eq!(
+            step("cooperatively-canceled"),
+            (EntryKind::Resolved, Some("cooperatively-canceled".into()))
+        );
+        assert_eq!(
+            step("settled"),
+            (EntryKind::Resolved, Some(format!("settled:{SOLVER}")))
+        );
+        assert_eq!(
+            step("seller-refunded"),
+            (
+                EntryKind::Resolved,
+                Some(format!("seller-refunded:{SOLVER}"))
+            )
+        );
+        assert_eq!(step("canceled"), (EntryKind::Canceled, None));
+        assert_eq!(step("frozen"), (EntryKind::Status, Some("frozen".into())));
+        assert_eq!(
+            status_step("settled", None, None),
+            (EntryKind::Resolved, Some("settled".into()))
+        );
+        assert_eq!(
+            status_step("in-progress", None, None),
+            (EntryKind::Taken, None)
+        );
+    }
+
+    #[tokio::test]
+    async fn backfill_opens_the_timeline_of_a_message_sent_before_timelines() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DisputeMessageStore::new(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        store
+            .insert(DISPUTE, 7, -100, "in-progress", "old")
+            .await
+            .unwrap();
+        let sent_at = store
+            .get_message(DISPUTE)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at;
+
+        backfill(&store, DISPUTE).await.unwrap();
+        // Again, and for a dispute without a message: nothing more.
+        backfill(&store, DISPUTE).await.unwrap();
+        backfill(&store, "none").await.unwrap();
+
+        assert_eq!(
+            store.timeline(DISPUTE).await.unwrap(),
+            vec![TimelineRow {
+                kind: "taken".into(),
+                detail: None,
+                created_at: sent_at,
+            }]
+        );
+        assert_eq!(store.timeline("none").await.unwrap(), vec![]);
     }
 
     #[test]

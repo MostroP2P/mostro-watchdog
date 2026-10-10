@@ -20,14 +20,24 @@ const UNKNOWN_DISPUTE: &str = "unknown";
 impl<M: Messenger> SerberoAlerts<'_, M> {
     /// Records a dispute's kind-38386 status, so a late Serbero handoff
     /// knows the dispute already ended, and announces a solver taking the
-    /// dispute over from Serbero. Called for every dispute event, before
-    /// the alert toggles. Errors are logged: the dispute's own alert goes
-    /// out regardless.
-    pub async fn note_dispute_status(&self, dispute_id: &str, status: &str, created_at: u64) {
+    /// dispute over from Serbero when `announce` is set: a caught-up event
+    /// may be months old, so it records the takeover without a message.
+    /// Called for every dispute event, before the alert toggles. Errors are
+    /// logged: the dispute's own alert goes out regardless.
+    pub async fn note_dispute_status(
+        &self,
+        dispute_id: &str,
+        status: &str,
+        created_at: u64,
+        announce: bool,
+    ) {
         if dispute_id == UNKNOWN_DISPUTE {
             return;
         }
-        if let Err(e) = self.track_status(dispute_id, status, created_at).await {
+        if let Err(e) = self
+            .track_status(dispute_id, status, created_at, announce)
+            .await
+        {
             error!(dispute_id, error = %e, "Failed to track the dispute's status");
         }
     }
@@ -37,6 +47,7 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         dispute_id: &str,
         status: &str,
         created_at: u64,
+        announce: bool,
     ) -> Result<(), AlertError> {
         let at = seconds(created_at);
         let previous = self.store.recorded_status(dispute_id).await?;
@@ -56,7 +67,7 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         // The takeover shows on the dispute's timeline from the event
         // itself. Recorded before sending: a takeover is seen once, so a
         // failed send cannot be retried.
-        if self.send_takeovers {
+        if self.send_takeovers && announce {
             let message = self.store.get_message(dispute_id).await?;
             let reply_to = reply_target(message.as_ref(), self.chat_id);
             self.telegram
@@ -131,8 +142,12 @@ mod tests {
                 .insert(DISPUTE, 42, CHAT, "in-progress", "base")
                 .await
                 .unwrap();
+            self.store
+                .set_sent_at(DISPUTE, (TAKEN - 10) as i64)
+                .await
+                .unwrap();
             self.alerts()
-                .note_dispute_status(DISPUTE, "in-progress", TAKEN)
+                .note_dispute_status(DISPUTE, "in-progress", TAKEN, true)
                 .await;
             self.store
                 .save_serbero_state(
@@ -197,7 +212,7 @@ mod tests {
         fx.handed_off().await;
 
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         // The takeover step itself comes from the dispute event, through
@@ -223,7 +238,7 @@ mod tests {
         };
 
         alerts
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert_eq!(fx.telegram.edits(), vec![]);
@@ -242,10 +257,30 @@ mod tests {
         fx.telegram.set_down(true);
 
         alerts
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert!(fx.store.taken_over(DISPUTE).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_takeover_is_recorded_without_a_message() {
+        // The solver catch-up fetches a months-old second `in-progress`:
+        // the takeover is known, but nothing new is posted.
+        let fx = Fixture::new().await;
+        fx.handed_off().await;
+
+        fx.alerts()
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, false)
+            .await;
+
+        assert!(fx.telegram.sends().is_empty());
+        assert!(fx.store.taken_over(DISPUTE).await.unwrap());
+        // Seen once: the live redelivery announces nothing either.
+        fx.alerts()
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
+            .await;
+        assert!(fx.telegram.sends().is_empty());
     }
 
     #[tokio::test]
@@ -255,10 +290,10 @@ mod tests {
         fx.handed_off().await;
 
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert_eq!(fx.telegram.sends().len(), 1);
@@ -268,11 +303,11 @@ mod tests {
     async fn a_dispute_serbero_never_reported_on_is_not_a_takeover() {
         let fx = Fixture::new().await;
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN, true)
             .await;
 
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert_eq!(fx.telegram.calls(), vec![]);
@@ -290,7 +325,7 @@ mod tests {
         };
 
         alerts
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert!(matches!(
@@ -314,7 +349,7 @@ mod tests {
         };
 
         alerts
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert_eq!(fx.telegram.calls(), vec![]);
@@ -329,7 +364,7 @@ mod tests {
         fx.store.delete(DISPUTE).await.unwrap();
 
         fx.alerts()
-            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER, true)
             .await;
 
         assert!(matches!(
@@ -343,7 +378,7 @@ mod tests {
         let fx = Fixture::new().await;
 
         fx.alerts()
-            .note_dispute_status(DISPUTE, "settled", TAKEN)
+            .note_dispute_status(DISPUTE, "settled", TAKEN, true)
             .await;
 
         assert_eq!(
@@ -357,7 +392,7 @@ mod tests {
         let fx = Fixture::new().await;
 
         fx.alerts()
-            .note_dispute_status(UNKNOWN_DISPUTE, "settled", TAKEN)
+            .note_dispute_status(UNKNOWN_DISPUTE, "settled", TAKEN, true)
             .await;
 
         assert_eq!(

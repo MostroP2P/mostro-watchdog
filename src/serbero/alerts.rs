@@ -70,19 +70,23 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
             return Ok(Outcome::Duplicate);
         }
         self.record_state(update, &subject).await?;
-        let (kind, detail) = timeline_step(&update.update);
-        let is_new_step = self
-            .store
-            .append_timeline(
-                &update.dispute_id,
-                kind.as_str(),
-                detail,
-                seconds(update.created_at),
-            )
-            .await?;
+        // With progress off, Serbero's steps stay off the timeline for
+        // good: a later redraw would show them otherwise.
+        let redrawn = self.show_progress && {
+            timeline::backfill(self.store, &update.dispute_id).await?;
+            let (kind, detail) = timeline_step(&update.update);
+            self.store
+                .append_timeline(
+                    &update.dispute_id,
+                    kind.as_str(),
+                    detail,
+                    seconds(update.created_at),
+                )
+                .await?;
+            self.redraw(&update.dispute_id).await
+        };
         let message = self.store.get_message(&update.dispute_id).await?;
         let taken_over = self.store.taken_over(&update.dispute_id).await?;
-        let redrawn = is_new_step && self.show_progress && self.redraw(&update.dispute_id).await;
         let alerted =
             self.send_handoffs && !taken_over && self.alert(update, message.as_ref()).await?;
         self.store
@@ -269,6 +273,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "🔄 *DISPUTE IN PROGRESS*")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
 
         let outcome = fx
             .alerts()
@@ -305,6 +310,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
 
         let outcome = fx
             .alerts()
@@ -334,6 +340,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         let handoff = update(handed_off("flood"), AT);
 
         fx.alerts().relay(&handoff).await.unwrap();
@@ -539,6 +546,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.telegram.set_down(true);
 
         let outcome = fx.alerts().relay(&update(Update::Mediating, AT)).await;
@@ -562,6 +570,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.alerts()
             .relay(&update(handed_off("round_limit"), AT + 60))
             .await
@@ -599,6 +608,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         let alerts = SerberoAlerts {
             show_progress: false,
             send_handoffs: false,
@@ -682,6 +692,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         let serbero = Keys::generate();
         let watchdog = Keys::generate();
         let brief = format!(
@@ -764,6 +775,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.alerts()
             .relay(&update(handed_off("conflicting_claims"), AT))
             .await
@@ -803,6 +815,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.store.record_takeover(DISPUTE, AT as i64).await.unwrap();
 
         let outcome = fx

@@ -320,8 +320,11 @@ Existing configurations continue to work unchanged. The new status monitoring is
   time bound, only add to the timeline and edit a dispute's existing message,
   and never fall back to a new message
 - Every step is stored once in `disputes.db` (`dispute_timeline`, keyed by
-  dispute, step and event time), so redeliveries, re-fetches and restarts
-  never duplicate one; the message is rendered from the whole timeline on
-  every change
+  dispute, step, detail and event time), so redeliveries, re-fetches and
+  restarts never duplicate one; the message is rendered from the whole
+  timeline on every change, and steps in the same second keep the lifecycle
+  order (opened, taken, Serbero, resolved)
+- With `serbero_progress = false`, Serbero's steps are not stored, so they
+  never show on the timeline, not even on a later redraw
 - Parses `s` tag for status, `d` tag for dispute ID, `initiator` tag for who created dispute, `solver` tag for who resolved it
 - Maintains backward compatibility with existing configurations

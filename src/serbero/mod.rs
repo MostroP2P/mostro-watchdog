@@ -297,6 +297,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, 1).await.unwrap();
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
         let batch = vec![
             fx.dm("handed off: round_limit", 200),
