@@ -271,6 +271,10 @@ Existing configurations continue to work unchanged. The new status monitoring is
 ## Technical Details
 
 - Monitors Nostr events (kind 38386) for all status values
+- Only the live subscription (`since` the launch, or the relay swap) posts
+  new messages. Statuses fetched by the solver catch-up, which has no lower
+  time bound, only edit a dispute's existing message when they are newer than
+  the recorded status, and never fall back to a new message
 - Parses `s` tag for status, `d` tag for dispute ID, `initiator` tag for who created dispute
 - Uses different emoji and messaging for each status type
 - Maintains backward compatibility with existing configurations

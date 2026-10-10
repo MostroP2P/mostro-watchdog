@@ -1,6 +1,6 @@
 //! Test doubles shared by the Serbero tests.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
 
 use mostro_core::message::{Action, Message, Payload};
@@ -51,13 +51,21 @@ pub enum Call {
         message_id: i32,
         text: String,
     },
+    Delete {
+        chat_id: i64,
+        message_id: i32,
+    },
 }
 
-/// Records the calls it gets; fails them all while `down` is set.
+/// Records the calls it gets; fails them all while `down` is set, and the
+/// edits alone while `edits_fail` is set. Sent messages get the ids 1, 2,
+/// 3...
 #[derive(Default)]
 pub struct FakeTelegram {
     calls: Mutex<Vec<Call>>,
+    sent: AtomicI32,
     pub down: AtomicBool,
+    pub edits_fail: AtomicBool,
 }
 
 impl FakeTelegram {
@@ -76,6 +84,13 @@ impl FakeTelegram {
         self.calls()
             .into_iter()
             .filter(|c| matches!(c, Call::Edit { .. }))
+            .collect()
+    }
+
+    pub fn deletes(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Delete { .. }))
             .collect()
     }
 
@@ -103,22 +118,34 @@ impl Messenger for FakeTelegram {
         chat_id: i64,
         text: &str,
         reply_to: Option<i32>,
-    ) -> Result<(), RequestError> {
+    ) -> Result<i32, RequestError> {
         self.reachable()?;
         self.calls.lock().unwrap().push(Call::Send {
             chat_id,
             text: text.into(),
             reply_to,
         });
-        Ok(())
+        Ok(self.sent.fetch_add(1, Ordering::SeqCst) + 1)
     }
 
     async fn edit(&self, chat_id: i64, message_id: i32, text: &str) -> Result<(), RequestError> {
         self.reachable()?;
+        if self.edits_fail.load(Ordering::SeqCst) {
+            return Err(RequestError::Api(ApiError::MessageToEditNotFound));
+        }
         self.calls.lock().unwrap().push(Call::Edit {
             chat_id,
             message_id,
             text: text.into(),
+        });
+        Ok(())
+    }
+
+    async fn delete(&self, chat_id: i64, message_id: i32) -> Result<(), RequestError> {
+        self.reachable()?;
+        self.calls.lock().unwrap().push(Call::Delete {
+            chat_id,
+            message_id,
         });
         Ok(())
     }

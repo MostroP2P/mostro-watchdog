@@ -309,7 +309,7 @@ impl SolverInbox {
         };
         let text = notification_text(watch.party, &watch.dispute_id, from_party.len());
         match telegram.send(watch.chat_id, &text, None).await {
-            Ok(()) => {
+            Ok(_) => {
                 info!(
                     dispute_id = %watch.dispute_id,
                     party = watch.party.as_str(),

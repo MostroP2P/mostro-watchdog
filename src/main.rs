@@ -3,23 +3,47 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use teloxide::prelude::*;
-use teloxide::types::{Chat, MessageId};
+use teloxide::types::Chat;
 use tokio::sync::{mpsc, Notify, RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 mod config;
 mod db;
+mod disputes;
 mod serbero;
 mod solver;
 mod version;
 
 use config::{Config, SerberoSettings};
 use db::DisputeMessageStore;
+use disputes::{handle_dispute_event, AlertMode};
 use serbero::alerts::SerberoAlerts;
+use serbero::telegram::Messenger;
 use version::{version_message, VERSION};
 
 /// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
 type ActiveRelays = Arc<RwLock<Vec<String>>>;
+
+/// Mostro's dispute events, kind 38386.
+const DISPUTE_KIND: Kind = Kind::Custom(38386);
+
+/// The id of the live dispute subscription. The event loop posts to the
+/// channel only what arrives on it: nostr-sdk notifies the events of every
+/// subscription, including the fetches of the solver catch-up, which bring
+/// statuses that are months old.
+const LIVE_DISPUTES: &str = "disputes-live";
+
+/// Mostro's dispute events from `since` on.
+fn live_dispute_filter(mostro_pubkey: PublicKey, since: Timestamp) -> Filter {
+    Filter::new()
+        .kind(DISPUTE_KIND)
+        .author(mostro_pubkey)
+        .since(since)
+}
+
+fn is_live_dispute_subscription(subscription_id: &SubscriptionId) -> bool {
+    subscription_id.as_str() == LIVE_DISPUTES
+}
 
 /// Fetch NIP-65 (kind 10002) relay list metadata from a pubkey via the connected relays.
 /// Returns the list of relay URLs if a kind 10002 event is found, or None.
@@ -69,12 +93,10 @@ async fn swap_relays(
 
     client.connect().await;
 
-    let dispute_filter = Filter::new()
-        .kind(Kind::Custom(38386))
-        .author(mostro_pubkey)
-        .since(swap_time);
-
-    client.subscribe(dispute_filter).await?;
+    client
+        .subscribe(live_dispute_filter(mostro_pubkey, swap_time))
+        .with_id(SubscriptionId::new(LIVE_DISPUTES))
+        .await?;
 
     Ok(())
 }
@@ -725,17 +747,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mostro_pubkey = PublicKey::from_bech32(&config.mostro.pubkey)
         .or_else(|_| PublicKey::from_hex(&config.mostro.pubkey))?;
 
-    let dispute_filter = Filter::new()
-        .kind(Kind::Custom(38386))
-        .author(mostro_pubkey)
-        .since(Timestamp::now());
+    let dispute_filter = live_dispute_filter(mostro_pubkey, Timestamp::now());
 
     // Open the notification stream *before* subscribing: it only delivers what arrives
     // after this call, so events received while the rest of the startup runs would
     // otherwise be lost.
     let notifications = client.notifications();
 
-    client.subscribe(dispute_filter).await?;
+    client
+        .subscribe(dispute_filter)
+        .with_id(SubscriptionId::new(LIVE_DISPUTES))
+        .await?;
 
     info!("🔍 Subscribed to dispute events on bootstrap relays. Watching...");
 
@@ -927,13 +949,13 @@ fn resolve_serbero(config: &Config) -> Result<Option<SerberoSettings>, Box<dyn s
 const SOLVER_FLUSH_INTERVAL: Duration = Duration::from_secs(1);
 
 /// What the event loop works with.
-struct EventLoop<'a> {
-    bot: &'a Bot,
+struct EventLoop<'a, M> {
+    bot: &'a M,
     chat_id: i64,
     alerts_config: &'a config::AlertsConfig,
     dispute_store: &'a DisputeMessageStore,
     health_monitor: &'a HealthMonitor,
-    serbero_alerts: &'a SerberoAlerts<'a, Bot>,
+    serbero_alerts: &'a SerberoAlerts<'a, M>,
     serbero_inbox: Option<serbero::SerberoInbox>,
     serbero_backlog: Option<mpsc::UnboundedReceiver<Vec<Event>>>,
     solver_inbox: Option<solver::inbox::SolverInbox>,
@@ -943,9 +965,9 @@ struct EventLoop<'a> {
 /// Handles dispute events and Serbero DMs one at a time, so a dispute's
 /// alert and Serbero's line on it never race each other. Returns when the
 /// Nostr client shuts down.
-async fn run_event_loop(
+async fn run_event_loop<M: Messenger>(
     mut notifications: impl StreamExt<Item = ClientNotification> + Unpin,
-    mut ctx: EventLoop<'_>,
+    mut ctx: EventLoop<'_, M>,
 ) {
     // Held solver notifications are sent once their grace period is over.
     let mut solver_tick = tokio::time::interval(SOLVER_FLUSH_INTERVAL);
@@ -955,18 +977,21 @@ async fn run_event_loop(
     loop {
         tokio::select! {
             notification = notifications.next() => match notification {
-                Some(ClientNotification::Event { event, .. }) => {
-                    if event.kind == Kind::Custom(38386) {
+                Some(ClientNotification::Event { subscription_id, event, .. }) => {
+                    if event.kind == DISPUTE_KIND {
+                        // The solver catch-up's fetches reach here too; those
+                        // events come back through its backlog, in catch-up
+                        // mode, so they are dropped here.
+                        if !is_live_dispute_subscription(&subscription_id) {
+                            debug!(
+                                subscription = %subscription_id,
+                                event_id = %event.id,
+                                "Ignoring a dispute event from a subscription other than the live one"
+                            );
+                            continue;
+                        }
                         ctx.health_monitor.record_event().await;
-                        handle_dispute_event(
-                            ctx.bot,
-                            ctx.chat_id,
-                            &event,
-                            ctx.alerts_config,
-                            ctx.dispute_store,
-                            ctx.serbero_inbox.is_some().then_some(ctx.serbero_alerts),
-                        )
-                        .await;
+                        ctx.handle_dispute(&event, AlertMode::Live).await;
                         if let Some(solver) = ctx.solver_inbox.as_ref() {
                             solver.on_dispute_event(&event).await;
                         }
@@ -991,6 +1016,15 @@ async fn run_event_loop(
                 }
             }
             Some(events) = next_batch(&mut ctx.solver_backlog) => {
+                // Oldest first, as a catch-up may hold several statuses of
+                // one dispute. The solver inbox ends the resolved disputes
+                // from the same batch, once per event.
+                let mut disputes: Vec<&Event> =
+                    events.iter().filter(|event| event.kind == DISPUTE_KIND).collect();
+                disputes.sort_by_key(|event| (event.created_at, event.id));
+                for event in disputes {
+                    ctx.handle_dispute(event, AlertMode::CatchUp).await;
+                }
                 if let Some(solver) = ctx.solver_inbox.as_mut() {
                     solver.receive_batch(events, ctx.bot, Timestamp::now().as_secs()).await;
                 }
@@ -1004,6 +1038,21 @@ async fn run_event_loop(
     }
 }
 
+impl<M: Messenger> EventLoop<'_, M> {
+    async fn handle_dispute(&self, event: &Event, mode: AlertMode) {
+        handle_dispute_event(
+            self.bot,
+            self.chat_id,
+            event,
+            mode,
+            self.alerts_config,
+            self.dispute_store,
+            self.serbero_inbox.is_some().then_some(self.serbero_alerts),
+        )
+        .await;
+    }
+}
+
 /// The next batch of caught-up events from a background sync. Never resolves
 /// when that sync is off.
 async fn next_batch(
@@ -1012,282 +1061,6 @@ async fn next_batch(
     match backlog {
         Some(backlog) => backlog.recv().await,
         None => std::future::pending().await,
-    }
-}
-
-/// Sends or updates a dispute's alert. `serbero` (with a `[serbero]`
-/// section) turns on the Serbero bookkeeping, the takeover message and the
-/// Serbero line.
-async fn handle_dispute_event(
-    bot: &Bot,
-    chat_id: i64,
-    event: &Event,
-    alerts_config: &config::AlertsConfig,
-    dispute_store: &DisputeMessageStore,
-    serbero: Option<&SerberoAlerts<'_, Bot>>,
-) {
-    let mut dispute_id = String::from("unknown");
-    let mut status = String::from("unknown");
-    let mut initiator = String::from("unknown");
-    let mut solver_pubkey: Option<String> = None;
-
-    for tag in event.tags.iter() {
-        let tag_vec: Vec<String> = tag.as_slice().iter().map(|s| s.to_string()).collect();
-        if tag_vec.len() >= 2 {
-            match tag_vec[0].as_str() {
-                "d" => dispute_id = tag_vec[1].clone(),
-                "s" => status = tag_vec[1].clone(),
-                "initiator" => initiator = tag_vec[1].clone(),
-                "solver" => solver_pubkey = Some(tag_vec[1].clone()),
-                _ => {}
-            }
-        }
-    }
-
-    info!(
-        "Dispute event received: id={}, status={}, initiator={}",
-        dispute_id, status, initiator
-    );
-
-    // Recorded before the alert toggles and the cooperative-cancel delete,
-    // so a late Serbero handoff knows the dispute already ended and a
-    // solver taking over from Serbero is announced whatever the status
-    // alert toggles.
-    if let Some(serbero) = serbero {
-        serbero
-            .note_dispute_status(&dispute_id, &status, event.created_at.as_secs())
-            .await;
-    }
-
-    // Check if this alert type is enabled
-    let alert_enabled = alert_enabled(&status, alerts_config);
-
-    if !alert_enabled {
-        info!(
-            "Alert for status '{}' is disabled, skipping notification",
-            status
-        );
-        return;
-    }
-
-    // Check if we have an existing message for this dispute
-    let existing_message = match dispute_store.get_message_id(&dispute_id).await {
-        Ok(result) => result,
-        Err(e) => {
-            error!("Failed to query dispute store: {}", e);
-            None
-        }
-    };
-
-    // Handle cooperative cancellation: delete the message
-    if status == "canceled" {
-        if let Some((message_id, stored_chat_id)) = existing_message {
-            if let Err(e) = bot
-                .delete_message(ChatId(stored_chat_id), MessageId(message_id))
-                .await
-            {
-                warn!("Failed to delete dispute message: {}", e);
-            } else {
-                info!(
-                    "🗑️ Deleted dispute message for {} (cooperative cancel)",
-                    dispute_id
-                );
-            }
-            if let Err(e) = dispute_store.delete(&dispute_id).await {
-                error!("Failed to remove dispute from store: {}", e);
-            }
-        }
-        return;
-    }
-
-    // Generate appropriate message based on status
-    let message = match status.as_str() {
-        "initiated" => {
-            format!(
-                "🚨 *NEW DISPUTE*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 👤 *Initiated by:* {}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ⚡ Please take this dispute in Mostrix or your admin client\\.",
-                escape_markdown_code(&dispute_id),
-                escape_markdown(&initiator),
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        "in-progress" => {
-            let solver_info = solver_pubkey
-                .as_ref()
-                .map(|pk| format!("\n👨‍⚖️ *Taken by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "🔄 *DISPUTE IN PROGRESS*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ℹ️ Dispute is now being handled\\.",
-                escape_markdown_code(&dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        "seller-refunded" => {
-            let solver_info = solver_pubkey
-                .as_ref()
-                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "💰 *DISPUTE RESOLVED \\- SELLER REFUNDED*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: funds returned to seller\\.",
-                escape_markdown_code(&dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        "settled" => {
-            let solver_info = solver_pubkey
-                .as_ref()
-                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "✅ *DISPUTE RESOLVED \\- SETTLED*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: buyer receives payment\\.",
-                escape_markdown_code(&dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        "cooperatively-canceled" => {
-            format!(
-                "🤝 *DISPUTE RESOLVED \\- COOPERATIVELY CANCELED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 🤝 *Resolution:* Both parties agreed to cancel\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: funds returned to seller, no solver needed\\.",
-                escape_markdown_code(&dispute_id),
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        "released" => {
-            format!(
-                "🔓 *DISPUTE RESOLVED \\- RELEASED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 🤝 *Resolution:* Released by seller\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: trade completed\\.",
-                escape_markdown_code(&dispute_id),
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-        _ => {
-            format!(
-                "📡 *DISPUTE STATUS UPDATE*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 📊 *Status:* {}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ℹ️ Status changed\\.",
-                escape_markdown_code(&dispute_id),
-                escape_markdown(&status),
-                escape_markdown(&chrono_timestamp(event.created_at.as_secs())),
-            )
-        }
-    };
-
-    // Serbero's latest state for the dispute shows below the alert; the
-    // store keeps the alert without it, to redraw it when the state changes.
-    let shown = serbero::alerts::decorate(
-        dispute_store,
-        &dispute_id,
-        &status,
-        &message,
-        serbero.is_some_and(|s| s.show_progress),
-    )
-    .await;
-
-    // If we have an existing message, update it; otherwise send a new one
-    if let Some((message_id, stored_chat_id)) = existing_message {
-        // Update existing message
-        match bot
-            .edit_message_text(ChatId(stored_chat_id), MessageId(message_id), &shown)
-            .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-            .await
-        {
-            Ok(_) => {
-                info!(
-                    "✏️ Updated dispute message for {} (status: {})",
-                    dispute_id, status
-                );
-                if let Err(e) = dispute_store
-                    .update_status(&dispute_id, &status, &message)
-                    .await
-                {
-                    error!("Failed to update dispute status in store: {}", e);
-                }
-            }
-            Err(e) => {
-                // If edit fails (e.g., message deleted), send a new one
-                warn!("Failed to edit message, sending new one: {}", e);
-                send_new_dispute_message(
-                    bot,
-                    chat_id,
-                    &dispute_id,
-                    &status,
-                    &shown,
-                    &message,
-                    dispute_store,
-                )
-                .await;
-            }
-        }
-    } else {
-        // Send new message
-        send_new_dispute_message(
-            bot,
-            chat_id,
-            &dispute_id,
-            &status,
-            &shown,
-            &message,
-            dispute_store,
-        )
-        .await;
-    }
-}
-
-/// Sends `shown` and stores the message, with `alert` (the text without
-/// Serbero's line) for later redraws.
-async fn send_new_dispute_message(
-    bot: &Bot,
-    chat_id: i64,
-    dispute_id: &str,
-    status: &str,
-    shown: &str,
-    alert: &str,
-    dispute_store: &DisputeMessageStore,
-) {
-    match bot
-        .send_message(ChatId(chat_id), shown)
-        .parse_mode(teloxide::types::ParseMode::MarkdownV2)
-        .await
-    {
-        Ok(sent_message) => {
-            info!(
-                "✅ Telegram alert sent for dispute {} (status: {})",
-                dispute_id, status
-            );
-            // Store the message ID for future updates
-            if let Err(e) = dispute_store
-                .insert(dispute_id, sent_message.id.0, chat_id, status, alert)
-                .await
-            {
-                error!("Failed to store dispute message ID: {}", e);
-            }
-        }
-        Err(e) => {
-            error!("Failed to send Telegram alert: {}", e);
-        }
     }
 }
 
@@ -1378,7 +1151,278 @@ fn escape_markdown_code(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::serbero::testing::{Call, FakeTelegram};
     use config::AlertsConfig;
+    use nostr_sdk::prelude::MockRelay;
+
+    const DISPUTE: &str = "51733e4d-a155-465b-a97e-07fba5f0e485";
+    const CHAT: i64 = -100_123;
+    const SETTLE: Duration = Duration::from_millis(500);
+
+    /// A client of the mock relay, plus a store and a fake Telegram for an
+    /// event loop over it.
+    struct Relayed {
+        _dir: tempfile::TempDir,
+        relay: MockRelay,
+        client: Client,
+        publisher: Client,
+        mostro: Keys,
+        store: DisputeMessageStore,
+        telegram: FakeTelegram,
+        alerts: AlertsConfig,
+        health: HealthMonitor,
+    }
+
+    async fn connect(url: &str) -> Client {
+        let client = Client::default();
+        client.add_relay(url).await.unwrap();
+        client.connect().await;
+        client
+    }
+
+    impl Relayed {
+        async fn new() -> Self {
+            let relay = MockRelay::run().await.unwrap();
+            let url = relay.url().await.to_string();
+            let dir = tempfile::tempdir().unwrap();
+            let store = DisputeMessageStore::new(&dir.path().join("disputes.db"))
+                .await
+                .unwrap();
+            Self {
+                _dir: dir,
+                client: connect(&url).await,
+                publisher: connect(&url).await,
+                relay,
+                mostro: Keys::generate(),
+                store,
+                telegram: FakeTelegram::default(),
+                alerts: AlertsConfig::default(),
+                health: HealthMonitor::new(),
+            }
+        }
+
+        fn dispute_event(&self, dispute_id: &str, status: &str, created_at: Timestamp) -> Event {
+            EventBuilder::new(DISPUTE_KIND, "")
+                .tag(Tag::identifier(dispute_id))
+                .tag(Tag::parse(["s", status]).unwrap())
+                .custom_created_at(created_at)
+                .finalize(&self.mostro)
+                .unwrap()
+        }
+
+        async fn publish(&self, event: &Event) {
+            self.publisher.send_event(event).await.unwrap();
+        }
+
+        fn serbero_alerts(&self) -> SerberoAlerts<'_, FakeTelegram> {
+            SerberoAlerts {
+                store: &self.store,
+                telegram: &self.telegram,
+                chat_id: CHAT,
+                show_progress: false,
+                send_handoffs: false,
+            }
+        }
+
+        /// Runs the event loop over the client's notifications, with
+        /// `solver_backlog` as the solver catch-up, until the client shuts
+        /// down.
+        async fn run_loop(
+            &self,
+            notifications: impl StreamExt<Item = ClientNotification> + Unpin,
+            serbero_alerts: &SerberoAlerts<'_, FakeTelegram>,
+            solver_backlog: mpsc::UnboundedReceiver<Vec<Event>>,
+        ) {
+            run_event_loop(
+                notifications,
+                EventLoop {
+                    bot: &self.telegram,
+                    chat_id: CHAT,
+                    alerts_config: &self.alerts,
+                    dispute_store: &self.store,
+                    health_monitor: &self.health,
+                    serbero_alerts,
+                    serbero_inbox: None,
+                    serbero_backlog: None,
+                    solver_inbox: None,
+                    solver_backlog: Some(solver_backlog),
+                },
+            )
+            .await;
+        }
+
+        async fn shutdown(self) {
+            self.client.shutdown().await;
+            self.publisher.shutdown().await;
+            drop(self.relay);
+        }
+    }
+
+    fn sent_texts(telegram: &FakeTelegram) -> Vec<String> {
+        telegram
+            .sends()
+            .into_iter()
+            .map(|call| match call {
+                Call::Send { text, .. } => text,
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// The incident: the solver catch-up fetches, on the same client, the
+    /// months-old status of a dispute the channel never saw. nostr-sdk
+    /// notifies it like any event, under the fetch's subscription id.
+    #[tokio::test]
+    async fn only_the_live_subscription_posts_dispute_events() {
+        let fx = Relayed::new().await;
+        let (backlog, solver_backlog) = mpsc::unbounded_channel();
+        let notifications = fx.client.notifications();
+        fx.client
+            .subscribe(live_dispute_filter(
+                fx.mostro.public_key(),
+                Timestamp::now(),
+            ))
+            .with_id(SubscriptionId::new(LIVE_DISPUTES))
+            .await
+            .unwrap();
+        let serbero_alerts = fx.serbero_alerts();
+        let stale = fx.dispute_event(
+            DISPUTE,
+            "in-progress",
+            Timestamp::from_secs(Timestamp::now().as_secs() - 180 * 86_400),
+        );
+        let fresh_id = "9b7e6c1d-2f3a-4b5c-8d9e-0f1a2b3c4d5e";
+
+        let drive = async {
+            fx.publish(&stale).await;
+            // What the solver catch-up does: a fetch with no lower bound,
+            // handed to the event loop through its backlog.
+            let fetched = fx
+                .client
+                .fetch_events(
+                    Filter::new()
+                        .kind(DISPUTE_KIND)
+                        .author(fx.mostro.public_key())
+                        .identifier(DISPUTE),
+                )
+                .timeout(Duration::from_secs(5))
+                .await
+                .unwrap();
+            assert_eq!(fetched.len(), 1, "the relay holds the stale status");
+            backlog.send(fetched.into_iter().collect()).unwrap();
+            tokio::time::sleep(SETTLE).await;
+
+            let fresh = fx.dispute_event(fresh_id, "initiated", Timestamp::now());
+            fx.publish(&fresh).await;
+            tokio::time::sleep(SETTLE).await;
+            fx.client.shutdown().await;
+        };
+        tokio::join!(
+            fx.run_loop(notifications, &serbero_alerts, solver_backlog),
+            drive
+        );
+
+        let sent = sent_texts(&fx.telegram);
+        assert_eq!(sent.len(), 1, "sent: {sent:?}");
+        assert!(sent[0].contains("NEW DISPUTE") && sent[0].contains(fresh_id));
+        assert!(fx.telegram.edits().is_empty());
+        assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
+        // Still recorded, for a late Serbero handoff.
+        assert_eq!(
+            fx.store.dispute_status(DISPUTE).await.unwrap().as_deref(),
+            Some("in-progress")
+        );
+        fx.shutdown().await;
+    }
+
+    /// A status the catch-up fetched before the live subscription saw it
+    /// (nostr-sdk notifies an event once, under the subscription that
+    /// stored it first) still updates the dispute's message.
+    #[tokio::test]
+    async fn a_caught_up_newer_status_updates_the_channel_message() {
+        let fx = Relayed::new().await;
+        let (backlog, solver_backlog) = mpsc::unbounded_channel();
+        let notifications = fx.client.notifications();
+        fx.client
+            .subscribe(live_dispute_filter(
+                fx.mostro.public_key(),
+                Timestamp::now(),
+            ))
+            .with_id(SubscriptionId::new(LIVE_DISPUTES))
+            .await
+            .unwrap();
+        let serbero_alerts = fx.serbero_alerts();
+        let now = Timestamp::now();
+
+        let drive = async {
+            fx.publish(&fx.dispute_event(DISPUTE, "initiated", now))
+                .await;
+            tokio::time::sleep(SETTLE).await;
+            let settled = fx.dispute_event(DISPUTE, "settled", now + 60);
+            backlog.send(vec![settled]).unwrap();
+            tokio::time::sleep(SETTLE).await;
+            fx.client.shutdown().await;
+        };
+        tokio::join!(
+            fx.run_loop(notifications, &serbero_alerts, solver_backlog),
+            drive
+        );
+
+        assert_eq!(fx.telegram.sends().len(), 1);
+        assert!(matches!(
+            fx.telegram.edits().as_slice(),
+            [Call::Edit { message_id: 1, text, .. }] if text.contains("SETTLED")
+        ));
+        fx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn a_relay_swap_keeps_the_live_subscription_id() {
+        let fx = Relayed::new().await;
+        let other = MockRelay::run().await.unwrap();
+        let other_url = other.url().await.to_string();
+        fx.client
+            .subscribe(live_dispute_filter(
+                fx.mostro.public_key(),
+                Timestamp::now(),
+            ))
+            .with_id(SubscriptionId::new(LIVE_DISPUTES))
+            .await
+            .unwrap();
+
+        swap_relays(
+            &fx.client,
+            std::slice::from_ref(&other_url),
+            fx.mostro.public_key(),
+        )
+        .await
+        .unwrap();
+
+        let live = fx
+            .client
+            .subscription(&SubscriptionId::new(LIVE_DISPUTES))
+            .await;
+        let relays: Vec<String> = live.keys().map(|url| url.to_string()).collect();
+        assert_eq!(relays, vec![other_url]);
+        let filters = live.values().next().unwrap();
+        assert_eq!(filters.len(), 1);
+        assert_eq!(filters[0].kinds.as_ref().unwrap().len(), 1);
+        assert!(filters[0].kinds.as_ref().unwrap().contains(&DISPUTE_KIND));
+        assert!(filters[0].since.is_some());
+        fx.shutdown().await;
+        drop(other);
+    }
+
+    #[test]
+    fn only_the_live_subscription_id_is_live() {
+        assert!(is_live_dispute_subscription(&SubscriptionId::new(
+            LIVE_DISPUTES
+        )));
+        assert!(!is_live_dispute_subscription(&SubscriptionId::new(
+            "solver-chat-0"
+        )));
+        assert!(!is_live_dispute_subscription(&SubscriptionId::generate()));
+    }
 
     /// Build a `Chat` the way Telegram sends it, since the type has no public
     /// constructor.

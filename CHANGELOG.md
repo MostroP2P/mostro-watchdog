@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `disputes.db` gains the `solver_*` tables for solver notifications.
 
 ### Fixed
+- The disputes channel only shows what the live dispute subscription
+  delivers. The solver catch-up, which reads the latest status of every
+  watched dispute however old, could post months-old statuses as new alerts
+  when a solver started watching a dispute the channel had no message for.
+  A caught-up status now only edits the dispute's existing message, and only
+  when newer than the status recorded for it (#40).
 - A config file with a TOML error no longer prints the whole file, Telegram bot
   token included, at startup: the error shows its message and line only.
 
