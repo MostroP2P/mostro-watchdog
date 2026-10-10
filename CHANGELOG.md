@@ -10,30 +10,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Serbero alerts: with a `[serbero]` section, the watchdog reads the mediation
   updates Serbero, Mostro's dispute assistant, sends its observers. It shows
-  Serbero's progress on each dispute's message and sends a new message when
-  Serbero hands a dispute off or cannot start mediating it, so a human solver
-  takes it over. Only the first line of each update is read. See
+  Serbero's progress on each dispute's message. Only the first line of each
+  update is read. See
   [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts).
-- `[alerts]` options `serbero_handoff` and `serbero_progress`.
-- Serbero takeover alert: a new message when a solver takes over a dispute
-  Serbero held. Sent with `takeover_message`.
+- `[alerts]` option `serbero_progress`.
 - One message per dispute with a timeline: the dispute's message is edited in
   place and lists everything that happened to it in the order it happened
   (opened, taken, Serbero's steps, takeover, resolution), under a header
   saying where it stands. Steps that arrive late or out of order take their
   place by event time. See
   [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#alert-format) (#41).
-- `[alerts]` options `takeover_message` and `solver_names`.
+- `[alerts]` option `solver_names`.
 - Solver notifications: with a `[solver_notifications]` section, a solver who
   links their key with `/link` and Mostrix gets a private Telegram message
   when a party writes to them in a dispute chat. No private key leaves
   Mostrix and the watchdog never reads the chat. New commands `/link`,
   `/unlink` and `/status`. See [SOLVER_NOTIFICATIONS.md](SOLVER_NOTIFICATIONS.md).
 
+### Removed
+- The separate Serbero messages (`🙋 SERBERO HANDED OFF A DISPUTE`,
+  `🙋 SERBERO COULD NOT START MEDIATION`, `👨‍⚖️ SOLVER TOOK OVER FROM SERBERO`)
+  and the `serbero_handoff` and `takeover_message` options. The dispute's one
+  message already shows every step; a config that still sets the options
+  loads unchanged.
+
 ### Changed
-- `disputes.db` gains a `message_text` column and four tables
-  (`serbero_states`, `serbero_headers`, `dispute_statuses`,
-  `serbero_takeovers`); existing databases are migrated on start.
+- `disputes.db` gains a `message_text` column and two tables
+  (`serbero_states`, `serbero_headers`); existing databases are migrated on
+  start.
 - `disputes.db` gains the `solver_*` tables for solver notifications.
 - `disputes.db` gains the `dispute_timeline` table; existing databases are
   migrated on start, and a message sent before the timeline gets its stored

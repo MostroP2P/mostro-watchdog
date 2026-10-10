@@ -9,7 +9,6 @@ use tracing::{debug, error, info, warn};
 use crate::alert_enabled;
 use crate::config::AlertsConfig;
 use crate::db::DisputeMessageStore;
-use crate::serbero::alerts::SerberoAlerts;
 use crate::serbero::telegram::Messenger;
 use crate::timeline::{self, status_step, Names};
 
@@ -57,9 +56,7 @@ fn parse(event: &Event) -> DisputeEvent {
 }
 
 /// Adds a dispute's status to its timeline, as `mode` allows, and shows
-/// the timeline on the dispute's message. `serbero` (with a `[serbero]`
-/// section) turns on the Serbero bookkeeping and the takeover message.
-#[allow(clippy::too_many_arguments)] // The event loop's context, spelled out.
+/// the timeline on the dispute's message.
 pub async fn handle_dispute_event<M: Messenger>(
     telegram: &M,
     chat_id: i64,
@@ -68,7 +65,6 @@ pub async fn handle_dispute_event<M: Messenger>(
     alerts_config: &AlertsConfig,
     dispute_store: &DisputeMessageStore,
     names: &Names,
-    serbero: Option<&SerberoAlerts<'_, M>>,
 ) {
     let DisputeEvent {
         dispute_id,
@@ -82,27 +78,6 @@ pub async fn handle_dispute_event<M: Messenger>(
         "Dispute event received: id={}, status={}, initiator={}, mode={:?}",
         dispute_id, status, initiator, mode
     );
-
-    // Recorded before the alert toggles, so a late Serbero handoff knows
-    // the dispute already ended and a solver taking over from Serbero is
-    // announced whatever the status alert toggles.
-    if let Some(serbero) = serbero {
-        serbero
-            .note_dispute_status(
-                &dispute_id,
-                &status,
-                event.created_at.as_secs(),
-                mode == AlertMode::Live,
-            )
-            .await;
-    }
-    // Recorded with or without Serbero, for the handoff alert's check.
-    if let Err(e) = dispute_store
-        .record_dispute_status(&dispute_id, &status, created_at)
-        .await
-    {
-        error!("Failed to record the dispute's status: {}", e);
-    }
 
     if let Err(e) = timeline::backfill(dispute_store, &dispute_id).await {
         error!("Failed to backfill the dispute's timeline: {}", e);
@@ -227,7 +202,7 @@ async fn send_new_dispute_message<M: Messenger>(
     text: &str,
     dispute_store: &DisputeMessageStore,
 ) {
-    match telegram.send(chat_id, text, None).await {
+    match telegram.send(chat_id, text).await {
         Ok(message_id) => {
             info!(
                 "✅ Telegram alert sent for dispute {} (status: {})",
@@ -307,7 +282,6 @@ mod tests {
                 &self.alerts,
                 &self.store,
                 &self.names,
-                None,
             )
             .await;
         }
@@ -431,7 +405,7 @@ mod tests {
         // again.
         assert!(matches!(
             fx.telegram.sends().as_slice(),
-            [Call::Send { chat_id: CHAT, text, reply_to: None }]
+            [Call::Send { chat_id: CHAT, text }]
                 if text.contains("Opened by buyer") && text.contains("Taken by a solver")
         ));
         let stored = fx.store.get_message(DISPUTE).await.unwrap().unwrap();
@@ -501,7 +475,7 @@ mod tests {
         assert_eq!(calls.len(), 3, "{calls:?}");
         assert!(matches!(
             &calls[0],
-            Call::Send { chat_id: CHAT, text, reply_to: None }
+            Call::Send { chat_id: CHAT, text }
                 if text.contains("*Status:* 🚨 OPEN · needs a solver")
                     && text.contains("Opened by buyer")
         ));
@@ -593,17 +567,5 @@ mod tests {
             [Call::Edit { message_id: 42, text, .. }]
                 if text.contains("Taken by a solver") && text.contains("Settled, buyer paid")
         ));
-    }
-
-    #[tokio::test]
-    async fn every_status_is_recorded_whatever_the_mode() {
-        let fx = Fixture::new().await;
-
-        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::CatchUp)
-            .await;
-
-        let recorded = fx.store.recorded_status(DISPUTE).await.unwrap().unwrap();
-        assert_eq!(recorded.status, "in-progress");
-        assert_eq!(recorded.created_at, TAKEN as i64);
     }
 }

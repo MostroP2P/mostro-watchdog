@@ -44,7 +44,6 @@ pub enum Call {
     Send {
         chat_id: i64,
         text: String,
-        reply_to: Option<i32>,
     },
     Edit {
         chat_id: i64,
@@ -102,17 +101,11 @@ impl FakeTelegram {
 }
 
 impl Messenger for FakeTelegram {
-    async fn send(
-        &self,
-        chat_id: i64,
-        text: &str,
-        reply_to: Option<i32>,
-    ) -> Result<i32, RequestError> {
+    async fn send(&self, chat_id: i64, text: &str) -> Result<i32, RequestError> {
         self.reachable()?;
         self.calls.lock().unwrap().push(Call::Send {
             chat_id,
             text: text.into(),
-            reply_to,
         });
         Ok(self.sent.fetch_add(1, Ordering::SeqCst) + 1)
     }

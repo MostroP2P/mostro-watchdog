@@ -42,18 +42,10 @@ pub struct AlertsConfig {
     /// Enable alerts for unknown/other status changes
     #[serde(default = "default_true")]
     pub other: bool,
-    /// Send a new message when Serbero hands a dispute off to a human solver
-    /// or cannot start mediating it, and when a solver takes it over
-    #[serde(default = "default_true")]
-    pub serbero_handoff: bool,
     /// Show Serbero's progress on the dispute's message (edits, no
     /// notification)
     #[serde(default = "default_true")]
     pub serbero_progress: bool,
-    /// Also send a separate message when a solver takes a dispute over from
-    /// Serbero. The takeover always shows on the dispute's timeline.
-    #[serde(default = "default_true")]
-    pub takeover_message: bool,
     /// Solver pubkeys (hex) and the name to show for each on the timeline.
     #[serde(default)]
     pub solver_names: HashMap<String, String>,
@@ -73,9 +65,7 @@ impl Default for AlertsConfig {
             released: true,
             cooperatively_canceled: true,
             other: true,
-            serbero_handoff: true,
             serbero_progress: true,
-            takeover_message: true,
             solver_names: HashMap::new(),
         }
     }
@@ -538,40 +528,24 @@ chat_id = -1001
     }
 
     #[test]
-    fn serbero_alert_toggles_default_to_true() {
+    fn serbero_progress_defaults_to_true() {
         let config = load("\n[alerts]\ninitiated = false\n").unwrap();
 
         let alerts = config.alerts.expect("section present");
-        assert!(alerts.serbero_handoff);
         assert!(alerts.serbero_progress);
-        assert!(AlertsConfig::default().serbero_handoff);
         assert!(AlertsConfig::default().serbero_progress);
     }
 
     #[test]
-    fn the_takeover_message_is_on_by_default_and_can_be_turned_off() {
-        assert!(AlertsConfig::default().takeover_message);
-        assert!(
-            load(
-                "
-[alerts]
-"
-            )
-            .unwrap()
-            .alerts
-            .unwrap()
-            .takeover_message
-        );
-
+    fn the_removed_message_toggles_are_still_accepted() {
+        // `serbero_handoff` and `takeover_message` turned off messages the
+        // watchdog no longer sends; a config that still sets them loads.
         let config = load(
-            "
-[alerts]
-takeover_message = false
-",
+            "\n[alerts]\nserbero_handoff = false\ntakeover_message = true\nserbero_progress = false\n",
         )
         .unwrap();
 
-        assert!(!config.alerts.unwrap().takeover_message);
+        assert!(!config.alerts.unwrap().serbero_progress);
     }
 
     #[test]
@@ -604,13 +578,10 @@ takeover_message = false
     }
 
     #[test]
-    fn serbero_alert_toggles_can_be_turned_off() {
-        let config =
-            load("\n[alerts]\nserbero_handoff = false\nserbero_progress = false\n").unwrap();
+    fn serbero_progress_can_be_turned_off() {
+        let config = load("\n[alerts]\nserbero_progress = false\n").unwrap();
 
-        let alerts = config.alerts.expect("section present");
-        assert!(!alerts.serbero_handoff);
-        assert!(!alerts.serbero_progress);
+        assert!(!config.alerts.expect("section present").serbero_progress);
     }
 
     #[test]
@@ -712,7 +683,6 @@ takeover_message = false
         let config = Config::load(&path).unwrap();
 
         let alerts = config.alerts.expect("[alerts] in the example");
-        assert!(alerts.serbero_handoff);
         assert!(alerts.serbero_progress);
         assert!(config.serbero.is_none(), "Serbero alerts are opt-in");
     }
