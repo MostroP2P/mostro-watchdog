@@ -158,7 +158,9 @@ once.
   `watch` sent while it was stopped still applies.
 - Each round also fetches Mostro's latest kind-38386 status of every watched
   dispute, however old, so a dispute resolved while the watchdog was stopped
-  stops being watched.
+  stops being watched. These fetched statuses never post a new message in the
+  disputes channel: only the live dispute subscription does. A fetched status
+  newer than the one recorded for a dispute edits its existing message.
 - A notification that Telegram refuses is retried a minute later; it is tried
   at most three times in total.
 

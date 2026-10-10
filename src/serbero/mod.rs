@@ -308,7 +308,7 @@ mod tests {
             .into_iter()
             .map(|call| match call {
                 Call::Edit { text, .. } => text,
-                Call::Send { .. } => unreachable!(),
+                _ => unreachable!(),
             })
             .collect();
         assert_eq!(

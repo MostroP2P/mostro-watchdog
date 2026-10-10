@@ -51,7 +51,8 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 
 | Path | Purpose |
 |---|---|
-| `src/main.rs` | Entry point, Nostr subscription, event handling, health tasks, Telegram formatting |
+| `src/main.rs` | Entry point, Nostr subscription, event loop, health tasks, Telegram commands |
+| `src/disputes.rs` | Dispute alerts: the message for each kind-38386 status, sent or edited as the live or catch-up mode allows |
 | `src/config.rs` | TOML configuration parsing and validation |
 | `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, plus Serbero's state per dispute |
 | `src/serbero/` | Serbero alerts: decoding Serbero's DMs (`dm.rs`), key discovery (`discovery.rs`), subscription and catch-up (`sync.rs`), relaying to Telegram (`alerts.rs`, `render.rs`, `telegram.rs`) |
