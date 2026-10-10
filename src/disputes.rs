@@ -1,15 +1,17 @@
-//! Dispute alerts: the kind-38386 status of a dispute, as a message in the
-//! disputes channel. Only the live subscription may post a new message;
-//! a catch-up only brings an existing message up to date.
+//! Dispute alerts: the kind-38386 status of a dispute, as a step on the
+//! dispute's timeline message in the disputes channel. Only the live
+//! subscription may post a new message; a catch-up only brings an existing
+//! message up to date.
 
 use nostr_sdk::prelude::*;
 use tracing::{debug, error, info, warn};
 
+use crate::alert_enabled;
 use crate::config::AlertsConfig;
 use crate::db::DisputeMessageStore;
 use crate::serbero::alerts::SerberoAlerts;
 use crate::serbero::telegram::Messenger;
-use crate::{alert_enabled, chrono_timestamp, escape_markdown, escape_markdown_code};
+use crate::timeline::{self, status_step, Names};
 
 /// Where a dispute event came from, which decides what it may do to the
 /// channel.
@@ -20,8 +22,7 @@ pub enum AlertMode {
     Live,
     /// A catch-up fetch (the solver sync reads the status of every watched
     /// dispute, with no lower time bound): mostly statuses already shown.
-    /// Edits the dispute's message when the event is newer than the status
-    /// recorded for it, and never sends a new message.
+    /// Edits the dispute's message, and never sends a new one.
     CatchUp,
 }
 
@@ -55,9 +56,10 @@ fn parse(event: &Event) -> DisputeEvent {
     parsed
 }
 
-/// Sends or updates a dispute's alert, as `mode` allows. `serbero` (with a
-/// `[serbero]` section) turns on the Serbero bookkeeping, the takeover
-/// message and the Serbero line.
+/// Adds a dispute's status to its timeline, as `mode` allows, and shows
+/// the timeline on the dispute's message. `serbero` (with a `[serbero]`
+/// section) turns on the Serbero bookkeeping and the takeover message.
+#[allow(clippy::too_many_arguments)] // The event loop's context, spelled out.
 pub async fn handle_dispute_event<M: Messenger>(
     telegram: &M,
     chat_id: i64,
@@ -65,6 +67,7 @@ pub async fn handle_dispute_event<M: Messenger>(
     mode: AlertMode,
     alerts_config: &AlertsConfig,
     dispute_store: &DisputeMessageStore,
+    names: &Names,
     serbero: Option<&SerberoAlerts<'_, M>>,
 ) {
     let DisputeEvent {
@@ -73,187 +76,141 @@ pub async fn handle_dispute_event<M: Messenger>(
         initiator,
         solver_pubkey,
     } = parse(event);
-    let created_at = event.created_at.as_secs();
+    let created_at = seconds(event.created_at.as_secs());
 
     info!(
         "Dispute event received: id={}, status={}, initiator={}, mode={:?}",
         dispute_id, status, initiator, mode
     );
 
-    // The status recorded before this event, to tell a caught-up event
-    // that is news from one already shown. Read before Serbero's
-    // bookkeeping records this one.
-    let previous = match dispute_store.recorded_status(&dispute_id).await {
-        Ok(previous) => previous,
-        Err(e) => {
-            error!("Failed to read the dispute's recorded status: {}", e);
-            None
-        }
-    };
-
-    // Recorded before the alert toggles and the cooperative-cancel delete,
-    // so a late Serbero handoff knows the dispute already ended and a
-    // solver taking over from Serbero is announced whatever the status
-    // alert toggles.
+    // Recorded before the alert toggles, so a late Serbero handoff knows
+    // the dispute already ended and a solver taking over from Serbero is
+    // announced whatever the status alert toggles.
     if let Some(serbero) = serbero {
         serbero
-            .note_dispute_status(&dispute_id, &status, created_at, mode == AlertMode::Live)
+            .note_dispute_status(
+                &dispute_id,
+                &status,
+                event.created_at.as_secs(),
+                mode == AlertMode::Live,
+            )
             .await;
     }
-    // Recorded with or without Serbero: the next catch-up compares
-    // against it.
+    // Recorded with or without Serbero, for the handoff alert's check.
     if let Err(e) = dispute_store
-        .record_dispute_status(&dispute_id, &status, seconds(created_at))
+        .record_dispute_status(&dispute_id, &status, created_at)
         .await
     {
         error!("Failed to record the dispute's status: {}", e);
     }
 
-    // Check if we have an existing message for this dispute
+    if let Err(e) = timeline::backfill(dispute_store, &dispute_id).await {
+        error!("Failed to backfill the dispute's timeline: {}", e);
+    }
+    let (kind, detail) = status_step(
+        &status,
+        (initiator != "unknown").then_some(initiator.as_str()),
+        solver_pubkey.as_deref(),
+    );
+    if let Err(e) = dispute_store
+        .append_timeline(&dispute_id, kind.as_str(), detail.as_deref(), created_at)
+        .await
+    {
+        // Shown anyway: the message is rendered from what is stored.
+        error!("Failed to record the dispute's timeline step: {}", e);
+    }
+
     let existing_message = match dispute_store.get_message(&dispute_id).await {
-        Ok(result) => result,
+        Ok(message) => message,
         Err(e) => {
             error!("Failed to query dispute store: {}", e);
             None
         }
     };
-
-    let shown_status = existing_message.as_ref().map(|m| m.status.as_str());
-    if mode == AlertMode::CatchUp
-        && !is_news(
-            previous.as_ref(),
-            seconds(created_at),
-            &status,
-            shown_status,
-        )
+    let text = match timeline::rendered(dispute_store, names, &dispute_id).await {
+        Ok(text) => text,
+        Err(e) => {
+            error!("Failed to read the dispute's timeline: {}", e);
+            return;
+        }
+    };
+    // The stored text is written once an edit or a send succeeds: a
+    // redelivered status with nothing new to show stops here, while one
+    // whose edit failed is tried again.
+    if existing_message
+        .as_ref()
+        .is_some_and(|m| m.text.as_deref() == Some(text.as_str()))
     {
         debug!(
-            "Caught-up status '{}' for dispute {} is already shown, skipping",
+            "Status '{}' of dispute {} already shown on its message, skipping",
             status, dispute_id
         );
         return;
     }
 
-    // Check if this alert type is enabled
-    if !alert_enabled(&status, alerts_config) {
-        info!(
-            "Alert for status '{}' is disabled, skipping notification",
-            status
-        );
-        return;
-    }
+    // Edits do not notify: the timeline is kept up to date whatever the
+    // alert toggles and the mode. Only a live, enabled status sends a new
+    // message.
+    let may_send = mode == AlertMode::Live && alert_enabled(&status, alerts_config);
 
-    // A catch-up may only bring the dispute's message up to date.
-    let existing_message = existing_message.map(|m| (m.message_id, m.chat_id));
-    if mode == AlertMode::CatchUp && existing_message.is_none() {
-        info!(
-            "Caught-up status '{}' for dispute {} has no channel message, not posting it",
-            status, dispute_id
-        );
-        return;
-    }
-
-    // Handle cooperative cancellation: delete the message
-    if status == "canceled" {
-        if let Some((message_id, stored_chat_id)) = existing_message {
-            if let Err(e) = telegram.delete(stored_chat_id, message_id).await {
-                warn!("Failed to delete dispute message: {}", e);
-            } else {
-                info!(
-                    "🗑️ Deleted dispute message for {} (cooperative cancel)",
-                    dispute_id
-                );
-            }
-            if let Err(e) = dispute_store.delete(&dispute_id).await {
-                error!("Failed to remove dispute from store: {}", e);
-            }
+    let Some(message) = existing_message else {
+        if may_send {
+            send_new_dispute_message(
+                telegram,
+                chat_id,
+                &dispute_id,
+                &status,
+                &text,
+                dispute_store,
+            )
+            .await;
+        } else {
+            info!(
+                "Status '{}' of dispute {} has no channel message and may not post one (mode {:?})",
+                status, dispute_id, mode
+            );
         }
-        return;
-    }
-
-    let message = alert_text(
-        &dispute_id,
-        &status,
-        &initiator,
-        solver_pubkey.as_deref(),
-        created_at,
-    );
-
-    // Serbero's latest state for the dispute shows below the alert; the
-    // store keeps the alert without it, to redraw it when the state changes.
-    let shown = crate::serbero::alerts::decorate(
-        dispute_store,
-        &dispute_id,
-        &status,
-        &message,
-        serbero.is_some_and(|s| s.show_progress),
-    )
-    .await;
-
-    let Some((message_id, stored_chat_id)) = existing_message else {
-        send_new_dispute_message(
-            telegram,
-            chat_id,
-            &dispute_id,
-            &status,
-            &shown,
-            &message,
-            dispute_store,
-        )
-        .await;
         return;
     };
 
-    match telegram.edit(stored_chat_id, message_id, &shown).await {
+    match telegram
+        .edit(message.chat_id, message.message_id, &text)
+        .await
+    {
         Ok(()) => {
             info!(
                 "✏️ Updated dispute message for {} (status: {})",
                 dispute_id, status
             );
             if let Err(e) = dispute_store
-                .update_status(&dispute_id, &status, &message)
+                .update_status(&dispute_id, &status, &text)
                 .await
             {
                 error!("Failed to update dispute status in store: {}", e);
             }
         }
-        // Live: the message was deleted, say; the status change still
-        // has to show. Catch-up: nothing new may be posted.
-        Err(e) if mode == AlertMode::Live => {
+        // Live: the message was deleted, say; the status change still has
+        // to show, with the whole timeline. Catch-up or a status turned
+        // off: nothing new may be posted.
+        Err(e) if may_send => {
             warn!("Failed to edit message, sending new one: {}", e);
             send_new_dispute_message(
                 telegram,
                 chat_id,
                 &dispute_id,
                 &status,
-                &shown,
-                &message,
+                &text,
                 dispute_store,
             )
             .await;
         }
         Err(e) => {
             warn!(
-                "Failed to edit the dispute message for a caught-up status, not resending: {}",
-                e
+                "Failed to edit the dispute message, not resending (mode {:?}): {}",
+                mode, e
             );
         }
     }
-}
-
-/// Whether a caught-up `status` dated `created_at` has something to show:
-/// it is newer than the recorded status, or it is the recorded status and
-/// the message does not show it yet (an edit that failed; the status is
-/// recorded before the edit). Nothing recorded means nothing was shown.
-fn is_news(
-    previous: Option<&crate::db::RecordedStatus>,
-    created_at: i64,
-    status: &str,
-    shown_status: Option<&str>,
-) -> bool {
-    previous.is_none_or(|p| {
-        created_at > p.created_at || (created_at == p.created_at && shown_status != Some(status))
-    })
 }
 
 /// Event times fit; saturate instead of wrapping if one does not.
@@ -261,118 +218,16 @@ fn seconds(secs: u64) -> i64 {
     i64::try_from(secs).unwrap_or(i64::MAX)
 }
 
-/// The alert for a dispute status, in MarkdownV2.
-fn alert_text(
-    dispute_id: &str,
-    status: &str,
-    initiator: &str,
-    solver_pubkey: Option<&str>,
-    created_at: u64,
-) -> String {
-    match status {
-        "initiated" => {
-            format!(
-                "🚨 *NEW DISPUTE*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 👤 *Initiated by:* {}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ⚡ Please take this dispute in Mostrix or your admin client\\.",
-                escape_markdown_code(dispute_id),
-                escape_markdown(initiator),
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        "in-progress" => {
-            let solver_info = solver_pubkey
-                .map(|pk| format!("\n👨‍⚖️ *Taken by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "🔄 *DISPUTE IN PROGRESS*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ℹ️ Dispute is now being handled\\.",
-                escape_markdown_code(dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        "seller-refunded" => {
-            let solver_info = solver_pubkey
-                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "💰 *DISPUTE RESOLVED \\- SELLER REFUNDED*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: funds returned to seller\\.",
-                escape_markdown_code(dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        "settled" => {
-            let solver_info = solver_pubkey
-                .map(|pk| format!("\n👨‍⚖️ *Resolved by:* `{}`", escape_markdown_code(pk)))
-                .unwrap_or_default();
-            format!(
-                "✅ *DISPUTE RESOLVED \\- SETTLED*\n\n\
-                 📋 *Dispute ID:* `{}`{}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: buyer receives payment\\.",
-                escape_markdown_code(dispute_id),
-                solver_info,
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        "cooperatively-canceled" => {
-            format!(
-                "🤝 *DISPUTE RESOLVED \\- COOPERATIVELY CANCELED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 🤝 *Resolution:* Both parties agreed to cancel\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: funds returned to seller, no solver needed\\.",
-                escape_markdown_code(dispute_id),
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        "released" => {
-            format!(
-                "🔓 *DISPUTE RESOLVED \\- RELEASED*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 🤝 *Resolution:* Released by seller\n\
-                 ⏰ *Time:* {}\n\n\
-                 ✔️ Dispute closed: trade completed\\.",
-                escape_markdown_code(dispute_id),
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-        _ => {
-            format!(
-                "📡 *DISPUTE STATUS UPDATE*\n\n\
-                 📋 *Dispute ID:* `{}`\n\
-                 📊 *Status:* {}\n\
-                 ⏰ *Time:* {}\n\n\
-                 ℹ️ Status changed\\.",
-                escape_markdown_code(dispute_id),
-                escape_markdown(status),
-                escape_markdown(&chrono_timestamp(created_at)),
-            )
-        }
-    }
-}
-
-/// Sends `shown` and stores the message, with `alert` (the text without
-/// Serbero's line) for later redraws.
+/// Sends `text` and stores the message.
 async fn send_new_dispute_message<M: Messenger>(
     telegram: &M,
     chat_id: i64,
     dispute_id: &str,
     status: &str,
-    shown: &str,
-    alert: &str,
+    text: &str,
     dispute_store: &DisputeMessageStore,
 ) {
-    match telegram.send(chat_id, shown, None).await {
+    match telegram.send(chat_id, text, None).await {
         Ok(message_id) => {
             info!(
                 "✅ Telegram alert sent for dispute {} (status: {})",
@@ -380,7 +235,7 @@ async fn send_new_dispute_message<M: Messenger>(
             );
             // Store the message ID for future updates
             if let Err(e) = dispute_store
-                .insert(dispute_id, message_id, chat_id, status, alert)
+                .insert(dispute_id, message_id, chat_id, status, text)
                 .await
             {
                 error!("Failed to store dispute message ID: {}", e);
@@ -400,6 +255,7 @@ mod tests {
 
     const DISPUTE: &str = "51733e4d-a155-465b-a97e-07fba5f0e485";
     const CHAT: i64 = -100_123;
+    const SOLVER: &str = "000000e2fdb5000000000000000000000000000000000000000000000000a7f1";
     /// 2026-03-29 14:16:31 UTC, the incident's `in-progress` event.
     const TAKEN: u64 = 1_774_793_791;
 
@@ -409,6 +265,7 @@ mod tests {
         telegram: FakeTelegram,
         mostro: Keys,
         alerts: AlertsConfig,
+        names: Names,
     }
 
     impl Fixture {
@@ -423,14 +280,19 @@ mod tests {
                 telegram: FakeTelegram::default(),
                 mostro: Keys::generate(),
                 alerts: AlertsConfig::default(),
+                names: Names::default(),
             }
         }
 
         fn dispute_event(&self, status: &str, created_at: u64) -> Event {
-            EventBuilder::new(DISPUTE_KIND, "")
+            let mut builder = EventBuilder::new(DISPUTE_KIND, "")
                 .tag(Tag::identifier(DISPUTE))
                 .tag(Tag::parse(["s", status]).unwrap())
-                .tag(Tag::parse(["initiator", "buyer"]).unwrap())
+                .tag(Tag::parse(["initiator", "buyer"]).unwrap());
+            if matches!(status, "settled" | "seller-refunded") {
+                builder = builder.tag(Tag::parse(["solver", SOLVER]).unwrap());
+            }
+            builder
                 .custom_created_at(Timestamp::from_secs(created_at))
                 .finalize(&self.mostro)
                 .unwrap()
@@ -444,6 +306,7 @@ mod tests {
                 mode,
                 &self.alerts,
                 &self.store,
+                &self.names,
                 None,
             )
             .await;
@@ -456,9 +319,25 @@ mod tests {
                 .unwrap()
                 .map(|m| m.status)
         }
+
+        async fn steps(&self) -> Vec<String> {
+            self.store
+                .timeline(DISPUTE)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.kind)
+                .collect()
+        }
     }
 
     const DISPUTE_KIND: Kind = Kind::Custom(38386);
+
+    fn text_of(call: &Call) -> &str {
+        match call {
+            Call::Send { text, .. } | Call::Edit { text, .. } => text,
+        }
+    }
 
     /// The incident: a solver starts watching a dispute taken months ago,
     /// the catch-up fetches its `in-progress` status, and the channel has
@@ -472,6 +351,8 @@ mod tests {
 
         assert!(fx.telegram.calls().is_empty());
         assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
+        // Kept for the day the dispute does get a message.
+        assert_eq!(fx.steps().await, vec!["taken"]);
     }
 
     #[tokio::test]
@@ -490,13 +371,16 @@ mod tests {
         assert!(fx.telegram.sends().is_empty());
         assert!(matches!(
             fx.telegram.edits().as_slice(),
-            [Call::Edit { chat_id: CHAT, message_id: 1, text }] if text.contains("SETTLED")
+            [Call::Edit { chat_id: CHAT, message_id: 1, text }]
+                if text.contains("RESOLVED · settled") && text.contains("Taken by")
         ));
         assert_eq!(fx.stored_status().await.as_deref(), Some("settled"));
     }
 
+    /// A step that reaches the watchdog late still belongs on the
+    /// timeline, in its place; the message's status stays the newest.
     #[tokio::test]
-    async fn a_caught_up_older_status_changes_nothing() {
+    async fn a_caught_up_older_status_is_added_to_the_timeline_without_a_new_message() {
         let fx = Fixture::new().await;
         fx.handle(&fx.dispute_event("settled", TAKEN + 3_600), AlertMode::Live)
             .await;
@@ -505,64 +389,31 @@ mod tests {
         fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::CatchUp)
             .await;
 
-        assert!(fx.telegram.calls().is_empty());
-        assert_eq!(fx.stored_status().await.as_deref(), Some("settled"));
+        assert!(fx.telegram.sends().is_empty());
+        let edits = fx.telegram.edits();
+        assert_eq!(edits.len(), 1);
+        let text = text_of(&edits[0]);
+        assert!(text.contains("*Status:* ✅ RESOLVED · settled"));
+        let taken = text.find("Taken by").unwrap();
+        let settled = text.find("Settled, buyer paid").unwrap();
+        assert!(taken < settled, "{text}");
+        assert_eq!(fx.steps().await, vec!["taken", "resolved"]);
     }
 
     #[tokio::test]
-    async fn a_caught_up_status_already_recorded_is_not_shown_again() {
+    async fn a_status_delivered_again_changes_nothing() {
         let fx = Fixture::new().await;
         let settled = fx.dispute_event("settled", TAKEN + 3_600);
         fx.handle(&settled, AlertMode::Live).await;
         fx.telegram.clear();
 
         // The same event again: the catch-up fetched what the live
-        // subscription already delivered.
+        // subscription already delivered, then a relay redelivered it.
         fx.handle(&settled, AlertMode::CatchUp).await;
+        fx.handle(&settled, AlertMode::Live).await;
 
         assert!(fx.telegram.calls().is_empty());
-    }
-
-    #[tokio::test]
-    async fn a_caught_up_status_whose_edit_failed_is_retried_by_the_next_catch_up() {
-        let fx = Fixture::new().await;
-        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
-            .await;
-        fx.telegram.clear();
-        let settled = fx.dispute_event("settled", TAKEN + 3_600);
-        fx.telegram.edits_fail.store(true, Ordering::SeqCst);
-        fx.handle(&settled, AlertMode::CatchUp).await;
-        assert!(fx.telegram.calls().is_empty());
-        fx.telegram.edits_fail.store(false, Ordering::SeqCst);
-
-        // The same event, fetched again by the next periodic catch-up.
-        fx.handle(&settled, AlertMode::CatchUp).await;
-
-        assert!(fx.telegram.sends().is_empty());
-        assert!(matches!(
-            fx.telegram.edits().as_slice(),
-            [Call::Edit { message_id: 1, text, .. }] if text.contains("SETTLED")
-        ));
-        assert_eq!(fx.stored_status().await.as_deref(), Some("settled"));
-    }
-
-    #[tokio::test]
-    async fn a_live_status_sends_a_new_message_and_then_edits_it() {
-        let fx = Fixture::new().await;
-
-        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
-            .await;
-        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
-            .await;
-
-        assert!(matches!(
-            fx.telegram.calls().as_slice(),
-            [
-                Call::Send { chat_id: CHAT, text: sent, reply_to: None },
-                Call::Edit { chat_id: CHAT, message_id: 1, text: edited },
-            ] if sent.contains("NEW DISPUTE") && edited.contains("IN PROGRESS")
-        ));
-        assert_eq!(fx.stored_status().await.as_deref(), Some("in-progress"));
+        assert_eq!(fx.steps().await, vec!["resolved"]);
     }
 
     #[tokio::test]
@@ -576,10 +427,12 @@ mod tests {
         fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
             .await;
 
-        // The message was deleted by hand, say: the status still shows.
+        // The message was deleted by hand, say: the whole timeline shows
+        // again.
         assert!(matches!(
             fx.telegram.sends().as_slice(),
-            [Call::Send { chat_id: CHAT, text, reply_to: None }] if text.contains("IN PROGRESS")
+            [Call::Send { chat_id: CHAT, text, reply_to: None }]
+                if text.contains("Opened by buyer") && text.contains("Taken by a solver")
         ));
         let stored = fx.store.get_message(DISPUTE).await.unwrap().unwrap();
         assert_eq!(
@@ -603,12 +456,73 @@ mod tests {
         .await;
 
         assert!(fx.telegram.sends().is_empty());
-        // Still what the message shows: the next newer status redraws it.
+        // Still what the message shows: the next step redraws it.
         assert_eq!(fx.stored_status().await.as_deref(), Some("in-progress"));
     }
 
     #[tokio::test]
-    async fn a_live_cancel_deletes_the_disputes_message() {
+    async fn a_caught_up_status_whose_edit_failed_is_retried_by_the_next_catch_up() {
+        let fx = Fixture::new().await;
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+        fx.telegram.clear();
+        let settled = fx.dispute_event("settled", TAKEN + 3_600);
+        fx.telegram.edits_fail.store(true, Ordering::SeqCst);
+        fx.handle(&settled, AlertMode::CatchUp).await;
+        assert!(fx.telegram.calls().is_empty());
+        fx.telegram.edits_fail.store(false, Ordering::SeqCst);
+
+        // The same event, fetched again by the next periodic catch-up.
+        fx.handle(&settled, AlertMode::CatchUp).await;
+
+        assert!(fx.telegram.sends().is_empty());
+        assert!(matches!(
+            fx.telegram.edits().as_slice(),
+            [Call::Edit { message_id: 1, text, .. }] if text.contains("RESOLVED · settled")
+        ));
+        assert_eq!(fx.stored_status().await.as_deref(), Some("settled"));
+    }
+
+    #[tokio::test]
+    async fn a_live_status_sends_one_message_and_then_edits_it_with_the_timeline() {
+        let fx = Fixture::new().await;
+
+        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
+            .await;
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+        fx.handle(
+            &fx.dispute_event("seller-refunded", TAKEN + 100),
+            AlertMode::Live,
+        )
+        .await;
+
+        let calls = fx.telegram.calls();
+        assert_eq!(calls.len(), 3, "{calls:?}");
+        assert!(matches!(
+            &calls[0],
+            Call::Send { chat_id: CHAT, text, reply_to: None }
+                if text.contains("*Status:* 🚨 OPEN · needs a solver")
+                    && text.contains("Opened by buyer")
+        ));
+        assert!(matches!(
+            &calls[1],
+            Call::Edit { chat_id: CHAT, message_id: 1, text }
+                if text.contains("*Status:* 👨‍⚖️ WITH A SOLVER · a solver")
+                    && text.contains("Opened by buyer")
+                    && text.contains("Taken by a solver")
+        ));
+        assert!(matches!(
+            &calls[2],
+            Call::Edit { chat_id: CHAT, message_id: 1, text }
+                if text.contains("*Status:* ✅ RESOLVED · seller refunded by solver 000000e2fdb5…a7f1")
+                    && text.contains("Seller refunded · resolved by solver 000000e2fdb5…a7f1")
+        ));
+        assert_eq!(fx.stored_status().await.as_deref(), Some("seller-refunded"));
+    }
+
+    #[tokio::test]
+    async fn a_live_cancel_closes_the_timeline_instead_of_deleting_the_message() {
         let fx = Fixture::new().await;
         fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
             .await;
@@ -617,14 +531,68 @@ mod tests {
         fx.handle(&fx.dispute_event("canceled", TAKEN), AlertMode::Live)
             .await;
 
-        assert_eq!(
-            fx.telegram.deletes(),
-            vec![Call::Delete {
-                chat_id: CHAT,
-                message_id: 1
-            }]
-        );
-        assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { message_id: 1, text, .. }]
+                if text.contains("*Status:* 🗑 CANCELED · cooperatively")
+                    && text.contains("Canceled cooperatively")
+        ));
+        assert_eq!(fx.stored_status().await.as_deref(), Some("canceled"));
+    }
+
+    #[tokio::test]
+    async fn a_status_turned_off_still_updates_the_message_but_never_sends_one() {
+        let mut fx = Fixture::new().await;
+        fx.alerts.in_progress = false;
+        fx.alerts.initiated = false;
+
+        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
+            .await;
+        assert!(fx.telegram.calls().is_empty());
+        fx.alerts.initiated = true;
+        fx.handle(&fx.dispute_event("settled", TAKEN + 60), AlertMode::Live)
+            .await;
+        fx.telegram.clear();
+
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+
+        assert!(fx.telegram.sends().is_empty());
+        assert!(matches!(
+            fx.telegram.edits().as_slice(),
+            [Call::Edit { text, .. }] if text.contains("Taken by")
+        ));
+        assert_eq!(fx.steps().await, vec!["opened", "taken", "resolved"]);
+    }
+
+    #[tokio::test]
+    async fn a_message_from_before_the_timeline_gets_its_stored_status_as_first_step() {
+        let fx = Fixture::new().await;
+        // Sent by an earlier version: a message, no timeline.
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "old alert")
+            .await
+            .unwrap();
+        let sent_at = fx
+            .store
+            .get_message(DISPUTE)
+            .await
+            .unwrap()
+            .unwrap()
+            .created_at;
+
+        fx.handle(
+            &fx.dispute_event("settled", (sent_at + 60) as u64),
+            AlertMode::Live,
+        )
+        .await;
+
+        assert_eq!(fx.steps().await, vec!["taken", "resolved"]);
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { message_id: 42, text, .. }]
+                if text.contains("Taken by a solver") && text.contains("Settled, buyer paid")
+        ));
     }
 
     #[tokio::test]
@@ -637,40 +605,5 @@ mod tests {
         let recorded = fx.store.recorded_status(DISPUTE).await.unwrap().unwrap();
         assert_eq!(recorded.status, "in-progress");
         assert_eq!(recorded.created_at, TAKEN as i64);
-    }
-
-    #[test]
-    fn an_event_is_news_when_newer_than_the_recorded_status() {
-        let recorded = crate::db::RecordedStatus {
-            status: "in-progress".into(),
-            created_at: 100,
-        };
-        assert!(is_news(None, 100, "in-progress", None));
-        assert!(is_news(
-            Some(&recorded),
-            101,
-            "settled",
-            Some("in-progress")
-        ));
-        assert!(!is_news(
-            Some(&recorded),
-            99,
-            "initiated",
-            Some("in-progress")
-        ));
-        // The recorded status, already shown.
-        assert!(!is_news(
-            Some(&recorded),
-            100,
-            "in-progress",
-            Some("in-progress")
-        ));
-        // The recorded status, not shown yet: the edit failed before.
-        assert!(is_news(
-            Some(&recorded),
-            100,
-            "in-progress",
-            Some("initiated")
-        ));
     }
 }

@@ -155,6 +155,7 @@ mod tests {
     use super::*;
     use crate::db::DisputeMessageStore;
     use crate::serbero::testing::{serbero_dm, Call, FakeTelegram};
+    use crate::timeline::Names;
 
     const DISPUTE: &str = "58511141-6e3f-4b87-9c4a-1f2e3d4c5b6a";
     const CHAT: i64 = -100_123;
@@ -191,6 +192,8 @@ mod tests {
                 chat_id: CHAT,
                 show_progress: true,
                 send_handoffs: true,
+                send_takeovers: true,
+                names: Names::default(),
             }
         }
 
@@ -294,6 +297,7 @@ mod tests {
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
+        fx.store.set_sent_at(DISPUTE, 1).await.unwrap();
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
         let batch = vec![
             fx.dm("handed off: round_limit", 200),
@@ -311,13 +315,12 @@ mod tests {
                 _ => unreachable!(),
             })
             .collect();
-        assert_eq!(
-            edits,
-            vec![
-                "base\n\n🤖 *Serbero:* mediating".to_string(),
-                "base\n\n🙋 *Serbero:* handed off \\(round limit\\) — a solver must take it over"
-                    .to_string(),
-            ]
+        assert_eq!(edits.len(), 2, "{edits:?}");
+        assert!(edits[0].contains("*Status:* 🤖 WITH SERBERO · mediating"));
+        assert!(!edits[0].contains("handed off"));
+        assert!(edits[1].contains("*Status:* 🙋 NEEDS A SOLVER · handed off · round limit"));
+        assert!(
+            edits[1].contains("Serbero mediating\n🙋 `00:03:20` Serbero handed off · round limit")
         );
         assert_eq!(fx.telegram.sends().len(), 1);
     }

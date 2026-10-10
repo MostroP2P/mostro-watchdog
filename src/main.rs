@@ -12,6 +12,7 @@ mod db;
 mod disputes;
 mod serbero;
 mod solver;
+mod timeline;
 mod version;
 
 use config::{Config, SerberoSettings};
@@ -19,6 +20,7 @@ use db::DisputeMessageStore;
 use disputes::{handle_dispute_event, AlertMode};
 use serbero::alerts::SerberoAlerts;
 use serbero::telegram::Messenger;
+use timeline::Names;
 use version::{version_message, VERSION};
 
 /// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
@@ -878,12 +880,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let alerts_config = config.alerts.unwrap_or_default();
     let chat_id = config.telegram.chat_id;
+    let names = Names::new(alerts_config.solver_names.clone());
     let serbero_alerts = SerberoAlerts {
         store: &dispute_store,
         telegram: &bot,
         chat_id,
         show_progress: alerts_config.serbero_progress,
         send_handoffs: alerts_config.serbero_handoff,
+        send_takeovers: alerts_config.takeover_message,
+        names: names.clone(),
     };
 
     run_event_loop(
@@ -893,6 +898,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             chat_id,
             alerts_config: &alerts_config,
             dispute_store: &dispute_store,
+            names: &names,
             health_monitor: &health_monitor,
             serbero_alerts: &serbero_alerts,
             serbero_inbox,
@@ -954,6 +960,7 @@ struct EventLoop<'a, M> {
     chat_id: i64,
     alerts_config: &'a config::AlertsConfig,
     dispute_store: &'a DisputeMessageStore,
+    names: &'a Names,
     health_monitor: &'a HealthMonitor,
     serbero_alerts: &'a SerberoAlerts<'a, M>,
     serbero_inbox: Option<serbero::SerberoInbox>,
@@ -1047,6 +1054,7 @@ impl<M: Messenger> EventLoop<'_, M> {
             mode,
             self.alerts_config,
             self.dispute_store,
+            self.names,
             self.serbero_inbox.is_some().then_some(self.serbero_alerts),
         )
         .await;
@@ -1170,6 +1178,7 @@ mod tests {
         store: DisputeMessageStore,
         telegram: FakeTelegram,
         alerts: AlertsConfig,
+        names: Names,
         health: HealthMonitor,
     }
 
@@ -1197,6 +1206,7 @@ mod tests {
                 store,
                 telegram: FakeTelegram::default(),
                 alerts: AlertsConfig::default(),
+                names: Names::default(),
                 health: HealthMonitor::new(),
             }
         }
@@ -1221,6 +1231,8 @@ mod tests {
                 chat_id: CHAT,
                 show_progress: false,
                 send_handoffs: false,
+                send_takeovers: false,
+                names: Names::default(),
             }
         }
 
@@ -1240,6 +1252,7 @@ mod tests {
                     chat_id: CHAT,
                     alerts_config: &self.alerts,
                     dispute_store: &self.store,
+                    names: &self.names,
                     health_monitor: &self.health,
                     serbero_alerts,
                     serbero_inbox: None,
@@ -1324,7 +1337,7 @@ mod tests {
 
         let sent = sent_texts(&fx.telegram);
         assert_eq!(sent.len(), 1, "sent: {sent:?}");
-        assert!(sent[0].contains("NEW DISPUTE") && sent[0].contains(fresh_id));
+        assert!(sent[0].contains("OPEN · needs a solver") && sent[0].contains(fresh_id));
         assert!(fx.telegram.edits().is_empty());
         assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
         // Still recorded, for a late Serbero handoff.
@@ -1371,7 +1384,7 @@ mod tests {
         assert_eq!(fx.telegram.sends().len(), 1);
         assert!(matches!(
             fx.telegram.edits().as_slice(),
-            [Call::Edit { message_id: 1, text, .. }] if text.contains("SETTLED")
+            [Call::Edit { message_id: 1, text, .. }] if text.contains("RESOLVED · settled")
         ));
         fx.shutdown().await;
     }

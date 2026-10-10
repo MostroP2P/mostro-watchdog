@@ -16,8 +16,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#serbero-alerts).
 - `[alerts]` options `serbero_handoff` and `serbero_progress`.
 - Serbero takeover alert: a new message when a solver takes over a dispute
-  Serbero held, and Serbero's line on the dispute's message reads "a solver
-  took it over". Sent with `serbero_handoff`.
+  Serbero held. Sent with `takeover_message`.
+- One message per dispute with a timeline: the dispute's message is edited in
+  place and lists everything that happened to it in the order it happened
+  (opened, taken, Serbero's steps, takeover, resolution), under a header
+  saying where it stands. Steps that arrive late or out of order take their
+  place by event time. See
+  [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#alert-format) (#41).
+- `[alerts]` options `takeover_message` and `solver_names`.
 - Solver notifications: with a `[solver_notifications]` section, a solver who
   links their key with `/link` and Mostrix gets a private Telegram message
   when a party writes to them in a dispute chat. No private key leaves
@@ -29,14 +35,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`serbero_states`, `serbero_headers`, `dispute_statuses`,
   `serbero_takeovers`); existing databases are migrated on start.
 - `disputes.db` gains the `solver_*` tables for solver notifications.
+- `disputes.db` gains the `dispute_timeline` table; existing databases are
+  migrated on start, and a message sent before the timeline gets its stored
+  status as first step.
+- A status turned off in `[alerts]` still goes on the dispute's timeline and
+  edits the message; it only never sends a new one.
+- A cooperative cancel reported as `canceled` by older nodes closes the
+  dispute's timeline instead of deleting its message.
 
 ### Fixed
 - The disputes channel only shows what the live dispute subscription
   delivers. The solver catch-up, which reads the latest status of every
   watched dispute however old, could post months-old statuses as new alerts
   when a solver started watching a dispute the channel had no message for.
-  A caught-up status now only edits the dispute's existing message, and only
-  when newer than the status recorded for it (#40).
+  A caught-up status now only adds to the dispute's timeline and edits its
+  existing message (#40).
 - A config file with a TOML error no longer prints the whole file, Telegram bot
   token included, at startup: the error shows its message and line only.
 

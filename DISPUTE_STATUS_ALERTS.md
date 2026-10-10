@@ -4,7 +4,10 @@ This document describes the enhanced dispute monitoring capabilities implemented
 
 ## Overview
 
-mostro-watchdog now monitors **all** dispute status changes, not just new disputes. This provides complete visibility into the dispute lifecycle for Mostro administrators.
+mostro-watchdog monitors **all** dispute status changes, not just new disputes,
+and keeps **one message per dispute**: sent when the dispute opens and edited
+in place with a timeline of everything that happened to it. See
+[Alert Format](#alert-format).
 
 ## Dispute Status Types
 
@@ -63,44 +66,82 @@ cooperatively_canceled = true  # Cancelled by both parties (recommended: true)
 other = true           # Unknown statuses (recommended: true)
 ```
 
+A status turned off still goes on the dispute's timeline and still edits the
+dispute's message (edits do not notify); it only never **sends** a new message.
+So with `initiated = false`, a dispute's message first appears at its next
+enabled status, with the opening already on its timeline.
+
+### Solver names
+
+Mostro names the solver in some dispute events. The timeline shows a solver by
+the name configured for their pubkey (hex), or by a shortened pubkey:
+
+```toml
+[alerts.solver_names]
+"000000e2fdb5000000000000000000000000000000000000000000000000a7f1" = "grunch"
+```
+
 ### Backward Compatibility
 
 The `[alerts]` section is **optional**. If not present, all alert types default to enabled, maintaining backward compatibility.
 
-## Alert Format Examples
+## Alert Format
 
-### New Dispute (initiated)
+Each dispute has one message, edited in place. A header line shows where the
+dispute stands; the timeline below it lists every step the watchdog knows
+about, in the order they happened (by event time, whatever order they reached
+the watchdog). Times are UTC; the date shows once at the bottom, and again on
+a step that happened on another day.
+
 ```text
-🚨 NEW DISPUTE
+⚖️ DISPUTE 96629381-bcb8-4d4f-8c66-e8f86f3e86ea
+Status: ✅ RESOLVED · released by seller
 
-📋 Dispute ID: `abc123def456`
-👤 Initiated by: buyer
-⏰ Time: 2026-02-20 15:30:00 UTC
+🚨 09:41:02 Opened by buyer
+🤖 09:41:03 Taken by Serbero
+🤖 09:41:05 Serbero mediating
+🙋 09:48:53 Serbero handed off · facts gathered
+🔓 10:07:21 Released by seller · resolved by the parties
 
-⚡ Please take this dispute in Mostrix or your admin client.
+All times UTC · 2026-10-10
 ```
 
-### Dispute In Progress
+A dispute a human took over from Serbero, resolved by that solver:
+
 ```text
-🔄 DISPUTE IN PROGRESS
+⚖️ DISPUTE f8af1141-b3a2-45e7-8391-017debdf3ef5
+Status: ✅ RESOLVED · seller refunded by grunch
 
-📋 Dispute ID: `abc123def456`
-👨‍⚖️ Status: Taken by solver
-⏰ Time: 2026-02-20 15:35:00 UTC
+🚨 18:10:39 Opened by seller
+🤖 18:10:40 Taken by Serbero
+🤖 18:10:42 Serbero mediating
+🙋 18:16:34 Serbero handed off · facts gathered
+👨‍⚖️ 18:48:47 Taken over by grunch
+💰 19:10:42 Seller refunded · resolved by grunch
 
-ℹ️ Dispute is now being handled.
+All times UTC · 2026-10-09
 ```
 
-### Dispute Resolved (settled)
-```text
-✅ DISPUTE RESOLVED
+Header lines:
 
-📋 Dispute ID: `abc123def456`
-💸 Resolution: Payment to buyer
-⏰ Time: 2026-02-20 16:00:00 UTC
+| Where the dispute stands | Header |
+|---|---|
+| Opened, nobody took it | 🚨 OPEN · needs a solver |
+| Serbero took it | 🤖 WITH SERBERO · mediating (or · guided the parties) |
+| Serbero handed it off or could not start | 🙋 NEEDS A SOLVER · handed off · ‹reason› |
+| A solver took it (over) | 👨‍⚖️ WITH A SOLVER · ‹name› |
+| Resolved | ✅ RESOLVED · released by seller / canceled cooperatively / settled, buyer paid, by ‹name› / seller refunded by ‹name› |
+| Cooperative cancel on an older node (`canceled`) | 🗑 CANCELED · cooperatively |
+| A status this version does not know | 📡 ‹status› |
 
-✔️ Dispute closed: buyer receives payment.
-```
+Mostro's `in-progress` event does not say who took the dispute: the first take
+of a dispute Serbero reports on is shown as Serbero's, and a later one as a
+solver taking it over.
+
+A timeline longer than 12 steps keeps its first step and its last eleven, with
+a line saying how many were left out. A message deleted in Telegram is sent
+again, with the whole timeline, at the dispute's next live status. A message
+sent by a version before the timeline gets its stored status as first step.
 
 ## Serbero alerts
 
@@ -112,27 +153,28 @@ the Telegram group never learns that a dispute was handed off and needs a solver
 
 With Serbero alerts on, the watchdog:
 
-- shows Serbero's latest step on the dispute's message (an edit, which does not
-  notify);
+- adds each of Serbero's steps to the dispute's timeline (an edit, which does
+  not notify);
 - sends a **new message**, which notifies, when Serbero hands a dispute off or
   cannot start mediating it. It replies to the dispute's message when there is
   one, and stands alone otherwise (for example when the watchdog started after
   the dispute's alert went out);
 - sends another **new message** when a solver takes the dispute over from
-  Serbero, so the group sees the handoff answered.
+  Serbero, so the group sees the handoff answered (`takeover_message`).
 
-| Serbero says | Line on the dispute's message | New message |
-|---|---|---|
-| `mediating` | 🤖 Serbero: mediating | – |
-| `guidance sent: <path>` | 🤖 Serbero: guided the parties to resolve it themselves (payment arrived) | – |
-| `handed off: <reason>` | 🙋 Serbero: handed off (conflicting claims) — a solver must take it over | 🙋 SERBERO HANDED OFF A DISPUTE |
-| `mediation could not start` | 🙋 Serbero: mediation could not start — a solver must take it over | 🙋 SERBERO COULD NOT START MEDIATION |
+| Serbero says | Step on the timeline | Header while it holds | New message |
+|---|---|---|---|
+| `mediating` | 🤖 Serbero mediating | 🤖 WITH SERBERO · mediating | – |
+| `guidance sent: <path>` | 🤖 Serbero guided the parties · payment arrived | 🤖 WITH SERBERO · guided the parties | – |
+| `handed off: <reason>` | 🙋 Serbero handed off · conflicting claims | 🙋 NEEDS A SOLVER · handed off · conflicting claims | 🙋 SERBERO HANDED OFF A DISPUTE |
+| `mediation could not start` | 🙋 Serbero could not start mediation | 🙋 NEEDS A SOLVER · mediation could not start | 🙋 SERBERO COULD NOT START MEDIATION |
 
-The line stays on the message through later status changes. Once a solver
-takes the dispute over, "a solver must take it over" becomes "a solver took it
-over" (and `mediating` reads `mediated`). Once the dispute is resolved without
-a takeover, "a solver must take it over" is dropped, so the final message stays
-true.
+The steps stay on the timeline through later status changes. The header stops
+asking for a solver once one takes the dispute over or the dispute is
+resolved, so the final message stays true. A step that reaches the watchdog
+late (a catch-up, a relay delay) takes its place on the timeline by its own
+time, and a late notice of an earlier mediation stage never moves the header
+back.
 
 ### Handoff alert
 
@@ -172,8 +214,9 @@ announced when:
   events published while it runs, like every other dispute alert;
 - it is seen before any update from Serbero about that dispute.
 
-The takeover also updates Serbero's line on the dispute's message, even with
-the `in_progress` alert turned off.
+The takeover also shows on the dispute's timeline (`👨‍⚖️ Taken over by ‹name›`)
+and in its header, even with the `in_progress` alert or `takeover_message`
+turned off.
 
 ### Setup
 
@@ -226,8 +269,9 @@ To turn either kind of alert off:
 
 ```toml
 [alerts]
-serbero_handoff = false    # no new message on handoffs or takeovers
-serbero_progress = false   # no Serbero line on dispute messages
+serbero_handoff = false    # no new message on handoffs
+takeover_message = false   # no new message on takeovers
+serbero_progress = false   # no Serbero steps on the dispute's timeline
 ```
 
 ### Privacy
@@ -273,8 +317,14 @@ Existing configurations continue to work unchanged. The new status monitoring is
 - Monitors Nostr events (kind 38386) for all status values
 - Only the live subscription (`since` the launch, or the relay swap) posts
   new messages. Statuses fetched by the solver catch-up, which has no lower
-  time bound, only edit a dispute's existing message when they are newer than
-  the recorded status, and never fall back to a new message
-- Parses `s` tag for status, `d` tag for dispute ID, `initiator` tag for who created dispute
-- Uses different emoji and messaging for each status type
+  time bound, only add to the timeline and edit a dispute's existing message,
+  and never fall back to a new message
+- Every step is stored once in `disputes.db` (`dispute_timeline`, keyed by
+  dispute, step, detail and event time), so redeliveries, re-fetches and
+  restarts never duplicate one; the message is rendered from the whole
+  timeline on every change, and steps in the same second keep the lifecycle
+  order (opened, taken, Serbero, resolved)
+- With `serbero_progress = false`, Serbero's steps are not stored, so they
+  never show on the timeline, not even on a later redraw
+- Parses `s` tag for status, `d` tag for dispute ID, `initiator` tag for who created dispute, `solver` tag for who resolved it
 - Maintains backward compatibility with existing configurations

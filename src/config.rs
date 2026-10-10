@@ -1,5 +1,6 @@
 use nostr_sdk::prelude::{Keys, PublicKey};
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::Path;
 use std::time::Duration;
 
@@ -49,6 +50,13 @@ pub struct AlertsConfig {
     /// notification)
     #[serde(default = "default_true")]
     pub serbero_progress: bool,
+    /// Also send a separate message when a solver takes a dispute over from
+    /// Serbero. The takeover always shows on the dispute's timeline.
+    #[serde(default = "default_true")]
+    pub takeover_message: bool,
+    /// Solver pubkeys (hex) and the name to show for each on the timeline.
+    #[serde(default)]
+    pub solver_names: HashMap<String, String>,
 }
 
 fn default_true() -> bool {
@@ -67,6 +75,8 @@ impl Default for AlertsConfig {
             other: true,
             serbero_handoff: true,
             serbero_progress: true,
+            takeover_message: true,
+            solver_names: HashMap::new(),
         }
     }
 }
@@ -536,6 +546,61 @@ chat_id = -1001
         assert!(alerts.serbero_progress);
         assert!(AlertsConfig::default().serbero_handoff);
         assert!(AlertsConfig::default().serbero_progress);
+    }
+
+    #[test]
+    fn the_takeover_message_is_on_by_default_and_can_be_turned_off() {
+        assert!(AlertsConfig::default().takeover_message);
+        assert!(
+            load(
+                "
+[alerts]
+"
+            )
+            .unwrap()
+            .alerts
+            .unwrap()
+            .takeover_message
+        );
+
+        let config = load(
+            "
+[alerts]
+takeover_message = false
+",
+        )
+        .unwrap();
+
+        assert!(!config.alerts.unwrap().takeover_message);
+    }
+
+    #[test]
+    fn solver_names_map_pubkeys_to_names() {
+        let config = load(
+            "
+[alerts]
+[alerts.solver_names]
+             \"000000e2fdb5000000000000000000000000000000000000000000000000a7f1\" = \"grunch\"
+",
+        )
+        .unwrap();
+
+        let names = config.alerts.unwrap().solver_names;
+        assert_eq!(
+            names.get("000000e2fdb5000000000000000000000000000000000000000000000000a7f1"),
+            Some(&"grunch".to_string())
+        );
+        assert!(AlertsConfig::default().solver_names.is_empty());
+        assert!(load(
+            "
+[alerts]
+"
+        )
+        .unwrap()
+        .alerts
+        .unwrap()
+        .solver_names
+        .is_empty());
     }
 
     #[test]

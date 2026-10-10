@@ -52,9 +52,10 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 | Path | Purpose |
 |---|---|
 | `src/main.rs` | Entry point, Nostr subscription, event loop, health tasks, Telegram commands |
-| `src/disputes.rs` | Dispute alerts: the message for each kind-38386 status, sent or edited as the live or catch-up mode allows |
+| `src/disputes.rs` | Dispute alerts: each kind-38386 status as a step on the dispute's timeline, sent or edited as the live or catch-up mode allows |
+| `src/timeline.rs` | One message per dispute: the timeline steps, their storage format, the MarkdownV2 renderer and the redraw |
 | `src/config.rs` | TOML configuration parsing and validation |
-| `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, plus Serbero's state per dispute |
+| `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, their timeline steps, and Serbero's state per dispute |
 | `src/serbero/` | Serbero alerts: decoding Serbero's DMs (`dm.rs`), key discovery (`discovery.rs`), subscription and catch-up (`sync.rs`), relaying to Telegram (`alerts.rs`, `render.rs`, `telegram.rs`) |
 | `src/solver/` | Solver notifications: Mostrix's messages (`protocol.rs`), link codes and Telegram commands (`code.rs`, `commands.rs`), storage (`store.rs`), subscriptions and catch-up (`sync.rs`), batching and delivery (`notifier.rs`, `inbox.rs`) |
 | `src/version.rs` | Version and commit reporting for the CLI and the `/version` command |
@@ -126,6 +127,14 @@ erode the signal admins rely on.
 The deliberate exceptions are the startup message, which is sent
 unconditionally on every launch, and the heartbeat, which is off by default and
 enabled with `heartbeat_enabled`.
+
+### One message per dispute
+
+A dispute has one channel message, rendered from its timeline
+(`dispute_timeline`) and edited in place. Anything that happens to a dispute
+appends a step and redraws the message; nothing formats a dispute's state on
+its own. New messages, which notify, are sent only for a live dispute status
+and for the Serbero handoff and takeover pings.
 
 For the same reason, bot commands such as `/version` are answered in private
 chats only. `is_answerable_chat` enforces this; a command sent in a group or

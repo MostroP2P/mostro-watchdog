@@ -264,17 +264,27 @@ docker build --build-arg GIT_COMMIT=$(git rev-parse --short HEAD) -t mostro-watc
 
 ## Alert Format
 
-When a dispute is detected, you'll receive a message like:
+Each dispute gets **one** message in the chat, sent when the dispute opens and
+edited in place as it goes on. Its header says where the dispute stands and the
+timeline below it says how it got there, in the order things happened:
 
 ```text
-🚨 NEW DISPUTE
+⚖️ DISPUTE 96629381-bcb8-4d4f-8c66-e8f86f3e86ea
+Status: ✅ RESOLVED · released by seller
 
-📋 Dispute ID: abc123def456
-👤 Initiated by: buyer
-⏰ Time: 2026-02-11 18:30:00 UTC
+🚨 09:41:02 Opened by buyer
+🤖 09:41:03 Taken by Serbero
+🤖 09:41:05 Serbero mediating
+🙋 09:48:53 Serbero handed off · facts gathered
+🔓 10:07:21 Released by seller · resolved by the parties
 
-⚡ Please take this dispute in Mostrix or your admin client.
+All times UTC · 2026-10-10
 ```
+
+Edits do not notify, so the moments that need a person (Serbero handing a
+dispute off, a solver taking it over) still send a reply to the dispute's
+message. Solvers show by the name given in `[alerts.solver_names]`, or by a
+shortened pubkey. See [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md).
 
 ## Serbero Alerts
 
@@ -283,10 +293,11 @@ solver and hands them to human solvers when needed. While it mediates, Mostro sh
 the dispute as `in-progress`, so the group would never learn that a handoff happened.
 With Serbero alerts on, the watchdog:
 
-- adds Serbero's latest step to the dispute's message, e.g. `🤖 Serbero: mediating`
-  or `🙋 Serbero: handed off (conflicting claims) — a solver must take it over`;
+- adds each of Serbero's steps to the dispute's timeline, e.g. `🤖 Serbero mediating`
+  or `🙋 Serbero handed off · conflicting claims`;
 - sends a new message when a solver then takes the dispute over from Serbero
-  (`👨‍⚖️ SOLVER TOOK OVER FROM SERBERO`), so the chat follows the dispute end to end;
+  (`👨‍⚖️ SOLVER TOOK OVER FROM SERBERO`), so the chat follows the dispute end to end
+  (`takeover_message`; the takeover shows on the timeline either way);
 - sends a new message when Serbero hands a dispute off or cannot start mediating it,
   as a reply to the dispute's message:
 
@@ -359,8 +370,10 @@ Mostrix speaks, and its limits.
 | `nostr.relays` | Array of Nostr relay WebSocket URLs |
 | `telegram.bot_token` | Telegram bot API token |
 | `telegram.chat_id` | Telegram chat/group/channel ID for alerts |
-| `alerts.serbero_handoff` | New message when Serbero hands a dispute off and when a solver takes it over (default: `true`) |
-| `alerts.serbero_progress` | Serbero's progress on dispute messages (default: `true`) |
+| `alerts.serbero_handoff` | New message when Serbero hands a dispute off or cannot start mediating it (default: `true`) |
+| `alerts.serbero_progress` | Serbero's steps on the dispute's timeline (default: `true`) |
+| `alerts.takeover_message` | New message when a solver takes a dispute over from Serbero (default: `true`) |
+| `alerts.solver_names` | Table of solver pubkeys (hex) to the name shown on the timeline (default: none) |
 | `serbero.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
 | `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |
 | `solver_notifications.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |

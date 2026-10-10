@@ -51,10 +51,6 @@ pub enum Call {
         message_id: i32,
         text: String,
     },
-    Delete {
-        chat_id: i64,
-        message_id: i32,
-    },
 }
 
 /// Records the calls it gets; fails them all while `down` is set, and the
@@ -84,13 +80,6 @@ impl FakeTelegram {
         self.calls()
             .into_iter()
             .filter(|c| matches!(c, Call::Edit { .. }))
-            .collect()
-    }
-
-    pub fn deletes(&self) -> Vec<Call> {
-        self.calls()
-            .into_iter()
-            .filter(|c| matches!(c, Call::Delete { .. }))
             .collect()
     }
 
@@ -137,15 +126,6 @@ impl Messenger for FakeTelegram {
             chat_id,
             message_id,
             text: text.into(),
-        });
-        Ok(())
-    }
-
-    async fn delete(&self, chat_id: i64, message_id: i32) -> Result<(), RequestError> {
-        self.reachable()?;
-        self.calls.lock().unwrap().push(Call::Delete {
-            chat_id,
-            message_id,
         });
         Ok(())
     }

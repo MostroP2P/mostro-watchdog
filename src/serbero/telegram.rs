@@ -7,7 +7,7 @@ use teloxide::prelude::*;
 use teloxide::types::{MessageId, ParseMode, ReplyParameters};
 use teloxide::{ApiError, RequestError};
 
-/// Sends, edits and deletes MarkdownV2 messages.
+/// Sends and edits MarkdownV2 messages.
 pub trait Messenger: Sync {
     /// Sends `text`, as a reply to message `reply_to` when given. Returns
     /// the id of the sent message.
@@ -24,13 +24,6 @@ pub trait Messenger: Sync {
         chat_id: i64,
         message_id: i32,
         text: &str,
-    ) -> impl Future<Output = Result<(), RequestError>> + Send;
-
-    /// Deletes message `message_id`.
-    fn delete(
-        &self,
-        chat_id: i64,
-        message_id: i32,
     ) -> impl Future<Output = Result<(), RequestError>> + Send;
 }
 
@@ -65,11 +58,5 @@ impl Messenger for Bot {
             Err(RequestError::Api(ApiError::MessageNotModified)) => Ok(()),
             Err(e) => Err(e),
         }
-    }
-
-    async fn delete(&self, chat_id: i64, message_id: i32) -> Result<(), RequestError> {
-        self.delete_message(ChatId(chat_id), MessageId(message_id))
-            .await
-            .map(|_| ())
     }
 }
