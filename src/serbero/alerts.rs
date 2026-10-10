@@ -400,17 +400,16 @@ mod tests {
         fx.telegram.set_down(true);
 
         let first = fx.alerts().relay(&handoff).await;
+        assert!(matches!(first, Err(AlertError::Telegram(_))), "{first:?}");
+        assert!(!fx
+            .store
+            .serbero_header_handled(DISPUTE, "handed off: uncertain")
+            .await
+            .unwrap());
         fx.telegram.set_down(false);
+
         let second = fx.alerts().relay(&handoff).await.unwrap();
 
-        assert!(matches!(first, Err(AlertError::Telegram(_))), "{first:?}");
-        assert!(
-            !fx.store
-                .serbero_header_handled(DISPUTE, "handed off: uncertain")
-                .await
-                .unwrap()
-                || second != Outcome::Duplicate
-        );
         assert_eq!(second, Outcome::Relayed { redrawn: true });
         assert!(fx.telegram.sends().is_empty());
         assert!(matches!(
