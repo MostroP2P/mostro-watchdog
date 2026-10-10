@@ -254,9 +254,10 @@ asking for the key to be moved to `[[observers]]`.
 - On every start, every 10 minutes (or every `nip65_refresh_interval`, if
   shorter) and after each switch of relays, the watchdog fetches the last 24
   hours of Serbero's messages, so updates sent while it was down are relayed.
-- A handoff alert that Telegram rejected is retried by an early fetch, after
-  30 seconds and then after doubling delays while failures last.
-- A handoff for a dispute the watchdog already saw resolved sends no alert.
+- An update the watchdog could not show (Telegram rejected the edit of the
+  dispute's message) or could not record (a database error) is retried by an
+  early fetch, after 30 seconds and then after doubling delays while failures
+  last. The step joins the timeline once however many times it is retried.
 - Updates move a dispute only forward (mediating, then guidance, then
   handoff): Serbero dates a retried message when it sends it, so a late
   `mediating` never replaces a handoff.

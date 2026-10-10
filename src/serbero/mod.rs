@@ -269,10 +269,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_failed_relay_asks_for_an_early_catch_up() {
-        // The store is what can fail a relay: edits only warn.
+        // Telegram rejects the edit of the dispute's message.
         let fx = Fixture::new().await;
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "base")
+            .await
+            .unwrap();
+        fx.store.set_sent_at(DISPUTE, 1).await.unwrap();
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
-        fx.store.close().await;
+        fx.telegram.set_down(true);
 
         let outcome = inbox
             .receive(&fx.dm("handed off: flood", 100), &fx.alerts())

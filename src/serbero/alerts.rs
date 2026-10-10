@@ -5,8 +5,8 @@
 use super::dm::{HeaderUpdate, Update};
 use super::telegram::Messenger;
 use crate::db::{DisputeMessageStore, SerberoState};
-use crate::timeline::{self, EntryKind, Names};
-use tracing::warn;
+use crate::timeline::{self, EntryKind, Names, RedrawError};
+use tracing::info;
 
 /// Why an update could not be relayed. It is not recorded as relayed, so
 /// the next delivery of the same DM tries again.
@@ -49,9 +49,11 @@ fn timeline_step(update: &Update) -> (EntryKind, Option<&str>) {
 }
 
 impl<M: Messenger> SerberoAlerts<'_, M> {
-    /// Relays one update, at most once per dispute and subject. A failed
-    /// redraw does not hold it back: edits do not notify, and the step
-    /// shows on the dispute's next redraw anyway.
+    /// Relays one update, at most once per dispute and subject. The update
+    /// is marked as relayed only once the dispute's message shows it, so a
+    /// redraw Telegram rejected is retried when the DM arrives again (an
+    /// early catch-up, the next periodic one, a restart). The timeline step
+    /// is kept once however many times that happens.
     pub async fn relay(&self, update: &HeaderUpdate) -> Result<Outcome, AlertError> {
         let subject = update.update.subject();
         if self
@@ -75,7 +77,7 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
                     seconds(update.created_at),
                 )
                 .await?;
-            self.redraw(&update.dispute_id).await
+            self.redraw(&update.dispute_id).await?
         };
         self.store
             .mark_serbero_header_handled(&update.dispute_id, &subject, seconds(update.created_at))
@@ -101,21 +103,21 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
     }
 
     /// Shows the dispute's timeline, with the step just added, on its
-    /// message. Edits do not notify, so a failure is logged and not
-    /// retried: the step also shows on the next redraw.
-    async fn redraw(&self, dispute_id: &str) -> bool {
+    /// message. The message is the only place the step shows, so a failed
+    /// edit is an error: the update stays unrelayed and is retried.
+    async fn redraw(&self, dispute_id: &str) -> Result<bool, AlertError> {
         match timeline::redraw(self.store, self.telegram, &self.names, dispute_id).await {
-            Ok(Some(_)) => true,
+            Ok(Some(_)) => Ok(true),
             // No message yet: the step shows on the dispute's first alert.
-            Ok(None) => false,
-            Err(e) => {
-                warn!(
+            Ok(None) => {
+                info!(
                     dispute_id,
-                    error = %e,
-                    "Failed to show Serbero's update on the dispute message"
+                    "No dispute message yet; Serbero's step waits for it"
                 );
-                false
+                Ok(false)
             }
+            Err(RedrawError::Store(e)) => Err(AlertError::Store(e)),
+            Err(RedrawError::Telegram(e)) => Err(AlertError::Telegram(e)),
         }
     }
 }
@@ -384,20 +386,38 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_failed_redraw_still_counts_the_update_as_relayed() {
+    async fn a_failed_redraw_is_retried_on_the_next_delivery() {
+        // The message is the only place a handoff shows, so an edit that
+        // Telegram rejected leaves the update unrelayed; the next delivery
+        // (an early catch-up) edits again, and the step is kept once.
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
             .await
             .unwrap();
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
+        let handoff = update(handed_off("uncertain"), AT);
         fx.telegram.set_down(true);
 
-        let outcome = fx.alerts().relay(&update(Update::Mediating, AT)).await;
+        let first = fx.alerts().relay(&handoff).await;
+        fx.telegram.set_down(false);
+        let second = fx.alerts().relay(&handoff).await.unwrap();
 
-        // Edits do not notify, so there is nothing to retry: the step shows
-        // on the dispute's next redraw.
-        assert_eq!(outcome.unwrap(), Outcome::Relayed { redrawn: false });
+        assert!(matches!(first, Err(AlertError::Telegram(_))), "{first:?}");
+        assert!(
+            !fx.store
+                .serbero_header_handled(DISPUTE, "handed off: uncertain")
+                .await
+                .unwrap()
+                || second != Outcome::Duplicate
+        );
+        assert_eq!(second, Outcome::Relayed { redrawn: true });
+        assert!(fx.telegram.sends().is_empty());
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { message_id: 42, text, .. }]
+                if text.matches("Serbero handed off · uncertain").count() == 1
+        ));
     }
 
     #[tokio::test]
