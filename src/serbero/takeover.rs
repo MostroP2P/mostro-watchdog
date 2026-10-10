@@ -7,13 +7,12 @@
 //! reported on means a person took it over from Serbero.
 
 use mostro_core::dispute::Status;
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
 use super::alerts::{reply_target, seconds, AlertError, SerberoAlerts};
-use super::dm::Update;
-use super::render::{status_line, takeover_alert, with_status_line, DisputeStage};
+use super::render::takeover_alert;
 use super::telegram::Messenger;
-use crate::db::{RecordedStatus, StoredMessage};
+use crate::db::RecordedStatus;
 
 /// `handle_dispute_event`'s placeholder for an event without a `d` tag.
 const UNKNOWN_DISPUTE: &str = "unknown";
@@ -47,24 +46,18 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         if !is_takeover(previous.as_ref(), status, at) {
             return Ok(());
         }
-        let Some(state) = self.store.serbero_state(dispute_id).await? else {
+        if self.store.serbero_state(dispute_id).await?.is_none() {
             return Ok(());
-        };
+        }
         if !self.store.record_takeover(dispute_id, at).await? {
             return Ok(());
         }
         info!(dispute_id, "A solver took the dispute over from Serbero");
-        let message = self.store.get_message(dispute_id).await?;
-        if self.show_progress {
-            if let (Some(update), Some(message)) =
-                (Update::from_subject(&state.subject), message.as_ref())
-            {
-                self.redraw_taken_over(dispute_id, &update, message).await;
-            }
-        }
-        // Recorded before sending: a takeover is seen once, so a failed
-        // send cannot be retried, but the dispute's message still shows it.
-        if self.send_handoffs {
+        // The takeover shows on the dispute's timeline from the event
+        // itself. Recorded before sending: a takeover is seen once, so a
+        // failed send cannot be retried.
+        if self.send_takeovers {
+            let message = self.store.get_message(dispute_id).await?;
             let reply_to = reply_target(message.as_ref(), self.chat_id);
             self.telegram
                 .send(
@@ -75,31 +68,6 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
                 .await?;
         }
         Ok(())
-    }
-
-    /// Makes Serbero's line on the dispute's message say a solver took it
-    /// over. Done here because the dispute's own alert may be turned off for
-    /// `in-progress`, leaving the message asking for a solver. Edits do not
-    /// notify, so a failure is logged: the line also shows on the dispute's
-    /// next alert.
-    async fn redraw_taken_over(&self, dispute_id: &str, update: &Update, message: &StoredMessage) {
-        // Stored before Serbero alerts: redrawing it would lose the alert.
-        let Some(base) = message.text.as_deref() else {
-            return;
-        };
-        let line = status_line(update, DisputeStage::TakenOver);
-        let text = with_status_line(base, Some(&line));
-        if let Err(e) = self
-            .telegram
-            .edit(message.chat_id, message.message_id, &text)
-            .await
-        {
-            warn!(
-                dispute_id,
-                error = %e,
-                "Failed to show the takeover on the dispute message"
-            );
-        }
     }
 }
 
@@ -117,6 +85,7 @@ mod tests {
     use super::*;
     use crate::db::{DisputeMessageStore, SerberoState};
     use crate::serbero::testing::{Call, FakeTelegram};
+    use crate::timeline::Names;
 
     const DISPUTE: &str = "58511141-6e3f-4b87-9c4a-1f2e3d4c5b6a";
     const CHAT: i64 = -100_123;
@@ -151,6 +120,8 @@ mod tests {
                 chat_id: CHAT,
                 show_progress: true,
                 send_handoffs: true,
+                send_takeovers: true,
+                names: Names::default(),
             }
         }
 
@@ -173,17 +144,6 @@ mod tests {
                 )
                 .await
                 .unwrap();
-        }
-    }
-
-    /// The dispute's message once Serbero's line says a solver took over.
-    fn taken_over_redraw() -> Call {
-        Call::Edit {
-            chat_id: CHAT,
-            message_id: 42,
-            text:
-                "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over"
-                    .into(),
         }
     }
 
@@ -240,16 +200,15 @@ mod tests {
             .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
             .await;
 
+        // The takeover step itself comes from the dispute event, through
+        // the timeline; here only the reply goes out.
         assert_eq!(
             fx.telegram.calls(),
-            vec![
-                taken_over_redraw(),
-                Call::Send {
-                    chat_id: CHAT,
-                    text: takeover_alert(DISPUTE, TAKEN_OVER),
-                    reply_to: Some(42),
-                },
-            ]
+            vec![Call::Send {
+                chat_id: CHAT,
+                text: takeover_alert(DISPUTE, TAKEN_OVER),
+                reply_to: Some(42),
+            }]
         );
         assert!(fx.store.taken_over(DISPUTE).await.unwrap());
     }
@@ -321,9 +280,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn turned_off_handoff_alerts_still_redraw_the_dispute_message() {
-        // Serbero's line must stop asking for a solver either way, also when
-        // the `in-progress` alert is off and nothing else edits the message.
+    async fn turned_off_handoff_alerts_still_send_the_takeover_message() {
+        // `serbero_handoff` and `takeover_message` are separate toggles.
         let fx = Fixture::new().await;
         fx.handed_off().await;
         let alerts = SerberoAlerts {
@@ -335,7 +293,31 @@ mod tests {
             .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
             .await;
 
-        assert_eq!(fx.telegram.calls(), vec![taken_over_redraw()]);
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Send {
+                reply_to: Some(42),
+                ..
+            }]
+        ));
+        assert!(fx.store.taken_over(DISPUTE).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn a_turned_off_takeover_message_is_only_recorded() {
+        // The takeover still shows on the dispute's timeline.
+        let fx = Fixture::new().await;
+        fx.handed_off().await;
+        let alerts = SerberoAlerts {
+            send_takeovers: false,
+            ..fx.alerts()
+        };
+
+        alerts
+            .note_dispute_status(DISPUTE, "in-progress", TAKEN_OVER)
+            .await;
+
+        assert_eq!(fx.telegram.calls(), vec![]);
         assert!(fx.store.taken_over(DISPUTE).await.unwrap());
     }
 

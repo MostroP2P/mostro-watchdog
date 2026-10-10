@@ -9,13 +9,8 @@ use crate::{chrono_timestamp, escape_markdown, escape_markdown_code};
 const TAKE_OVER_HINT: &str =
     "⚡ A solver must take it over in Mostrix \\(Ctrl\\+T on Disputes Pending\\)\\.";
 
-/// Whether a dispute still waits for a solver, by its kind-38386 status.
-pub fn dispute_is_open(status: &str) -> bool {
-    matches!(status.parse(), Ok(Status::Initiated | Status::InProgress))
-}
-
-/// The cooperative-cancel status of older nodes, which `handle_dispute_event`
-/// treats as the end of the dispute (it deletes the dispute's message).
+/// The cooperative-cancel status of older nodes, shown as the end of the
+/// dispute's timeline.
 const CANCELED_STATUS: &str = "canceled";
 
 /// Whether a dispute is over, by its kind-38386 status. A status this
@@ -35,74 +30,6 @@ pub fn dispute_is_resolved(status: &str) -> bool {
 /// `conflicting claims`.
 pub fn humanize(word: &str) -> String {
     word.replace('_', " ")
-}
-
-/// Where a dispute stands for Serbero's line under its alert.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DisputeStage {
-    /// Still waiting for a solver, or held by Serbero.
-    Open,
-    /// A solver took the dispute over from Serbero; it stays so once the
-    /// dispute closes.
-    TakenOver,
-    /// Resolved, or in a status this version does not know.
-    Closed,
-}
-
-impl DisputeStage {
-    /// The stage of a dispute in kind-38386 `status`, `taken_over` when a
-    /// solver took it over from Serbero.
-    pub fn of(status: &str, taken_over: bool) -> Self {
-        if taken_over {
-            Self::TakenOver
-        } else if dispute_is_open(status) {
-            Self::Open
-        } else {
-            Self::Closed
-        }
-    }
-}
-
-/// The line shown under a dispute's alert for Serbero's latest state. It
-/// asks for a solver only while one is still needed, so it stays true once
-/// a solver takes over or the dispute closes.
-pub fn status_line(update: &Update, stage: DisputeStage) -> String {
-    let (icon, state) = match update {
-        Update::Mediating if stage == DisputeStage::Open => ("🤖", "mediating".to_owned()),
-        Update::Mediating => ("🤖", "mediated".to_owned()),
-        Update::GuidanceSent { path } => (
-            "🤖",
-            detailed(
-                "guided the parties to resolve it themselves",
-                path.as_deref(),
-            ),
-        ),
-        Update::HandedOff { reason } => ("🙋", detailed("handed off", reason.as_deref())),
-        Update::CouldNotStart => ("🙋", "mediation could not start".to_owned()),
-    };
-    let state = match stage {
-        DisputeStage::TakenOver => format!("{state} — a solver took it over"),
-        DisputeStage::Open if update.needs_human() => {
-            format!("{state} — a solver must take it over")
-        }
-        DisputeStage::Open | DisputeStage::Closed => state,
-    };
-    format!("{icon} *Serbero:* {}", escape_markdown(&state))
-}
-
-fn detailed(text: &str, detail: Option<&str>) -> String {
-    match detail {
-        Some(detail) => format!("{text} ({})", humanize(detail)),
-        None => text.to_owned(),
-    }
-}
-
-/// A dispute's alert text with Serbero's line, when there is one.
-pub fn with_status_line(base: &str, line: Option<&str>) -> String {
-    match line {
-        Some(line) => format!("{base}\n\n{line}"),
-        None => base.to_owned(),
-    }
 }
 
 /// The new message sent when Serbero needs a human solver for a dispute.
@@ -164,22 +91,6 @@ mod tests {
     }
 
     #[test]
-    fn only_initiated_and_in_progress_disputes_are_open() {
-        assert!(dispute_is_open("initiated"));
-        assert!(dispute_is_open("in-progress"));
-        for other in [
-            "settled",
-            "seller-refunded",
-            "released",
-            "canceled",
-            "cooperatively-canceled",
-            "unknown",
-        ] {
-            assert!(!dispute_is_open(other), "{other}");
-        }
-    }
-
-    #[test]
     fn only_known_outcomes_count_as_resolved() {
         for resolved in [
             "settled",
@@ -196,80 +107,6 @@ mod tests {
         for other in ["initiated", "in-progress", "some-new-status", ""] {
             assert!(!dispute_is_resolved(other), "{other}");
         }
-    }
-
-    #[test]
-    fn progress_lines_while_the_dispute_is_open() {
-        assert_eq!(
-            status_line(&Update::Mediating, DisputeStage::Open),
-            "🤖 *Serbero:* mediating"
-        );
-        assert_eq!(
-            status_line(
-                &Update::GuidanceSent {
-                    path: Some("payment_arrived".into())
-                },
-                DisputeStage::Open
-            ),
-            "🤖 *Serbero:* guided the parties to resolve it themselves \\(payment arrived\\)"
-        );
-        assert_eq!(
-            status_line(&Update::GuidanceSent { path: None }, DisputeStage::Open),
-            "🤖 *Serbero:* guided the parties to resolve it themselves"
-        );
-    }
-
-    #[test]
-    fn handoff_lines_ask_for_a_solver_while_the_dispute_is_open() {
-        assert_eq!(
-            status_line(&handed_off("conflicting_claims"), DisputeStage::Open),
-            "🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver must take it over"
-        );
-        assert_eq!(
-            status_line(&Update::HandedOff { reason: None }, DisputeStage::Open),
-            "🙋 *Serbero:* handed off — a solver must take it over"
-        );
-        assert_eq!(
-            status_line(&Update::CouldNotStart, DisputeStage::Open),
-            "🙋 *Serbero:* mediation could not start — a solver must take it over"
-        );
-    }
-
-    #[test]
-    fn lines_stay_true_once_the_dispute_is_closed() {
-        assert_eq!(
-            status_line(&Update::Mediating, DisputeStage::Closed),
-            "🤖 *Serbero:* mediated"
-        );
-        assert_eq!(
-            status_line(&handed_off("fraud_signal"), DisputeStage::Closed),
-            "🙋 *Serbero:* handed off \\(fraud signal\\)"
-        );
-        assert_eq!(
-            status_line(&Update::CouldNotStart, DisputeStage::Closed),
-            "🙋 *Serbero:* mediation could not start"
-        );
-        assert_eq!(
-            status_line(
-                &Update::GuidanceSent {
-                    path: Some("payment_not_sent".into())
-                },
-                DisputeStage::Closed
-            ),
-            "🤖 *Serbero:* guided the parties to resolve it themselves \\(payment not sent\\)"
-        );
-    }
-
-    #[test]
-    fn the_status_line_goes_below_the_alert() {
-        assert_eq!(
-            with_status_line("🚨 *NEW DISPUTE*", Some("🤖 *Serbero:* mediating")),
-            "🚨 *NEW DISPUTE*\n\n🤖 *Serbero:* mediating"
-        );
-        assert_eq!(
-            with_status_line("🚨 *NEW DISPUTE*", None),
-            "🚨 *NEW DISPUTE*"
-        );
     }
 
     #[test]
@@ -326,36 +163,6 @@ mod tests {
         let alert = needs_human_alert("a`b\\c", &Update::CouldNotStart, AT).expect("alert");
 
         assert!(alert.contains("`a\\`b\\\\c`"), "{alert}");
-    }
-
-    #[test]
-    fn a_takeover_outranks_the_dispute_status() {
-        assert_eq!(DisputeStage::of("initiated", false), DisputeStage::Open);
-        assert_eq!(DisputeStage::of("in-progress", false), DisputeStage::Open);
-        assert_eq!(DisputeStage::of("settled", false), DisputeStage::Closed);
-        assert_eq!(
-            DisputeStage::of("in-progress", true),
-            DisputeStage::TakenOver
-        );
-        // A dispute closed after the takeover keeps saying who took it.
-        assert_eq!(DisputeStage::of("settled", true), DisputeStage::TakenOver);
-    }
-
-    #[test]
-    fn lines_say_a_solver_took_over_instead_of_asking_for_one() {
-        assert_eq!(
-            status_line(&handed_off("conflicting_claims"), DisputeStage::TakenOver),
-            "🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over"
-        );
-        assert_eq!(
-            status_line(&Update::CouldNotStart, DisputeStage::TakenOver),
-            "🙋 *Serbero:* mediation could not start — a solver took it over"
-        );
-        // Serbero stops mediating as soon as a solver takes over.
-        assert_eq!(
-            status_line(&Update::Mediating, DisputeStage::TakenOver),
-            "🤖 *Serbero:* mediated — a solver took it over"
-        );
     }
 
     #[test]

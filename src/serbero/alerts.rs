@@ -2,12 +2,11 @@
 //! redraw and when to ask the team for a solver.
 
 use super::dm::{HeaderUpdate, Update};
-use super::render::{
-    dispute_is_resolved, needs_human_alert, status_line, with_status_line, DisputeStage,
-};
+use super::render::{dispute_is_resolved, needs_human_alert};
 use super::telegram::Messenger;
 use crate::db::{DisputeMessageStore, SerberoState, StoredMessage};
-use tracing::{error, info, warn};
+use crate::timeline::{self, EntryKind, Names};
+use tracing::{info, warn};
 
 /// Why an update could not be relayed. It is not recorded as relayed, so
 /// the next delivery of the same DM tries again.
@@ -38,9 +37,23 @@ pub struct SerberoAlerts<'a, M> {
     /// `[alerts] serbero_progress`: show Serbero's state on the dispute's
     /// message.
     pub show_progress: bool,
-    /// `[alerts] serbero_handoff`: send a message when a solver is needed
-    /// and when one takes the dispute over.
+    /// `[alerts] serbero_handoff`: send a message when a solver is needed.
     pub send_handoffs: bool,
+    /// `[alerts] takeover_message`: send a message when a solver takes the
+    /// dispute over from Serbero.
+    pub send_takeovers: bool,
+    /// How solvers are named on the timeline.
+    pub names: Names,
+}
+
+/// The timeline step a Serbero update adds.
+fn timeline_step(update: &Update) -> (EntryKind, Option<&str>) {
+    match update {
+        Update::Mediating => (EntryKind::SerberoMediating, None),
+        Update::GuidanceSent { path } => (EntryKind::SerberoGuided, path.as_deref()),
+        Update::HandedOff { reason } => (EntryKind::SerberoHandedOff, reason.as_deref()),
+        Update::CouldNotStart => (EntryKind::SerberoCouldNotStart, None),
+    }
 }
 
 impl<M: Messenger> SerberoAlerts<'_, M> {
@@ -56,12 +69,20 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         {
             return Ok(Outcome::Duplicate);
         }
-        let is_latest = self.record_state(update, &subject).await?;
+        self.record_state(update, &subject).await?;
+        let (kind, detail) = timeline_step(&update.update);
+        let is_new_step = self
+            .store
+            .append_timeline(
+                &update.dispute_id,
+                kind.as_str(),
+                detail,
+                seconds(update.created_at),
+            )
+            .await?;
         let message = self.store.get_message(&update.dispute_id).await?;
         let taken_over = self.store.taken_over(&update.dispute_id).await?;
-        let redrawn = is_latest
-            && self.show_progress
-            && self.redraw(update, message.as_ref(), taken_over).await;
+        let redrawn = is_new_step && self.show_progress && self.redraw(&update.dispute_id).await;
         let alerted =
             self.send_handoffs && !taken_over && self.alert(update, message.as_ref()).await?;
         self.store
@@ -87,42 +108,19 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         Ok(true)
     }
 
-    /// Shows `update` on the dispute's message. Edits do not notify, so a
-    /// failure is logged and not retried: the line also shows on the
-    /// dispute's next alert.
-    async fn redraw(
-        &self,
-        update: &HeaderUpdate,
-        message: Option<&StoredMessage>,
-        taken_over: bool,
-    ) -> bool {
-        // No message yet: the state shows on the dispute's first alert.
-        let Some(message) = message else {
-            return false;
-        };
-        let Some(base) = message.text.as_deref() else {
-            info!(
-                dispute_id = %update.dispute_id,
-                "Dispute message predates Serbero alerts; Serbero's state shows from its next update"
-            );
-            return false;
-        };
-        let line = status_line(
-            &update.update,
-            DisputeStage::of(&message.status, taken_over),
-        );
-        let text = with_status_line(base, Some(&line));
-        match self
-            .telegram
-            .edit(message.chat_id, message.message_id, &text)
-            .await
-        {
-            Ok(()) => true,
+    /// Shows the dispute's timeline, with the step just added, on its
+    /// message. Edits do not notify, so a failure is logged and not
+    /// retried: the step also shows on the next redraw.
+    async fn redraw(&self, dispute_id: &str) -> bool {
+        match timeline::redraw(self.store, self.telegram, &self.names, dispute_id).await {
+            Ok(Some(_)) => true,
+            // No message yet: the step shows on the dispute's first alert.
+            Ok(None) => false,
             Err(e) => {
                 warn!(
-                    dispute_id = %update.dispute_id,
+                    dispute_id,
                     error = %e,
-                    "Failed to show Serbero's state on the dispute message"
+                    "Failed to show Serbero's update on the dispute message"
                 );
                 false
             }
@@ -184,37 +182,6 @@ pub fn supersedes(update: &HeaderUpdate, stored: Option<&SerberoState>) -> bool 
     (update.update.stage(), seconds(update.created_at)) >= (stored_stage, stored.created_at)
 }
 
-/// `base` with Serbero's latest state for the dispute appended, when there
-/// is one and progress is shown. A store error leaves `base` unchanged: the
-/// dispute alert matters more than Serbero's line.
-pub async fn decorate(
-    store: &DisputeMessageStore,
-    dispute_id: &str,
-    status: &str,
-    base: &str,
-    show_progress: bool,
-) -> String {
-    if !show_progress {
-        return base.to_owned();
-    }
-    let update = match store.serbero_state(dispute_id).await {
-        Ok(state) => state.and_then(|s| Update::from_subject(&s.subject)),
-        Err(e) => {
-            error!(dispute_id, error = %e, "Failed to read Serbero's state for the dispute");
-            None
-        }
-    };
-    let Some(update) = update else {
-        return base.to_owned();
-    };
-    let taken_over = store.taken_over(dispute_id).await.unwrap_or_else(|e| {
-        error!(dispute_id, error = %e, "Failed to read whether a solver took the dispute over");
-        false
-    });
-    let line = status_line(&update, DisputeStage::of(status, taken_over));
-    with_status_line(base, Some(&line))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -256,6 +223,8 @@ mod tests {
                 chat_id: CHAT,
                 show_progress: true,
                 send_handoffs: true,
+                send_takeovers: true,
+                names: Names::default(),
             }
         }
     }
@@ -281,6 +250,18 @@ mod tests {
         }
     }
 
+    /// The texts of the edits made, in order.
+    fn edit_texts(telegram: &FakeTelegram) -> Vec<String> {
+        telegram
+            .edits()
+            .into_iter()
+            .map(|call| match call {
+                Call::Edit { text, .. } => text,
+                Call::Send { .. } => unreachable!(),
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn a_handoff_redraws_the_dispute_message_and_replies_with_an_alert() {
         let fx = Fixture::new().await;
@@ -302,22 +283,15 @@ mod tests {
                 alerted: true
             }
         );
-        assert_eq!(
-            fx.telegram.calls(),
-            vec![
-                Call::Edit {
-                    chat_id: CHAT,
-                    message_id: 42,
-                    text: "🔄 *DISPUTE IN PROGRESS*\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver must take it over".into(),
-                },
-                Call::Send {
-                    chat_id: CHAT,
-                    text: needs_human_alert(DISPUTE, &handed_off("conflicting_claims"), AT)
-                        .unwrap(),
-                    reply_to: Some(42),
-                },
-            ]
-        );
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [
+                Call::Edit { chat_id: CHAT, message_id: 42, text },
+                Call::Send { chat_id: CHAT, text: alert, reply_to: Some(42) },
+            ] if text.contains("*Status:* 🙋 NEEDS A SOLVER · handed off · conflicting claims")
+                && text.contains("🙋 `00:00:00` Serbero handed off · conflicting claims")
+                && *alert == needs_human_alert(DISPUTE, &handed_off("conflicting_claims"), AT).unwrap()
+        ));
         assert_eq!(
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: conflicting_claims", AT as i64))
@@ -345,14 +319,12 @@ mod tests {
                 alerted: false
             }
         );
-        assert_eq!(
-            fx.telegram.calls(),
-            vec![Call::Edit {
-                chat_id: CHAT,
-                message_id: 42,
-                text: "base\n\n🤖 *Serbero:* mediating".into(),
-            }]
-        );
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { chat_id: CHAT, message_id: 42, text }]
+                if text.contains("*Status:* 🤖 WITH SERBERO · mediating")
+                    && text.contains("Serbero mediating")
+        ));
     }
 
     #[tokio::test]
@@ -388,6 +360,8 @@ mod tests {
             chat_id: CHAT,
             show_progress: true,
             send_handoffs: true,
+            send_takeovers: true,
+            names: Names::default(),
         };
 
         assert_eq!(alerts.relay(&handoff).await.unwrap(), Outcome::Duplicate);
@@ -450,13 +424,14 @@ mod tests {
             }
         );
         assert_eq!(fx.telegram.sends(), vec![]);
-        assert_eq!(
-            fx.telegram.edits(),
-            vec![Call::Edit {
-                chat_id: CHAT,
-                message_id: 42,
-                text: "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\)".into(),
-            }]
+        assert!(
+            matches!(
+                fx.telegram.edits().as_slice(),
+                [Call::Edit { chat_id: CHAT, message_id: 42, text }]
+                    if text.contains("Serbero handed off · conflicting claims")
+            ),
+            "{:?}",
+            fx.telegram.edits()
         );
     }
 
@@ -580,7 +555,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_older_update_does_not_replace_a_later_state() {
-        // The catch-up fetch returns events in any order.
+        // The catch-up fetch returns events in any order. The older step
+        // still joins the timeline, in its place.
         let fx = Fixture::new().await;
         fx.store
             .insert(DISPUTE, 42, CHAT, "in-progress", "base")
@@ -600,11 +576,16 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Relayed {
-                redrawn: false,
+                redrawn: true,
                 alerted: false
             }
         );
-        assert_eq!(fx.telegram.edits().len(), 1);
+        let edits = edit_texts(&fx.telegram);
+        assert_eq!(edits.len(), 2);
+        assert!(edits[1].contains("*Status:* 🙋 NEEDS A SOLVER · handed off · round limit"));
+        let mediating = edits[1].find("Serbero mediating").unwrap();
+        let handed_off = edits[1].find("Serbero handed off").unwrap();
+        assert!(mediating < handed_off);
         assert_eq!(
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: round_limit", (AT + 60) as i64))
@@ -641,8 +622,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_message_stored_before_the_upgrade_is_not_redrawn() {
-        // Its text was never stored, so redrawing it would lose the alert.
+    async fn a_message_stored_before_the_upgrade_is_redrawn_from_what_is_known() {
+        // Its text was never stored; the timeline starts with this step.
         let fx = Fixture::new().await;
         insert_legacy_row(&fx.path, DISPUTE, 42).await;
 
@@ -655,11 +636,14 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Relayed {
-                redrawn: false,
+                redrawn: true,
                 alerted: true
             }
         );
-        assert_eq!(fx.telegram.edits(), vec![]);
+        assert!(matches!(
+            fx.telegram.edits().as_slice(),
+            [Call::Edit { message_id: 42, text, .. }] if text.contains("Serbero handed off · flood")
+        ));
         assert!(matches!(
             fx.telegram.sends().as_slice(),
             [Call::Send {
@@ -794,35 +778,20 @@ mod tests {
         assert_eq!(
             outcome,
             Outcome::Relayed {
-                redrawn: false,
+                redrawn: true,
                 alerted: false
             }
         );
-        assert_eq!(fx.telegram.edits().len(), 1);
+        let edits = edit_texts(&fx.telegram);
+        assert_eq!(edits.len(), 2);
+        // Shown on the timeline, after the handoff, without the header
+        // asking for Serbero again.
+        assert!(edits[1].contains("*Status:* 🙋 NEEDS A SOLVER · handed off · conflicting claims"));
+        assert!(edits[1]
+            .contains("Serbero handed off · conflicting claims\n🤖 `00:01:40` Serbero mediating"));
         assert_eq!(
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: conflicting_claims", AT as i64))
-        );
-    }
-
-    #[tokio::test]
-    async fn dispute_alerts_show_serberos_latest_state() {
-        let fx = Fixture::new().await;
-        fx.store
-            .save_serbero_state(DISPUTE, &state("handed off: conflicting_claims", 5))
-            .await
-            .unwrap();
-
-        let open = decorate(&fx.store, DISPUTE, "in-progress", "base", true).await;
-        let closed = decorate(&fx.store, DISPUTE, "settled", "base", true).await;
-
-        assert_eq!(
-            open,
-            "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver must take it over"
-        );
-        assert_eq!(
-            closed,
-            "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\)"
         );
     }
 
@@ -849,48 +818,10 @@ mod tests {
                 alerted: false
             }
         );
-        assert_eq!(
-            fx.telegram.calls(),
-            vec![Call::Edit {
-                chat_id: CHAT,
-                message_id: 42,
-                text: "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over".into(),
-            }]
-        );
-    }
-
-    #[tokio::test]
-    async fn dispute_alerts_say_a_solver_took_over() {
-        let fx = Fixture::new().await;
-        fx.store
-            .save_serbero_state(DISPUTE, &state("handed off: conflicting_claims", 5))
-            .await
-            .unwrap();
-        fx.store.record_takeover(DISPUTE, 10).await.unwrap();
-
-        let shown = decorate(&fx.store, DISPUTE, "in-progress", "base", true).await;
-
-        assert_eq!(
-            shown,
-            "base\n\n🙋 *Serbero:* handed off \\(conflicting claims\\) — a solver took it over"
-        );
-    }
-
-    #[tokio::test]
-    async fn dispute_alerts_are_unchanged_without_serbero() {
-        let fx = Fixture::new().await;
-
-        assert_eq!(
-            decorate(&fx.store, DISPUTE, "initiated", "base", true).await,
-            "base"
-        );
-        fx.store
-            .save_serbero_state(DISPUTE, &state("mediating", 5))
-            .await
-            .unwrap();
-        assert_eq!(
-            decorate(&fx.store, DISPUTE, "in-progress", "base", false).await,
-            "base"
-        );
+        assert!(matches!(
+            fx.telegram.calls().as_slice(),
+            [Call::Edit { chat_id: CHAT, message_id: 42, text }]
+                if text.contains("Serbero handed off · conflicting claims")
+        ));
     }
 }

@@ -71,11 +71,6 @@ impl Update {
         }
     }
 
-    /// Handoffs and failed openings mean a person has to take the dispute.
-    pub fn needs_human(&self) -> bool {
-        matches!(self, Self::HandedOff { .. } | Self::CouldNotStart)
-    }
-
     /// Position in a mediation's lifecycle, to order two updates written in
     /// the same second.
     pub fn stage(&self) -> u8 {
@@ -592,14 +587,6 @@ mod tests {
             .subject(),
             "handed off: flood"
         );
-    }
-
-    #[test]
-    fn handoffs_and_failed_openings_need_a_human() {
-        assert!(Update::HandedOff { reason: None }.needs_human());
-        assert!(Update::CouldNotStart.needs_human());
-        assert!(!Update::Mediating.needs_human());
-        assert!(!Update::GuidanceSent { path: None }.needs_human());
     }
 
     #[test]

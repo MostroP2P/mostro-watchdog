@@ -27,6 +27,18 @@ pub struct StoredMessage {
     /// message when Serbero's state changes. `None` for messages stored
     /// before this column existed.
     pub text: Option<String>,
+    /// When the message was sent (Unix seconds, the watchdog's clock).
+    pub created_at: i64,
+}
+
+/// One step of a dispute's timeline, as stored.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineRow {
+    /// `opened`, `taken`, `serbero_mediating`, ... (see `timeline::EntryKind`).
+    pub kind: String,
+    pub detail: Option<String>,
+    /// The `created_at` of the source event or DM, Unix seconds.
+    pub created_at: i64,
 }
 
 /// What Serbero last reported about a dispute.
@@ -114,30 +126,14 @@ impl DisputeMessageStore {
     }
 
     /// Get the message ID for a dispute.
-    pub async fn get_message_id(
-        &self,
-        dispute_id: &str,
-    ) -> Result<Option<(i32, i64)>, sqlx::Error> {
-        let result: Option<(i32, i64)> = sqlx::query_as(
-            r#"
-            SELECT message_id, chat_id FROM dispute_messages WHERE dispute_id = ?
-            "#,
-        )
-        .bind(dispute_id)
-        .fetch_optional(&self.pool)
-        .await?;
-
-        Ok(result)
-    }
-
     /// The stored message for a dispute.
     pub async fn get_message(
         &self,
         dispute_id: &str,
     ) -> Result<Option<StoredMessage>, sqlx::Error> {
-        let row: Option<(i32, i64, String, Option<String>)> = sqlx::query_as(
+        let row: Option<(i32, i64, String, Option<String>, i64)> = sqlx::query_as(
             r#"
-            SELECT message_id, chat_id, status, message_text
+            SELECT message_id, chat_id, status, message_text, created_at
             FROM dispute_messages WHERE dispute_id = ?
             "#,
         )
@@ -145,14 +141,67 @@ impl DisputeMessageStore {
         .fetch_optional(&self.pool)
         .await?;
 
-        Ok(
-            row.map(|(message_id, chat_id, status, text)| StoredMessage {
+        Ok(row.map(
+            |(message_id, chat_id, status, text, created_at)| StoredMessage {
                 message_id,
                 chat_id,
                 status,
                 text,
-            }),
+                created_at,
+            },
+        ))
+    }
+
+    /// Adds a step to a dispute's timeline. Returns whether it is new: the
+    /// same step at the same event time (a redelivery, a re-fetch, a
+    /// restart) is kept once.
+    pub async fn append_timeline(
+        &self,
+        dispute_id: &str,
+        kind: &str,
+        detail: Option<&str>,
+        event_created_at: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query(
+            r#"
+            INSERT OR IGNORE INTO dispute_timeline
+                (dispute_id, kind, detail, event_created_at, recorded_at)
+            VALUES (?, ?, ?, ?, ?)
+            "#,
         )
+        .bind(dispute_id)
+        .bind(kind)
+        .bind(detail)
+        .bind(event_created_at)
+        .bind(now_secs())
+        .execute(&self.pool)
+        .await?;
+
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// A dispute's timeline in event order. Steps can arrive out of order
+    /// (catch-up, relay delays), so the order comes from the event time,
+    /// never from the arrival.
+    pub async fn timeline(&self, dispute_id: &str) -> Result<Vec<TimelineRow>, sqlx::Error> {
+        let rows: Vec<(String, Option<String>, i64)> = sqlx::query_as(
+            r#"
+            SELECT kind, detail, event_created_at FROM dispute_timeline
+            WHERE dispute_id = ? ORDER BY event_created_at, kind
+            "#,
+        )
+        .bind(dispute_id)
+        .fetch_all(&self.pool)
+        .await?;
+
+        Ok(rows
+            .into_iter()
+            .map(|(kind, detail, created_at)| TimelineRow {
+                kind,
+                detail,
+                created_at,
+            })
+            .collect())
     }
 
     /// Update the status for a dispute, with the alert `text` now shown
@@ -179,7 +228,9 @@ impl DisputeMessageStore {
         Ok(())
     }
 
-    /// Delete a dispute record (after cooperative cancellation).
+    /// Deletes a dispute's message record. Test fixtures only: a
+    /// cooperative cancel now closes the dispute's timeline instead.
+    #[cfg(test)]
     pub async fn delete(&self, dispute_id: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -466,6 +517,23 @@ async fn migrate(pool: &SqlitePool) -> Result<(), sqlx::Error> {
     .execute(pool)
     .await?;
 
+    // Everything known about each dispute, in event order, shown as the
+    // dispute's message. The key keeps a redelivered step once.
+    sqlx::query(
+        r#"
+        CREATE TABLE IF NOT EXISTS dispute_timeline (
+            dispute_id TEXT NOT NULL,
+            kind TEXT NOT NULL,
+            detail TEXT,
+            event_created_at INTEGER NOT NULL,
+            recorded_at INTEGER NOT NULL,
+            PRIMARY KEY (dispute_id, kind, event_created_at)
+        )
+        "#,
+    )
+    .execute(pool)
+    .await?;
+
     Ok(())
 }
 
@@ -486,9 +554,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Get the message ID
-        let result = store.get_message_id("dispute-123").await.unwrap();
-        assert_eq!(result, Some((456, -100123)));
+        let message = store.get_message("dispute-123").await.unwrap().unwrap();
+        assert_eq!((message.message_id, message.chat_id), (456, -100123));
 
         // Update status
         store
@@ -498,8 +565,7 @@ mod tests {
 
         // Delete
         store.delete("dispute-123").await.unwrap();
-        let result = store.get_message_id("dispute-123").await.unwrap();
-        assert_eq!(result, None);
+        assert_eq!(store.get_message("dispute-123").await.unwrap(), None);
     }
 
     /// The schema released before Serbero alerts (v0.3.0).
@@ -619,6 +685,7 @@ mod tests {
                 chat_id: -100123,
                 status: "in-progress".into(),
                 text: None,
+                created_at: 1,
             })
         );
         // The new column and tables are usable.
@@ -662,15 +729,18 @@ mod tests {
             .insert("d1", 10, -1, "initiated", "new dispute")
             .await
             .unwrap();
+        let message = store.get_message("d1").await.unwrap().unwrap();
         assert_eq!(
-            store.get_message("d1").await.unwrap(),
-            Some(StoredMessage {
+            message,
+            StoredMessage {
                 message_id: 10,
                 chat_id: -1,
                 status: "initiated".into(),
                 text: Some("new dispute".into()),
-            })
+                created_at: message.created_at,
+            }
         );
+        assert!(message.created_at > 1_700_000_000);
 
         store
             .update_status("d1", "in-progress", "taken")
@@ -680,6 +750,51 @@ mod tests {
         assert_eq!(message.status, "in-progress");
         assert_eq!(message.text.as_deref(), Some("taken"));
         assert_eq!(store.get_message("unknown").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn a_timeline_keeps_each_step_once_in_event_order() {
+        let dir = tempdir().unwrap();
+        let store = DisputeMessageStore::new(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+
+        assert!(store
+            .append_timeline("d1", "resolved", Some("released"), 30)
+            .await
+            .unwrap());
+        assert!(store
+            .append_timeline("d1", "opened", Some("buyer"), 10)
+            .await
+            .unwrap());
+        assert!(store
+            .append_timeline("d1", "serbero_mediating", None, 20)
+            .await
+            .unwrap());
+        // Delivered again: kept once.
+        assert!(!store
+            .append_timeline("d1", "opened", Some("buyer"), 10)
+            .await
+            .unwrap());
+        store
+            .append_timeline("d2", "opened", Some("seller"), 5)
+            .await
+            .unwrap();
+
+        let row = |kind: &str, detail: Option<&str>, created_at: i64| TimelineRow {
+            kind: kind.into(),
+            detail: detail.map(Into::into),
+            created_at,
+        };
+        assert_eq!(
+            store.timeline("d1").await.unwrap(),
+            vec![
+                row("opened", Some("buyer"), 10),
+                row("serbero_mediating", None, 20),
+                row("resolved", Some("released"), 30),
+            ]
+        );
+        assert_eq!(store.timeline("none").await.unwrap(), vec![]);
     }
 
     #[tokio::test]

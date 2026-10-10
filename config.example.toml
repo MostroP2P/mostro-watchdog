@@ -58,14 +58,26 @@ cooperatively_canceled = true
 # Other/unknown status changes (default: true)
 other = true
 
+# A status turned off still goes on the dispute's timeline (an edit, which
+# does not notify); it only never sends a new message.
+
 # Serbero alerts (only with the [serbero] section below)
 # A new message when Serbero hands a dispute off to a human solver or cannot
-# start mediating it, and another when a solver takes it over (default: true)
+# start mediating it (default: true)
 serbero_handoff = true
 
-# Show Serbero's progress (mediating, guidance sent, handed off) on the
-# dispute's message; edits do not notify (default: true)
+# Show Serbero's steps (mediating, guidance sent, handed off) on the
+# dispute's timeline; edits do not notify (default: true)
 serbero_progress = true
+
+# A new message when a solver takes a dispute over from Serbero; the takeover
+# shows on the dispute's timeline either way (default: true)
+takeover_message = true
+
+# Names shown on the timeline for solvers, by pubkey (hex). A solver without
+# a name shows as a shortened pubkey.
+# [alerts.solver_names]
+# "000000e2fdb5000000000000000000000000000000000000000000000000a7f1" = "grunch"
 
 # Health check and monitoring configuration (optional)
 [health]
