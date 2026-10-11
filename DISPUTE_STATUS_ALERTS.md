@@ -67,9 +67,39 @@ other = true           # Unknown statuses (recommended: true)
 ```
 
 A status turned off still goes on the dispute's timeline and still edits the
-dispute's message (edits do not notify); it only never **sends** a new message.
-So with `initiated = false`, a dispute's message first appears at its next
-enabled status, with the opening already on its timeline.
+dispute's message, without the edit notification; it only never **sends** a
+new message. So with `initiated = false`, a dispute's message first appears
+at its next enabled status, with the opening already on its timeline.
+
+### Edit notifications
+
+Telegram does not notify of an edited message: no sound, no banner, no unread
+badge. With one message per dispute, only a dispute's first status would ever
+ring a phone. So after each live edit of a dispute's message the watchdog
+sends a short reply to it naming the step, for example:
+
+```text
+🔔 Dispute 96629381-bcb8-4d4f-8c66-e8f86f3e86ea
+🙋 Serbero handed off · conflicting claims
+```
+
+and deletes that reply `edit_notification_lifetime` seconds later (default:
+60, at most 300). The phones ring, the preview says what happened, and the
+channel keeps one message per dispute. Telegram clears the notification from
+the phone when the message is deleted, so the reply stays long enough to be
+seen before it goes; `0` deletes it at once.
+
+```toml
+[alerts]
+edit_notifications = true        # default
+edit_notification_lifetime = 60  # seconds
+```
+
+A caught-up step, a status turned off and a step that arrives before the
+dispute has a message never notify. In a group, the bot deletes its own
+messages without any extra permission; in a channel it needs the admin right
+to delete messages. A reply the bot could not delete stays in the channel and
+is logged as a warning.
 
 ### Solver names
 
@@ -152,9 +182,9 @@ mediates, Mostro shows the dispute as `in-progress`, so without Serbero alerts
 the Telegram group never learns that a dispute was handed off and needs a solver.
 
 With Serbero alerts on, the watchdog adds each of Serbero's steps to the
-dispute's timeline and moves its header, an edit of the dispute's one message.
-It never sends a separate message for them: edits do not notify, and the
-channel holds one message per dispute.
+dispute's timeline and moves its header, an edit of the dispute's one message
+followed by the [edit notification](#edit-notifications). It never sends a
+lasting message for them: the channel holds one message per dispute.
 
 | Serbero says | Step on the timeline | Header while it holds |
 |---|---|---|

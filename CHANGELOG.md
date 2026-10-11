@@ -21,6 +21,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   place by event time. See
   [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#alert-format) (#41).
 - `[alerts]` option `solver_names`.
+- Edit notifications: Telegram does not notify of an edited message, so each
+  live edit of a dispute's message is followed by a short reply naming the
+  step, deleted a minute later. `[alerts]` options `edit_notifications`
+  and `edit_notification_lifetime`. See
+  [DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#edit-notifications).
 - Solver notifications: with a `[solver_notifications]` section, a solver who
   links their key with `/link` and Mostrix gets a private Telegram message
   when a party writes to them in a dispute chat. No private key leaves

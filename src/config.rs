@@ -42,10 +42,19 @@ pub struct AlertsConfig {
     /// Enable alerts for unknown/other status changes
     #[serde(default = "default_true")]
     pub other: bool,
-    /// Show Serbero's progress on the dispute's message (edits, no
-    /// notification)
+    /// Show Serbero's progress on the dispute's message (an edit, followed
+    /// by the edit notification when those are on)
     #[serde(default = "default_true")]
     pub serbero_progress: bool,
+    /// Notify of each live edit of a dispute's message with a short reply
+    /// to it, deleted right after.
+    #[serde(default = "default_true")]
+    pub edit_notifications: bool,
+    /// Seconds the edit notification stays before it is deleted. Telegram
+    /// clears the notification from the phone when the message is deleted,
+    /// so a few seconds let the banner show.
+    #[serde(default = "default_edit_notification_lifetime")]
+    pub edit_notification_lifetime: u64,
     /// Solver pubkeys (hex) and the name to show for each on the timeline.
     #[serde(default)]
     pub solver_names: HashMap<String, String>,
@@ -54,6 +63,14 @@ pub struct AlertsConfig {
 fn default_true() -> bool {
     true
 }
+
+fn default_edit_notification_lifetime() -> u64 {
+    60
+}
+
+/// Longest an edit notification may stay: it is meant to vanish, not to
+/// pile up in the channel.
+pub const MAX_EDIT_NOTIFICATION_LIFETIME: u64 = 300;
 
 impl Default for AlertsConfig {
     fn default() -> Self {
@@ -66,6 +83,8 @@ impl Default for AlertsConfig {
             cooperatively_canceled: true,
             other: true,
             serbero_progress: true,
+            edit_notifications: true,
+            edit_notification_lifetime: default_edit_notification_lifetime(),
             solver_names: HashMap::new(),
         }
     }
@@ -456,6 +475,15 @@ impl Config {
             return Err("nip65_refresh_interval must be greater than 0".into());
         }
 
+        if let Some(ref alerts) = config.alerts {
+            if alerts.edit_notification_lifetime > MAX_EDIT_NOTIFICATION_LIFETIME {
+                return Err(format!(
+                    "edit_notification_lifetime must be at most {MAX_EDIT_NOTIFICATION_LIFETIME} seconds"
+                )
+                .into());
+            }
+        }
+
         if let Some(ref serbero) = config.serbero {
             // As a string, like the errors above: `main` prints it with `Debug`.
             serbero.validate().map_err(|e| e.to_string())?;
@@ -534,6 +562,38 @@ chat_id = -1001
         let alerts = config.alerts.expect("section present");
         assert!(alerts.serbero_progress);
         assert!(AlertsConfig::default().serbero_progress);
+    }
+
+    #[test]
+    fn edit_notifications_default_to_on_for_a_minute() {
+        let config = load("\n[alerts]\ninitiated = false\n").unwrap();
+
+        let alerts = config.alerts.expect("section present");
+        assert!(alerts.edit_notifications);
+        assert_eq!(alerts.edit_notification_lifetime, 60);
+        assert!(AlertsConfig::default().edit_notifications);
+        assert_eq!(AlertsConfig::default().edit_notification_lifetime, 60);
+    }
+
+    #[test]
+    fn edit_notifications_can_be_turned_off_or_deleted_at_once() {
+        let config =
+            load("\n[alerts]\nedit_notifications = false\nedit_notification_lifetime = 0\n")
+                .unwrap();
+
+        let alerts = config.alerts.expect("section present");
+        assert!(!alerts.edit_notifications);
+        assert_eq!(alerts.edit_notification_lifetime, 0);
+    }
+
+    #[test]
+    fn an_edit_notification_lifetime_over_five_minutes_is_rejected() {
+        let error = load("\n[alerts]\nedit_notification_lifetime = 301\n")
+            .expect_err("rejected")
+            .to_string();
+
+        assert!(error.contains("edit_notification_lifetime"), "{error}");
+        assert!(error.contains("300"), "{error}");
     }
 
     #[test]

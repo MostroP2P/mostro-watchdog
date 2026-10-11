@@ -137,6 +137,12 @@ its own. A new message, which notifies, is sent only for a live dispute
 status; Serbero's steps and a solver's takeover are edits of that message,
 never messages of their own.
 
+Telegram does not notify of an edit, so a live edit is followed by a "nudge":
+a short reply to the dispute's message, naming the step, deleted
+`edit_notification_lifetime` seconds later (`timeline::nudge`,
+`Messenger::nudge`). That is the one ephemeral message the channel gets.
+Caught-up steps never nudge: a restart must not ring every phone.
+
 For the same reason, bot commands such as `/version` are answered in private
 chats only. `is_answerable_chat` enforces this; a command sent in a group or
 channel is logged and dropped. Any new command must go through that check.

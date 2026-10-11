@@ -31,6 +31,7 @@ use tokio::sync::{mpsc, Notify, RwLock};
 use tracing::{debug, error, info, warn};
 
 use crate::config::SerberoSettings;
+use crate::disputes::AlertMode;
 use alerts::{Outcome, SerberoAlerts};
 use dm::parse_dm;
 use sync::{SerberoSync, TrustedSerbero};
@@ -63,6 +64,7 @@ impl SerberoInbox {
         &mut self,
         event: &Event,
         alerts: &SerberoAlerts<'_, M>,
+        mode: AlertMode,
     ) -> Option<Outcome> {
         let serbero = (*self.trusted.read().await)?;
         let dm = parse_dm(event, &self.keys, &serbero)?;
@@ -75,7 +77,7 @@ impl SerberoInbox {
         }
         let update = dm.into_update()?;
         let subject = update.update.subject();
-        match alerts.relay(&update).await {
+        match alerts.relay(&update, mode).await {
             Ok(outcome) => {
                 match outcome {
                     Outcome::Duplicate => debug!(
@@ -106,6 +108,7 @@ impl SerberoInbox {
     }
 
     /// Relays caught-up DMs oldest first, so Serbero's steps show in order.
+    /// Caught-up steps never notify.
     pub async fn receive_batch<M: Messenger>(
         &mut self,
         mut events: Vec<Event>,
@@ -113,7 +116,7 @@ impl SerberoInbox {
     ) {
         events.sort_by_key(|event| (event.created_at, event.id));
         for event in &events {
-            self.receive(event, alerts).await;
+            self.receive(event, alerts, AlertMode::CatchUp).await;
         }
     }
 }
@@ -188,6 +191,7 @@ mod tests {
                 telegram: &self.telegram,
                 show_progress: true,
                 names: Names::default(),
+                nudge: None,
             }
         }
 
@@ -216,7 +220,11 @@ mod tests {
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
 
         let outcome = inbox
-            .receive(&fx.dm("handed off: conflicting_claims", 100), &fx.alerts())
+            .receive(
+                &fx.dm("handed off: conflicting_claims", 100),
+                &fx.alerts(),
+                AlertMode::Live,
+            )
             .await;
 
         assert_eq!(outcome, Some(Outcome::Relayed { redrawn: false }));
@@ -234,7 +242,11 @@ mod tests {
         let mut inbox = fx.inbox(None);
 
         let outcome = inbox
-            .receive(&fx.dm("handed off: flood", 100), &fx.alerts())
+            .receive(
+                &fx.dm("handed off: flood", 100),
+                &fx.alerts(),
+                AlertMode::Live,
+            )
             .await;
 
         assert_eq!(outcome, None);
@@ -247,7 +259,11 @@ mod tests {
         let mut inbox = fx.inbox(Some(Keys::generate().public_key()));
 
         let outcome = inbox
-            .receive(&fx.dm("handed off: flood", 100), &fx.alerts())
+            .receive(
+                &fx.dm("handed off: flood", 100),
+                &fx.alerts(),
+                AlertMode::Live,
+            )
             .await;
 
         assert_eq!(outcome, None);
@@ -260,7 +276,11 @@ mod tests {
         let mut inbox = fx.inbox(Some(fx.serbero.public_key()));
 
         let outcome = inbox
-            .receive(&fx.dm("resolved: settled", 100), &fx.alerts())
+            .receive(
+                &fx.dm("resolved: settled", 100),
+                &fx.alerts(),
+                AlertMode::Live,
+            )
             .await;
 
         assert_eq!(outcome, None);
@@ -280,7 +300,11 @@ mod tests {
         fx.telegram.set_down(true);
 
         let outcome = inbox
-            .receive(&fx.dm("handed off: flood", 100), &fx.alerts())
+            .receive(
+                &fx.dm("handed off: flood", 100),
+                &fx.alerts(),
+                AlertMode::Live,
+            )
             .await;
 
         assert_eq!(outcome, None);
