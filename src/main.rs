@@ -1012,8 +1012,19 @@ async fn run_event_loop<M: Messenger>(
                             solver.on_dispute_event(&event).await;
                         }
                     } else if event.kind == Kind::PrivateDirectMessage {
+                        // The Serbero catch-up's fetches reach here too, under
+                        // the fetch's id; those DMs come back through the
+                        // backlog in catch-up mode, which never notifies.
                         if let Some(inbox) = ctx.serbero_inbox.as_mut() {
-                            inbox.receive(&event, ctx.serbero_alerts, AlertMode::Live).await;
+                            if serbero::sync::is_live_subscription(&subscription_id) {
+                                inbox.receive(&event, ctx.serbero_alerts, AlertMode::Live).await;
+                            } else {
+                                debug!(
+                                    subscription = %subscription_id,
+                                    event_id = %event.id,
+                                    "Ignoring a DM from a subscription other than Serbero's live one"
+                                );
+                            }
                         }
                         if let Some(solver) = ctx.solver_inbox.as_mut() {
                             solver.receive(&event, ctx.bot, Timestamp::now().as_secs()).await;
