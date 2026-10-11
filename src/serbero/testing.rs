@@ -2,6 +2,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::sync::Mutex;
+use std::time::Duration;
 
 use mostro_core::message::{Action, Message, Payload};
 use mostro_core::transport::{wrap_message_nip44, WrapOptions};
@@ -50,6 +51,12 @@ pub enum Call {
         message_id: i32,
         text: String,
     },
+    Nudge {
+        chat_id: i64,
+        reply_to: i32,
+        text: String,
+        lifetime: Duration,
+    },
 }
 
 /// Records the calls it gets; fails them all while `down` is set, and the
@@ -79,6 +86,13 @@ impl FakeTelegram {
         self.calls()
             .into_iter()
             .filter(|c| matches!(c, Call::Edit { .. }))
+            .collect()
+    }
+
+    pub fn nudges(&self) -> Vec<Call> {
+        self.calls()
+            .into_iter()
+            .filter(|c| matches!(c, Call::Nudge { .. }))
             .collect()
     }
 
@@ -121,5 +135,15 @@ impl Messenger for FakeTelegram {
             text: text.into(),
         });
         Ok(())
+    }
+
+    async fn nudge(&self, chat_id: i64, reply_to: i32, text: &str, lifetime: Duration) {
+        // Best effort, like the real one: recorded even while down.
+        self.calls.lock().unwrap().push(Call::Nudge {
+            chat_id,
+            reply_to,
+            text: text.into(),
+            lifetime,
+        });
     }
 }

@@ -10,7 +10,7 @@ use crate::alert_enabled;
 use crate::config::AlertsConfig;
 use crate::db::DisputeMessageStore;
 use crate::serbero::telegram::Messenger;
-use crate::timeline::{self, status_step, Names};
+use crate::timeline::{self, status_step, Entry, Names, Nudge};
 
 /// Where a dispute event came from, which decides what it may do to the
 /// channel.
@@ -55,17 +55,32 @@ fn parse(event: &Event) -> DisputeEvent {
     parsed
 }
 
+/// How dispute alerts are shown: the `[alerts]` toggles, the solvers'
+/// names and the notification that follows a live edit, if any.
+#[derive(Debug, Clone, Copy)]
+pub struct AlertSettings<'a> {
+    pub config: &'a AlertsConfig,
+    pub names: &'a Names,
+    pub nudge: Option<Nudge>,
+}
+
 /// Adds a dispute's status to its timeline, as `mode` allows, and shows
-/// the timeline on the dispute's message.
+/// the timeline on the dispute's message. A live edit is followed by the
+/// settings' nudge, when there is one, so the status change notifies like
+/// a new message would.
 pub async fn handle_dispute_event<M: Messenger>(
     telegram: &M,
     chat_id: i64,
     event: &Event,
     mode: AlertMode,
-    alerts_config: &AlertsConfig,
+    settings: AlertSettings<'_>,
     dispute_store: &DisputeMessageStore,
-    names: &Names,
 ) {
+    let AlertSettings {
+        config: alerts_config,
+        names,
+        nudge,
+    } = settings;
     let DisputeEvent {
         dispute_id,
         status,
@@ -123,9 +138,9 @@ pub async fn handle_dispute_event<M: Messenger>(
         return;
     }
 
-    // Edits do not notify: the timeline is kept up to date whatever the
-    // alert toggles and the mode. Only a live, enabled status sends a new
-    // message.
+    // The timeline is kept up to date whatever the alert toggles and the
+    // mode. Only a live, enabled status sends a new message, or notifies
+    // of the edit.
     let may_send = mode == AlertMode::Live && alert_enabled(&status, alerts_config);
 
     let Some(message) = existing_message else {
@@ -162,6 +177,25 @@ pub async fn handle_dispute_event<M: Messenger>(
                 .await
             {
                 error!("Failed to update dispute status in store: {}", e);
+            }
+            if let Some(nudge) = nudge.filter(|_| may_send) {
+                let added = Entry::new(kind, detail.as_deref(), created_at);
+                if let Err(e) = timeline::nudge(
+                    dispute_store,
+                    telegram,
+                    names,
+                    &dispute_id,
+                    &message,
+                    &added,
+                    nudge,
+                )
+                .await
+                {
+                    error!(
+                        "Failed to read the timeline for the edit notification: {}",
+                        e
+                    );
+                }
             }
         }
         // Live: the message was deleted, say; the status change still has
@@ -227,6 +261,7 @@ mod tests {
     use super::*;
     use crate::serbero::testing::{Call, FakeTelegram};
     use std::sync::atomic::Ordering;
+    use std::time::Duration;
 
     const DISPUTE: &str = "51733e4d-a155-465b-a97e-07fba5f0e485";
     const CHAT: i64 = -100_123;
@@ -241,6 +276,7 @@ mod tests {
         mostro: Keys,
         alerts: AlertsConfig,
         names: Names,
+        nudge: Option<Nudge>,
     }
 
     impl Fixture {
@@ -256,6 +292,7 @@ mod tests {
                 mostro: Keys::generate(),
                 alerts: AlertsConfig::default(),
                 names: Names::default(),
+                nudge: None,
             }
         }
 
@@ -279,9 +316,12 @@ mod tests {
                 CHAT,
                 event,
                 mode,
-                &self.alerts,
+                AlertSettings {
+                    config: &self.alerts,
+                    names: &self.names,
+                    nudge: self.nudge,
+                },
                 &self.store,
-                &self.names,
             )
             .await;
         }
@@ -309,7 +349,7 @@ mod tests {
 
     fn text_of(call: &Call) -> &str {
         match call {
-            Call::Send { text, .. } | Call::Edit { text, .. } => text,
+            Call::Send { text, .. } | Call::Edit { text, .. } | Call::Nudge { text, .. } => text,
         }
     }
 
@@ -327,6 +367,68 @@ mod tests {
         assert_eq!(fx.store.get_message(DISPUTE).await.unwrap(), None);
         // Kept for the day the dispute does get a message.
         assert_eq!(fx.steps().await, vec!["taken"]);
+    }
+
+    #[tokio::test]
+    async fn a_live_edit_is_followed_by_a_nudge_replying_to_the_message() {
+        let mut fx = Fixture::new().await;
+        let lifetime = Duration::from_secs(5);
+        fx.nudge = Some(Nudge { lifetime });
+        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
+            .await;
+        // The new message notifies by itself.
+        assert!(fx.telegram.nudges().is_empty());
+        fx.telegram.clear();
+
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+
+        let calls = fx.telegram.calls();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [
+                    Call::Edit { message_id: 1, .. },
+                    Call::Nudge { chat_id: CHAT, reply_to: 1, text, lifetime: l }
+                ] if *l == lifetime
+                    && text.starts_with("🔔 *Dispute* `51733e4d-a155-465b-a97e-07fba5f0e485`\n")
+                    && text.ends_with("Taken by a solver")
+            ),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caught_up_edit_or_a_status_turned_off_does_not_nudge() {
+        let mut fx = Fixture::new().await;
+        fx.nudge = Some(Nudge {
+            lifetime: Duration::from_secs(5),
+        });
+        fx.alerts.settled = false;
+        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
+            .await;
+        fx.telegram.clear();
+
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::CatchUp)
+            .await;
+        fx.handle(&fx.dispute_event("settled", TAKEN + 3_600), AlertMode::Live)
+            .await;
+
+        assert_eq!(fx.telegram.edits().len(), 2);
+        assert!(fx.telegram.nudges().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_live_edit_is_silent_with_edit_notifications_off() {
+        let fx = Fixture::new().await;
+        fx.handle(&fx.dispute_event("initiated", TAKEN - 60), AlertMode::Live)
+            .await;
+
+        fx.handle(&fx.dispute_event("in-progress", TAKEN), AlertMode::Live)
+            .await;
+
+        assert_eq!(fx.telegram.edits().len(), 1);
+        assert!(fx.telegram.nudges().is_empty());
     }
 
     #[tokio::test]

@@ -4,8 +4,9 @@
 
 use super::dm::{HeaderUpdate, Update};
 use super::telegram::Messenger;
-use crate::db::{DisputeMessageStore, SerberoState};
-use crate::timeline::{self, EntryKind, Names, RedrawError};
+use crate::db::{DisputeMessageStore, SerberoState, StoredMessage};
+use crate::disputes::AlertMode;
+use crate::timeline::{self, Entry, EntryKind, Names, Nudge, RedrawError};
 use tracing::info;
 
 /// Why an update could not be relayed. It is not recorded as relayed, so
@@ -36,6 +37,8 @@ pub struct SerberoAlerts<'a, M> {
     pub show_progress: bool,
     /// How solvers are named on the timeline.
     pub names: Names,
+    /// The notification sent after a live redraw, when edits notify.
+    pub nudge: Option<Nudge>,
 }
 
 /// The timeline step a Serbero update adds.
@@ -53,8 +56,13 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
     /// is marked as relayed only once the dispute's message shows it, so a
     /// redraw Telegram rejected is retried when the DM arrives again (an
     /// early catch-up, the next periodic one, a restart). The timeline step
-    /// is kept once however many times that happens.
-    pub async fn relay(&self, update: &HeaderUpdate) -> Result<Outcome, AlertError> {
+    /// is kept once however many times that happens. A live redraw is
+    /// followed by the edit notification; a caught-up one is silent.
+    pub async fn relay(
+        &self,
+        update: &HeaderUpdate,
+        mode: AlertMode,
+    ) -> Result<Outcome, AlertError> {
         let subject = update.update.subject();
         if self
             .store
@@ -69,15 +77,28 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
         let redrawn = self.show_progress && {
             timeline::backfill(self.store, &update.dispute_id).await?;
             let (kind, detail) = timeline_step(&update.update);
+            let added = Entry::new(kind, detail, seconds(update.created_at));
             self.store
-                .append_timeline(
-                    &update.dispute_id,
-                    kind.as_str(),
-                    detail,
-                    seconds(update.created_at),
-                )
+                .append_timeline(&update.dispute_id, kind.as_str(), detail, added.created_at)
                 .await?;
-            self.redraw(&update.dispute_id).await?
+            match self.redraw(&update.dispute_id).await? {
+                Some(message) => {
+                    if let Some(nudge) = self.nudge.filter(|_| mode == AlertMode::Live) {
+                        timeline::nudge(
+                            self.store,
+                            self.telegram,
+                            &self.names,
+                            &update.dispute_id,
+                            &message,
+                            &added,
+                            nudge,
+                        )
+                        .await?;
+                    }
+                    true
+                }
+                None => false,
+            }
         };
         self.store
             .mark_serbero_header_handled(&update.dispute_id, &subject, seconds(update.created_at))
@@ -103,18 +124,19 @@ impl<M: Messenger> SerberoAlerts<'_, M> {
     }
 
     /// Shows the dispute's timeline, with the step just added, on its
-    /// message. The message is the only place the step shows, so a failed
-    /// edit is an error: the update stays unrelayed and is retried.
-    async fn redraw(&self, dispute_id: &str) -> Result<bool, AlertError> {
+    /// message, and returns the message. The message is the only place the
+    /// step shows, so a failed edit is an error: the update stays unrelayed
+    /// and is retried.
+    async fn redraw(&self, dispute_id: &str) -> Result<Option<StoredMessage>, AlertError> {
         match timeline::redraw(self.store, self.telegram, &self.names, dispute_id).await {
-            Ok(Some(_)) => Ok(true),
+            Ok(Some(message)) => Ok(Some(message)),
             // No message yet: the step shows on the dispute's first alert.
             Ok(None) => {
                 info!(
                     dispute_id,
                     "No dispute message yet; Serbero's step waits for it"
                 );
-                Ok(false)
+                Ok(None)
             }
             Err(RedrawError::Store(e)) => Err(AlertError::Store(e)),
             Err(RedrawError::Telegram(e)) => Err(AlertError::Telegram(e)),
@@ -148,6 +170,7 @@ mod tests {
     use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
     use std::path::{Path, PathBuf};
     use std::str::FromStr;
+    use std::time::Duration;
 
     const DISPUTE: &str = "58511141-6e3f-4b87-9c4a-1f2e3d4c5b6a";
     const CHAT: i64 = -100_123;
@@ -179,6 +202,7 @@ mod tests {
                 telegram: &self.telegram,
                 show_progress: true,
                 names: Names::default(),
+                nudge: None,
             }
         }
     }
@@ -211,7 +235,7 @@ mod tests {
             .into_iter()
             .map(|call| match call {
                 Call::Edit { text, .. } => text,
-                Call::Send { .. } => unreachable!(),
+                Call::Send { .. } | Call::Nudge { .. } => unreachable!(),
             })
             .collect()
     }
@@ -227,7 +251,10 @@ mod tests {
 
         let outcome = fx
             .alerts()
-            .relay(&update(handed_off("conflicting_claims"), AT))
+            .relay(
+                &update(handed_off("conflicting_claims"), AT),
+                AlertMode::Live,
+            )
             .await
             .unwrap();
 
@@ -242,6 +269,61 @@ mod tests {
             fx.store.serbero_state(DISPUTE).await.unwrap(),
             Some(state("handed off: conflicting_claims", AT as i64))
         );
+    }
+
+    #[tokio::test]
+    async fn a_live_handoff_nudges_after_the_redraw_and_a_caught_up_one_does_not() {
+        let fx = Fixture::new().await;
+        fx.store
+            .insert(DISPUTE, 42, CHAT, "in-progress", "old")
+            .await
+            .unwrap();
+        let lifetime = Duration::from_secs(2);
+        let alerts = SerberoAlerts {
+            nudge: Some(Nudge { lifetime }),
+            ..fx.alerts()
+        };
+
+        alerts
+            .relay(&update(Update::Mediating, AT), AlertMode::CatchUp)
+            .await
+            .unwrap();
+        assert!(fx.telegram.nudges().is_empty());
+        fx.telegram.clear();
+        alerts
+            .relay(&update(handed_off("flood"), AT + 60), AlertMode::Live)
+            .await
+            .unwrap();
+
+        let calls = fx.telegram.calls();
+        assert!(
+            matches!(
+                calls.as_slice(),
+                [
+                    Call::Edit { message_id: 42, .. },
+                    Call::Nudge { chat_id: CHAT, reply_to: 42, text, lifetime: l }
+                ] if *l == lifetime && text.ends_with("🙋 Serbero handed off · flood")
+            ),
+            "{calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_live_step_without_a_message_yet_does_not_nudge() {
+        let fx = Fixture::new().await;
+        let alerts = SerberoAlerts {
+            nudge: Some(Nudge {
+                lifetime: Duration::from_secs(2),
+            }),
+            ..fx.alerts()
+        };
+
+        alerts
+            .relay(&update(Update::Mediating, AT), AlertMode::Live)
+            .await
+            .unwrap();
+
+        assert!(fx.telegram.calls().is_empty());
     }
 
     #[tokio::test]
@@ -266,7 +348,10 @@ mod tests {
                 fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
             }
 
-            fx.alerts().relay(&update(kind, AT)).await.unwrap();
+            fx.alerts()
+                .relay(&update(kind, AT), AlertMode::Live)
+                .await
+                .unwrap();
 
             assert!(fx.telegram.sends().is_empty(), "{:?}", fx.telegram.calls());
         }
@@ -283,7 +368,7 @@ mod tests {
 
         let outcome = fx
             .alerts()
-            .relay(&update(Update::Mediating, AT))
+            .relay(&update(Update::Mediating, AT), AlertMode::Live)
             .await
             .unwrap();
 
@@ -306,8 +391,8 @@ mod tests {
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         let handoff = update(handed_off("flood"), AT);
 
-        fx.alerts().relay(&handoff).await.unwrap();
-        let again = fx.alerts().relay(&handoff).await.unwrap();
+        fx.alerts().relay(&handoff, AlertMode::Live).await.unwrap();
+        let again = fx.alerts().relay(&handoff, AlertMode::Live).await.unwrap();
 
         assert_eq!(again, Outcome::Duplicate);
         assert!(fx.telegram.sends().is_empty());
@@ -318,7 +403,7 @@ mod tests {
     async fn a_restart_does_not_relay_a_header_again() {
         let fx = Fixture::new().await;
         let handoff = update(Update::CouldNotStart, AT);
-        fx.alerts().relay(&handoff).await.unwrap();
+        fx.alerts().relay(&handoff, AlertMode::Live).await.unwrap();
 
         // A new process on the same database gets the DM again from the
         // catch-up fetch.
@@ -329,9 +414,13 @@ mod tests {
             telegram: &telegram,
             show_progress: true,
             names: Names::default(),
+            nudge: None,
         };
 
-        assert_eq!(alerts.relay(&handoff).await.unwrap(), Outcome::Duplicate);
+        assert_eq!(
+            alerts.relay(&handoff, AlertMode::Live).await.unwrap(),
+            Outcome::Duplicate
+        );
         assert!(telegram.calls().is_empty());
     }
 
@@ -343,7 +432,7 @@ mod tests {
 
         let outcome = fx
             .alerts()
-            .relay(&update(handed_off("human_requested"), AT))
+            .relay(&update(handed_off("human_requested"), AT), AlertMode::Live)
             .await
             .unwrap();
 
@@ -368,7 +457,10 @@ mod tests {
 
         let outcome = fx
             .alerts()
-            .relay(&update(handed_off("conflicting_claims"), AT))
+            .relay(
+                &update(handed_off("conflicting_claims"), AT),
+                AlertMode::Live,
+            )
             .await
             .unwrap();
 
@@ -399,7 +491,7 @@ mod tests {
         let handoff = update(handed_off("uncertain"), AT);
         fx.telegram.set_down(true);
 
-        let first = fx.alerts().relay(&handoff).await;
+        let first = fx.alerts().relay(&handoff, AlertMode::Live).await;
         assert!(matches!(first, Err(AlertError::Telegram(_))), "{first:?}");
         assert!(!fx
             .store
@@ -408,7 +500,7 @@ mod tests {
             .unwrap());
         fx.telegram.set_down(false);
 
-        let second = fx.alerts().relay(&handoff).await.unwrap();
+        let second = fx.alerts().relay(&handoff, AlertMode::Live).await.unwrap();
 
         assert_eq!(second, Outcome::Relayed { redrawn: true });
         assert!(fx.telegram.sends().is_empty());
@@ -430,13 +522,13 @@ mod tests {
             .unwrap();
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.alerts()
-            .relay(&update(handed_off("round_limit"), AT + 60))
+            .relay(&update(handed_off("round_limit"), AT + 60), AlertMode::Live)
             .await
             .unwrap();
 
         let outcome = fx
             .alerts()
-            .relay(&update(Update::Mediating, AT))
+            .relay(&update(Update::Mediating, AT), AlertMode::Live)
             .await
             .unwrap();
 
@@ -467,7 +559,7 @@ mod tests {
         };
 
         let outcome = alerts
-            .relay(&update(handed_off("fraud_signal"), AT))
+            .relay(&update(handed_off("fraud_signal"), AT), AlertMode::Live)
             .await
             .unwrap();
 
@@ -484,7 +576,7 @@ mod tests {
 
         let outcome = fx
             .alerts()
-            .relay(&update(handed_off("flood"), AT))
+            .relay(&update(handed_off("flood"), AT), AlertMode::Live)
             .await
             .unwrap();
 
@@ -537,7 +629,7 @@ mod tests {
         let dm = parse_dm(&event, &watchdog, &serbero.public_key()).expect("accepted");
         let outcome = fx
             .alerts()
-            .relay(&dm.into_update().expect("relayed subject"))
+            .relay(&dm.into_update().expect("relayed subject"), AlertMode::Live)
             .await
             .unwrap();
         fx.store.close().await;
@@ -603,13 +695,16 @@ mod tests {
             .unwrap();
         fx.store.set_sent_at(DISPUTE, AT as i64).await.unwrap();
         fx.alerts()
-            .relay(&update(handed_off("conflicting_claims"), AT))
+            .relay(
+                &update(handed_off("conflicting_claims"), AT),
+                AlertMode::Live,
+            )
             .await
             .unwrap();
 
         let outcome = fx
             .alerts()
-            .relay(&update(Update::Mediating, AT + 100))
+            .relay(&update(Update::Mediating, AT + 100), AlertMode::Live)
             .await
             .unwrap();
 

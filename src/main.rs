@@ -17,10 +17,10 @@ mod version;
 
 use config::{Config, SerberoSettings};
 use db::DisputeMessageStore;
-use disputes::{handle_dispute_event, AlertMode};
+use disputes::{handle_dispute_event, AlertMode, AlertSettings};
 use serbero::alerts::SerberoAlerts;
 use serbero::telegram::Messenger;
-use timeline::Names;
+use timeline::{Names, Nudge};
 use version::{version_message, VERSION};
 
 /// Shared state for the currently active relay list (discovered via NIP-65 or bootstrap fallback)
@@ -881,11 +881,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let alerts_config = config.alerts.unwrap_or_default();
     let chat_id = config.telegram.chat_id;
     let names = Names::new(alerts_config.solver_names.clone());
+    let nudge = Nudge::from_config(&alerts_config);
+    match nudge {
+        Some(nudge) => info!(
+            "🔔 Edit notifications on: a reply deleted after {}s follows each live edit",
+            nudge.lifetime.as_secs()
+        ),
+        None => info!("Edit notifications off: edits of a dispute's message are silent"),
+    }
     let serbero_alerts = SerberoAlerts {
         store: &dispute_store,
         telegram: &bot,
         show_progress: alerts_config.serbero_progress,
         names: names.clone(),
+        nudge,
     };
 
     run_event_loop(
@@ -896,6 +905,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             alerts_config: &alerts_config,
             dispute_store: &dispute_store,
             names: &names,
+            nudge,
             health_monitor: &health_monitor,
             serbero_alerts: &serbero_alerts,
             serbero_inbox,
@@ -958,6 +968,8 @@ struct EventLoop<'a, M> {
     alerts_config: &'a config::AlertsConfig,
     dispute_store: &'a DisputeMessageStore,
     names: &'a Names,
+    /// The notification after a live edit, when edits notify.
+    nudge: Option<Nudge>,
     health_monitor: &'a HealthMonitor,
     serbero_alerts: &'a SerberoAlerts<'a, M>,
     serbero_inbox: Option<serbero::SerberoInbox>,
@@ -1000,8 +1012,19 @@ async fn run_event_loop<M: Messenger>(
                             solver.on_dispute_event(&event).await;
                         }
                     } else if event.kind == Kind::PrivateDirectMessage {
+                        // The Serbero catch-up's fetches reach here too, under
+                        // the fetch's id; those DMs come back through the
+                        // backlog in catch-up mode, which never notifies.
                         if let Some(inbox) = ctx.serbero_inbox.as_mut() {
-                            inbox.receive(&event, ctx.serbero_alerts).await;
+                            if serbero::sync::is_live_subscription(&subscription_id) {
+                                inbox.receive(&event, ctx.serbero_alerts, AlertMode::Live).await;
+                            } else {
+                                debug!(
+                                    subscription = %subscription_id,
+                                    event_id = %event.id,
+                                    "Ignoring a DM from a subscription other than Serbero's live one"
+                                );
+                            }
                         }
                         if let Some(solver) = ctx.solver_inbox.as_mut() {
                             solver.receive(&event, ctx.bot, Timestamp::now().as_secs()).await;
@@ -1049,9 +1072,12 @@ impl<M: Messenger> EventLoop<'_, M> {
             self.chat_id,
             event,
             mode,
-            self.alerts_config,
+            AlertSettings {
+                config: self.alerts_config,
+                names: self.names,
+                nudge: self.nudge,
+            },
             self.dispute_store,
-            self.names,
         )
         .await;
     }
@@ -1226,6 +1252,7 @@ mod tests {
                 telegram: &self.telegram,
                 show_progress: false,
                 names: Names::default(),
+                nudge: None,
             }
         }
 
@@ -1246,6 +1273,7 @@ mod tests {
                     alerts_config: &self.alerts,
                     dispute_store: &self.store,
                     names: &self.names,
+                    nudge: None,
                     health_monitor: &self.health,
                     serbero_alerts,
                     serbero_inbox: None,

@@ -3,13 +3,16 @@
 //!
 //! Every source (Mostro's kind-38386 statuses, Serbero's updates) appends a
 //! step to the dispute's timeline, then the message is rendered again from
-//! the whole timeline and edited in place. Edits do not notify, so the
-//! moments that need a person still send a reply to the message.
+//! the whole timeline and edited in place. Edits do not notify, so a live
+//! edit is followed by a [`Nudge`]: a short reply to the message, deleted
+//! moments later, whose only job is to make the phones ring.
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use tracing::{info, warn};
 
+use crate::config::AlertsConfig;
 use crate::db::{DisputeMessageStore, StoredMessage, TimelineRow};
 use crate::serbero::render::humanize;
 use crate::serbero::telegram::Messenger;
@@ -497,6 +500,70 @@ pub fn render(dispute_id: &str, entries: &[Entry], names: &Names) -> String {
     text
 }
 
+/// The notification of an edit: a short reply to the dispute's message,
+/// deleted once the phones have rung. `[alerts] edit_notifications`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Nudge {
+    /// How long the reply stays before it is deleted.
+    pub lifetime: Duration,
+}
+
+impl Nudge {
+    /// The nudge `[alerts]` asks for; `None` with `edit_notifications` off.
+    pub fn from_config(alerts: &AlertsConfig) -> Option<Self> {
+        alerts.edit_notifications.then_some(Self {
+            lifetime: Duration::from_secs(alerts.edit_notification_lifetime),
+        })
+    }
+}
+
+/// The nudge's text (MarkdownV2): the dispute and `added`, the step the
+/// edit showed, so the push notification's preview says what happened.
+/// The step is read in its place on the timeline, which decides who a
+/// `Taken` names; a step not on the timeline reads as its latest. `None`
+/// for an empty timeline.
+pub fn nudge_text(
+    dispute_id: &str,
+    entries: &[Entry],
+    added: &Entry,
+    names: &Names,
+) -> Option<String> {
+    let holders = holders(entries, names);
+    let index = entries
+        .iter()
+        .rposition(|entry| entry == added)
+        .or_else(|| entries.len().checked_sub(1))?;
+    let (icon, line) = step(&entries[index], holders[index].as_ref(), names);
+    Some(format!(
+        "🔔 *Dispute* `{}`\n{icon} {}",
+        escape_markdown_code(dispute_id),
+        escape_markdown(&line)
+    ))
+}
+
+/// Notifies of an edit of `message`, the dispute's message, with a reply
+/// naming `added`, the step the edit showed. Nothing is sent for an empty
+/// timeline.
+pub async fn nudge<M: Messenger>(
+    store: &DisputeMessageStore,
+    telegram: &M,
+    names: &Names,
+    dispute_id: &str,
+    message: &StoredMessage,
+    added: &Entry,
+    nudge: Nudge,
+) -> Result<(), sqlx::Error> {
+    let rows = store.timeline(dispute_id).await?;
+    let Some(text) = nudge_text(dispute_id, &entries(&rows), added, names) else {
+        return Ok(());
+    };
+    telegram
+        .nudge(message.chat_id, message.message_id, &text, nudge.lifetime)
+        .await;
+    info!(dispute_id, "🔔 Edit notification sent");
+    Ok(())
+}
+
 /// Why a redraw failed. The timeline is kept either way; the next step
 /// redraws the message again.
 #[derive(Debug, thiserror::Error)]
@@ -560,6 +627,84 @@ mod tests {
     fn header_of(entries: &[Entry], names: &Names) -> String {
         let holders = holders(entries, names);
         header(&standing(entries, &holders, names))
+    }
+
+    #[test]
+    fn the_nudge_names_the_dispute_and_the_step_added_escaped() {
+        let handoff = entry(EntryKind::SerberoHandedOff, Some("conflicting_claims"), 471);
+        let entries = vec![
+            entry(EntryKind::Opened, Some("buyer"), 0),
+            entry(EntryKind::Taken, None, 1),
+            handoff.clone(),
+        ];
+
+        let text = nudge_text(DISPUTE, &entries, &handoff, &Names::default()).unwrap();
+
+        assert_eq!(
+            text,
+            "🔔 *Dispute* `96629381-bcb8-4d4f-8c66-e8f86f3e86ea`\n\
+             🙋 Serbero handed off · conflicting claims"
+        );
+    }
+
+    #[test]
+    fn the_nudge_knows_who_took_the_dispute_over() {
+        let takeover = entry(EntryKind::Taken, Some(SOLVER), 600);
+        let entries = vec![
+            entry(EntryKind::Opened, Some("seller"), 0),
+            entry(EntryKind::Taken, None, 1),
+            entry(EntryKind::SerberoMediating, None, 3),
+            takeover.clone(),
+        ];
+
+        let text = nudge_text(DISPUTE, &entries, &takeover, &named()).unwrap();
+
+        assert!(text.ends_with("👨‍⚖️ Taken over by grunch"), "{text}");
+    }
+
+    /// A Serbero notice that arrives after the takeover is the news, not
+    /// the takeover.
+    #[test]
+    fn the_nudge_names_a_late_step_not_the_latest() {
+        let late = entry(EntryKind::SerberoMediating, None, 3);
+        let entries = vec![
+            entry(EntryKind::Opened, Some("seller"), 0),
+            entry(EntryKind::Taken, None, 1),
+            late.clone(),
+            entry(EntryKind::Taken, Some(SOLVER), 600),
+        ];
+
+        let text = nudge_text(DISPUTE, &entries, &late, &named()).unwrap();
+
+        assert!(text.ends_with("🤖 Serbero mediating"), "{text}");
+    }
+
+    #[test]
+    fn a_step_missing_from_the_timeline_reads_as_its_latest() {
+        let entries = vec![entry(EntryKind::Opened, Some("buyer"), 0)];
+        let unstored = entry(EntryKind::Taken, None, 1);
+
+        let text = nudge_text(DISPUTE, &entries, &unstored, &Names::default()).unwrap();
+
+        assert!(text.ends_with("🚨 Opened by buyer"), "{text}");
+        assert_eq!(nudge_text(DISPUTE, &[], &unstored, &Names::default()), None);
+    }
+
+    #[test]
+    fn the_nudge_is_off_when_edit_notifications_are() {
+        let on = AlertsConfig::default();
+        let off = AlertsConfig {
+            edit_notifications: false,
+            ..AlertsConfig::default()
+        };
+
+        assert_eq!(
+            Nudge::from_config(&on),
+            Some(Nudge {
+                lifetime: Duration::from_secs(60)
+            })
+        );
+        assert_eq!(Nudge::from_config(&off), None);
     }
 
     #[test]
@@ -972,6 +1117,52 @@ mod tests {
                 .await
                 .unwrap(),
             None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_nudge_replies_to_the_dispute_message_with_its_latest_step() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = DisputeMessageStore::new(&dir.path().join("t.db"))
+            .await
+            .unwrap();
+        let telegram = FakeTelegram::default();
+        store
+            .insert(DISPUTE, 7, -100, "in-progress", "old")
+            .await
+            .unwrap();
+        store
+            .append_timeline(DISPUTE, "opened", Some("buyer"), OPENED)
+            .await
+            .unwrap();
+        store
+            .append_timeline(DISPUTE, "serbero_mediating", None, OPENED + 3)
+            .await
+            .unwrap();
+        let message = store.get_message(DISPUTE).await.unwrap().unwrap();
+        let lifetime = Duration::from_secs(3);
+
+        nudge(
+            &store,
+            &telegram,
+            &Names::default(),
+            DISPUTE,
+            &message,
+            &Entry::new(EntryKind::SerberoMediating, None, OPENED + 3),
+            Nudge { lifetime },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            telegram.calls(),
+            vec![Call::Nudge {
+                chat_id: -100,
+                reply_to: 7,
+                text: "🔔 *Dispute* `96629381-bcb8-4d4f-8c66-e8f86f3e86ea`\n🤖 Serbero mediating"
+                    .to_owned(),
+                lifetime,
+            }]
         );
     }
 }

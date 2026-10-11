@@ -58,12 +58,23 @@ cooperatively_canceled = true
 # Other/unknown status changes (default: true)
 other = true
 
-# A status turned off still goes on the dispute's timeline (an edit, which
-# does not notify); it only never sends a new message.
+# A status turned off still goes on the dispute's timeline (an edit, with no
+# edit notification); it only never sends a new message.
+
+# Edit notifications: Telegram does not notify of an edited message, so after
+# each live edit of a dispute's message the watchdog sends a short reply to
+# it, naming the step, and deletes that reply moments later. The phones ring,
+# the channel stays one message per dispute. (default: true)
+edit_notifications = true
+
+# Seconds the reply stays before it is deleted, at most 300. Telegram clears
+# the notification from the phone when the message is deleted, so the reply
+# stays long enough to be seen; 0 deletes it at once. (default: 60)
+edit_notification_lifetime = 60
 
 # Serbero alerts (only with the [serbero] section below)
 # Show Serbero's steps (mediating, guidance sent, handed off) on the
-# dispute's timeline; edits do not notify (default: true)
+# dispute's timeline, an edit followed by the edit notification (default: true)
 serbero_progress = true
 
 # Names shown on the timeline for solvers, by pubkey (hex). A solver without

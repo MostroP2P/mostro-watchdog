@@ -60,6 +60,19 @@ pub fn subscription_id(serbero: &PublicKey) -> SubscriptionId {
     SubscriptionId::new(format!("{SUBSCRIPTION_PREFIX}-{digits}"))
 }
 
+/// Whether `id` is the live subscription to Serbero's DMs, for any Serbero
+/// key. nostr-sdk notifies the events of a catch-up fetch like any other,
+/// under the fetch's own id; those reach the event loop again through the
+/// catch-up backlog, so only the live subscription's DMs are live.
+pub fn is_live_subscription(id: &SubscriptionId) -> bool {
+    id.as_str()
+        .strip_prefix(SUBSCRIPTION_PREFIX)
+        .and_then(|rest| rest.strip_prefix('-'))
+        .is_some_and(|digits| {
+            digits.len() == SUBSCRIPTION_KEY_DIGITS && digits.chars().all(|c| c.is_ascii_hexdigit())
+        })
+}
+
 /// The relays that refused a subscription, and why. A relay that already
 /// holds it is not a refusal.
 pub fn refusals(failed: &HashMap<RelayUrl, String>) -> Vec<(&RelayUrl, &str)> {
@@ -461,6 +474,23 @@ mod tests {
         })
         .await
         .expect("a DM notification")
+    }
+
+    #[test]
+    fn only_the_subscription_to_a_serbero_key_is_live() {
+        let serbero = Keys::generate().public_key();
+
+        assert!(is_live_subscription(&subscription_id(&serbero)));
+        assert!(!is_live_subscription(&SubscriptionId::generate()));
+        assert!(!is_live_subscription(&SubscriptionId::new(
+            "mostro-watchdog-serbero"
+        )));
+        assert!(!is_live_subscription(&SubscriptionId::new(
+            "mostro-watchdog-serbero-notahexkeyatall"
+        )));
+        assert!(!is_live_subscription(&SubscriptionId::new(
+            "mostro-watchdog-solver-dm"
+        )));
     }
 
     #[test]

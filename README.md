@@ -281,10 +281,14 @@ Status: ✅ RESOLVED · released by seller
 All times UTC · 2026-10-10
 ```
 
-Edits do not notify: the dispute's message is the whole story, and the only
-new message is the one sent when a live dispute status arrives. Solvers show by
-the name given in `[alerts.solver_names]`, or by a shortened pubkey. See
-[DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md).
+The dispute's message is the whole story, and the only lasting new message is
+the one sent when a live dispute status arrives. Telegram does not notify of
+an edit, so each live edit is followed by a short reply naming the step,
+deleted a minute later: the phones ring and the channel stays clean
+(`edit_notifications`, see
+[DISPUTE_STATUS_ALERTS.md](DISPUTE_STATUS_ALERTS.md#edit-notifications)).
+Solvers show by the name given in `[alerts.solver_names]`, or by a shortened
+pubkey.
 
 ## Serbero Alerts
 
@@ -358,6 +362,8 @@ Mostrix speaks, and its limits.
 | `telegram.bot_token` | Telegram bot API token |
 | `telegram.chat_id` | Telegram chat/group/channel ID for alerts |
 | `alerts.serbero_progress` | Serbero's steps on the dispute's timeline (default: `true`) |
+| `alerts.edit_notifications` | Notify of each live edit of a dispute's message with a reply deleted moments later (default: `true`) |
+| `alerts.edit_notification_lifetime` | Seconds that reply stays before it is deleted, at most `300` (default: `60`) |
 | `alerts.solver_names` | Table of solver pubkeys (hex) to the name shown on the timeline (default: none) |
 | `serbero.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
 | `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |
