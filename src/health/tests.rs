@@ -1,0 +1,424 @@
+//! Health monitoring end to end, without relays: events in, Telegram
+//! messages out, one evaluation per simulated minute.
+
+use super::*;
+use crate::health::content::tests::payload;
+use crate::health::event::tests::{health_tags, set_tag, sign, NOW};
+use crate::health::store::tests::store;
+use crate::serbero::testing::{Call, FakeTelegram};
+use mostro_core::prelude::NOSTR_INFO_EVENT_KIND;
+
+const CHAT: i64 = -100_777;
+
+struct Harness {
+    _dir: tempfile::TempDir,
+    store: HealthStore,
+    mostro: Keys,
+    watchdog: Keys,
+    monitor: Monitor<FakeTelegram>,
+}
+
+fn config() -> MonitorConfig {
+    MonitorConfig {
+        mostro_health_enabled: true,
+        ..MonitorConfig::default()
+    }
+}
+
+impl Harness {
+    async fn new(config: MonitorConfig) -> Self {
+        let (dir, store) = store().await;
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        let monitor = Monitor::new(
+            config,
+            mostro.public_key(),
+            Some(watchdog.clone()),
+            CHAT,
+            NOW - 3600,
+            FakeTelegram::default(),
+            store.clone(),
+        )
+        .await
+        .unwrap();
+        Self {
+            _dir: dir,
+            store,
+            mostro,
+            watchdog,
+            monitor,
+        }
+    }
+
+    /// The monitor again on the same store: a restart.
+    async fn restart(&mut self, config: MonitorConfig) {
+        self.monitor = Monitor::new(
+            config,
+            self.mostro.public_key(),
+            Some(self.watchdog.clone()),
+            CHAT,
+            NOW - 3600,
+            FakeTelegram::default(),
+            self.store.clone(),
+        )
+        .await
+        .unwrap();
+    }
+
+    fn sends(&self) -> Vec<String> {
+        self.monitor
+            .messenger
+            .sends()
+            .into_iter()
+            .map(|call| match call {
+                Call::Send { chat_id, text } => {
+                    assert_eq!(chat_id, CHAT);
+                    text
+                }
+                _ => unreachable!(),
+            })
+            .collect()
+    }
+
+    /// One evaluation at `now`, the relays answering with `events`.
+    async fn round(&mut self, now: u64, events: &[Event], reachable: bool) {
+        self.monitor
+            .assess(Round {
+                now,
+                relays_reachable: Some(reachable),
+                events,
+                explorer: Some((971_485, "mempool.space".into())),
+            })
+            .await;
+    }
+
+    fn info(&self, created_at: u64) -> Event {
+        EventBuilder::new(Kind::Custom(NOSTR_INFO_EVENT_KIND), "")
+            .tags([
+                Tag::identifier(self.mostro.public_key().to_hex()),
+                Tag::parse(["maintenance_mode", "false"]).unwrap(),
+            ])
+            .custom_created_at(Timestamp::from(created_at))
+            .finalize(&self.mostro)
+            .unwrap()
+    }
+
+    /// A health event published at `created_at`: healthy, or the
+    /// 2026-10-14 incident (LND 136 blocks behind, unsynced, down).
+    fn health(&self, created_at: u64, seq: u64, stalled: bool) -> Event {
+        let mut tags = health_tags(&self.mostro, created_at, seq);
+        if stalled {
+            set_tag(&mut tags, "status", &["down"]);
+            set_tag(&mut tags, "lnd_block_height", &["971349"]);
+            set_tag(&mut tags, "lnd_synced_to_chain", &["false"]);
+            tags.retain(|t| t[0] != "check" || t[1] != "lnd_sync");
+            tags.push(vec![
+                "check".into(),
+                "lnd_sync".into(),
+                "fail".into(),
+                (NOW - 6 * 3600).to_string(),
+            ]);
+        }
+        sign(&self.mostro, tags, "", created_at)
+    }
+}
+
+/// Feeds a fresh event every minute for `minutes` from `start`.
+async fn minutes(h: &mut Harness, start: u64, minutes: u64, stalled: bool, seq0: u64) {
+    for i in 0..minutes {
+        let now = start + 60 * i;
+        let events = [h.info(now), h.health(now, seq0 + i, stalled)];
+        h.round(now, &events, true).await;
+    }
+}
+
+#[tokio::test]
+async fn the_incident_replayed_alerts_once_and_resolves_once() {
+    let mut h = Harness::new(config()).await;
+
+    // Healthy for ten minutes: nothing is sent.
+    minutes(&mut h, NOW, 10, false, 1).await;
+    assert!(h.sends().is_empty());
+
+    // Stalled: one alert after three samples, nothing more for 50 minutes.
+    minutes(&mut h, NOW + 600, 50, true, 100).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    let alert = &sends[0];
+    assert!(alert.starts_with("🚨 *Mostro health alert*"), "{alert}");
+    assert!(alert.contains("*LND behind the chain*"), "{alert}");
+    assert!(
+        alert.contains(r"LND is 136 blocks behind \(971349 vs 971485 from mempool\.space\)"),
+        "{alert}"
+    );
+    assert!(alert.contains("*LND not synced to chain*"), "{alert}");
+    assert!(alert.contains("*Mostro reports itself down*"), "{alert}");
+    assert!(alert.contains("*Test Mostro*"), "{alert}");
+
+    // Back to normal: one recovery message for everything.
+    minutes(&mut h, NOW + 3600, 10, false, 200).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert!(sends[1].starts_with("✅ *Resolved*"), "{}", sends[1]);
+    assert!(sends[1].contains("*LND behind the chain*"), "{}", sends[1]);
+}
+
+#[tokio::test]
+async fn a_long_critical_incident_is_repeated_hourly() {
+    let mut h = Harness::new(config()).await;
+
+    minutes(&mut h, NOW, 130, true, 1).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 3, "alert + 2 reminders: {sends:#?}");
+    assert!(sends[1].starts_with("🔁 *Still active*"), "{}", sends[1]);
+}
+
+#[tokio::test]
+async fn unreachable_relays_alert_as_relays_not_as_a_silent_mostro() {
+    let mut h = Harness::new(config()).await;
+
+    for i in 0..10 {
+        h.round(NOW + 60 * i, &[], false).await;
+    }
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(
+        sends[0].contains("*Relays unreachable from the watchdog*"),
+        "{}",
+        sends[0]
+    );
+    assert!(!sends[0].contains("silent"), "{}", sends[0]);
+}
+
+#[tokio::test]
+async fn a_silent_mostro_is_reported_when_relays_round_trip() {
+    let mut h = Harness::new(config()).await;
+    minutes(&mut h, NOW, 3, false, 1).await;
+
+    // mostrod stops: relays still work, its events just stop coming.
+    for i in 0..10 {
+        h.round(NOW + 180 + 60 * i, &[], true).await;
+    }
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(sends[0].contains("*Mostro is silent*"), "{}", sends[0]);
+}
+
+#[tokio::test]
+async fn phase_zero_reports_a_stopped_mostrod_once_and_its_return() {
+    let config = MonitorConfig {
+        info_silence_threshold: 900,
+        ..MonitorConfig::default()
+    };
+    let mut h = Harness::new(config).await;
+    let last_info = h.info(NOW);
+
+    // The info event stops at NOW; the threshold is 900 s.
+    for i in 0..30 {
+        h.round(NOW + 60 * i, std::slice::from_ref(&last_info), true)
+            .await;
+    }
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(
+        sends[0].contains("*Mostro info event silent*"),
+        "{}",
+        sends[0]
+    );
+
+    for i in 30..35 {
+        let fresh = h.info(NOW + 60 * i);
+        h.round(NOW + 60 * i, &[fresh], true).await;
+    }
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert!(
+        sends[1].contains("*Mostro info event silent*"),
+        "{}",
+        sends[1]
+    );
+    assert!(sends[1].starts_with("✅ *Resolved*"), "{}", sends[1]);
+}
+
+#[tokio::test]
+async fn nothing_is_sent_while_everything_is_healthy() {
+    let mut h = Harness::new(config()).await;
+
+    minutes(&mut h, NOW, 24 * 60, false, 1).await;
+
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+}
+
+#[tokio::test]
+async fn a_restart_neither_repeats_nor_forgets_an_open_incident() {
+    let mut h = Harness::new(config()).await;
+    minutes(&mut h, NOW, 10, true, 1).await;
+    assert_eq!(h.sends().len(), 1);
+
+    h.restart(config()).await;
+    minutes(&mut h, NOW + 600, 10, true, 100).await;
+    assert!(h.sends().is_empty(), "no new alert: {:#?}", h.sends());
+
+    minutes(&mut h, NOW + 1200, 5, false, 200).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(sends[0].starts_with("✅ *Resolved*"), "{}", sends[0]);
+}
+
+#[tokio::test]
+async fn an_older_revision_served_after_a_restart_is_not_accepted() {
+    let config = MonitorConfig {
+        info_silence_threshold: 0,
+        ..config()
+    };
+    let mut h = Harness::new(config.clone()).await;
+    // The instance published seq 50, stalled, then recovered with seq 51.
+    let stalled = h.health(NOW, 50, true);
+    let recovered = h.health(NOW + 60, 51, false);
+    h.round(NOW, std::slice::from_ref(&stalled), true).await;
+    h.round(NOW + 60, std::slice::from_ref(&recovered), true)
+        .await;
+
+    h.restart(config).await;
+    // A relay still serves the unexpired, older revision.
+    for i in 0..5 {
+        h.round(NOW + 90 + i, std::slice::from_ref(&stalled), true)
+            .await;
+    }
+
+    assert!(
+        h.monitor.health.is_none(),
+        "the replay must not become current"
+    );
+    assert_eq!(
+        h.store
+            .accepted(&h.mostro.public_key())
+            .await
+            .unwrap()
+            .map(|a| a.seq),
+        Some(51)
+    );
+    // Without the current revision the instance is unknown; it is never
+    // reported down on the strength of the replay.
+    for text in h.sends() {
+        assert!(!text.contains("not synced"), "{text}");
+        assert!(!text.contains("reports itself down"), "{text}");
+    }
+
+    // The current revision, served again, is still accepted.
+    h.round(NOW + 100, std::slice::from_ref(&recovered), true)
+        .await;
+    assert_eq!(h.monitor.health.as_ref().map(|r| r.envelope.seq), Some(51));
+}
+
+#[tokio::test]
+async fn forged_or_future_events_are_ignored() {
+    let mut h = Harness::new(config()).await;
+    let impostor = Keys::generate();
+    // Claims to be Mostro's address but is signed by someone else.
+    let mut tags = health_tags(&h.mostro, NOW, 9);
+    set_tag(&mut tags, "status", &["down"]);
+    let forged = sign(&impostor, tags, "", NOW);
+    let future = h.health(NOW + 400, 10, true);
+
+    h.round(NOW, &[forged, future], true).await;
+
+    assert!(h.monitor.health.is_none());
+}
+
+#[tokio::test]
+async fn the_encrypted_details_feed_the_payout_rules() {
+    let mut h = Harness::new(config()).await;
+    let mut body = payload();
+    body["payouts"]["payouts_succeeded_1h"] = 0.into();
+    body["payouts"]["payouts_failed_1h"] = 9.into();
+    body["payouts"]["failure_reasons_1h"] = serde_json::json!({"no_route": 9});
+
+    for i in 0..3 {
+        let now = NOW + 60 * i;
+        let mut tags = health_tags(&h.mostro, now, 1 + i);
+        set_tag(&mut tags, "p", &[&h.watchdog.public_key().to_hex()]);
+        let content = nip44::encrypt(
+            h.mostro.secret_key(),
+            &h.watchdog.public_key(),
+            body.to_string(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = sign(&h.mostro, tags, &content, now);
+        let info = h.info(now);
+        h.round(now, &[info, event], true).await;
+    }
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(sends[0].contains("*Buyer payouts failing*"), "{}", sends[0]);
+    assert!(sends[0].contains("Reasons: no\\_route 9"), "{}", sends[0]);
+}
+
+#[tokio::test]
+async fn the_heartbeat_keeps_rising_across_restarts() {
+    let mut h = Harness::new(config()).await;
+    let first = h.monitor.next_heartbeat(NOW * 1000).await.unwrap();
+
+    h.restart(config()).await;
+    // The clock stepped back a minute meanwhile.
+    let second = h.monitor.next_heartbeat((NOW - 60) * 1000).await.unwrap();
+
+    let seq = |e: &Event| {
+        e.tags
+            .iter()
+            .find(|t| t.as_slice()[0] == "seq")
+            .unwrap()
+            .as_slice()[1]
+            .parse::<u64>()
+            .unwrap()
+    };
+    assert!(seq(&second) > seq(&first));
+    assert!(second.created_at > first.created_at);
+}
+
+#[tokio::test]
+async fn a_silent_peer_watchdog_is_reported() {
+    let peer = Keys::generate();
+    let config = MonitorConfig {
+        peer_watchdogs: vec![peer.public_key().to_hex()],
+        ..MonitorConfig::default()
+    };
+    let mut h = Harness::new(config).await;
+    let beat = heartbeat::build(&peer, heartbeat::next(None, NOW * 1000), 60, None).unwrap();
+
+    for i in 0..10 {
+        let info = h.info(NOW + 60 * i);
+        h.round(NOW + 60 * i, &[info, beat.clone()], true).await;
+    }
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(sends[0].contains("*Peer watchdog silent*"), "{}", sends[0]);
+}
+
+#[tokio::test]
+async fn after_a_restart_the_current_event_restores_the_state_at_once() {
+    let mut h = Harness::new(config()).await;
+    let current = h.health(NOW, 42, false);
+    h.round(NOW, std::slice::from_ref(&current), true).await;
+
+    h.restart(config()).await;
+    // Same seq, another event: not the one accepted, so rejected.
+    let impostor_revision = h.health(NOW + 1, 42, true);
+    h.round(NOW + 30, std::slice::from_ref(&impostor_revision), true)
+        .await;
+    assert!(h.monitor.health.is_none());
+
+    // The relay returns the very event accepted before the restart.
+    h.round(NOW + 60, std::slice::from_ref(&current), true)
+        .await;
+
+    let restored = h.monitor.health.as_ref().expect("state restored");
+    assert_eq!(restored.envelope.id, current.id);
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+}

@@ -117,6 +117,10 @@ pub struct HealthConfig {
     /// Set to "0.0.0.0" for Docker or external access
     #[serde(default = "default_http_bind")]
     pub http_bind: String,
+    /// Mostro health monitoring: info event freshness, the health event,
+    /// the watchdog's heartbeat (see MOSTRO_HEALTH.md).
+    #[serde(flatten)]
+    pub monitor: crate::health::settings::MonitorConfig,
 }
 
 fn default_false() -> bool {
@@ -154,6 +158,7 @@ impl Default for HealthConfig {
             enable_http_endpoint: false,
             http_port: default_http_port(),
             http_bind: default_http_bind(),
+            monitor: Default::default(),
         }
     }
 }
@@ -297,6 +302,29 @@ fn check_key_variable(variable: &str) -> Result<(), KeyProblem> {
         return Err(KeyProblem::KeyAsVariable);
     }
     Ok(())
+}
+
+/// Reads the watchdog's secret key for health monitoring, which works
+/// without one: `Ok(None)` when `variable` is unset. A set but invalid key
+/// is an error that names the variable, never the value.
+pub fn read_optional_key(
+    variable: &str,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<Option<Keys>, String> {
+    match read_key(variable, env) {
+        Ok(keys) => Ok(Some(keys)),
+        Err(KeyProblem::Missing(_)) => Ok(None),
+        Err(KeyProblem::Invalid(variable)) => Err(format!(
+            "the environment variable {variable} does not hold a valid Nostr secret key \
+             (expected nsec or hex)"
+        )),
+        Err(KeyProblem::EmptyVariable) => Err("health.private_key_env cannot be empty".into()),
+        Err(KeyProblem::KeyAsVariable) => Err(
+            "health.private_key_env must name an environment variable, but it holds a \
+             Nostr secret key; move the key into the environment"
+                .into(),
+        ),
+    }
 }
 
 /// Reads the watchdog's secret key from `variable` through `env` (a lookup by
@@ -502,6 +530,16 @@ impl Config {
                     "relay_timeout must be greater than 0 when check_relays is enabled".into(),
                 );
             }
+            health.monitor.validate()?;
+            check_key_variable(&health.monitor.private_key_env).map_err(
+                |problem| match problem {
+                    KeyProblem::KeyAsVariable => "health.private_key_env must name an \
+                        environment variable, but it holds a Nostr secret key; move the key \
+                        into the environment"
+                        .to_string(),
+                    _ => "health.private_key_env cannot be empty".to_string(),
+                },
+            )?;
         }
 
         Ok(config)
@@ -776,6 +814,55 @@ chat_id = -1001
         let config = load("\n[serbero]\nprivate_key_env = \"SURELY_UNSET_VARIABLE_42\"\n");
 
         assert!(config.is_ok());
+    }
+
+    #[test]
+    fn health_monitoring_keys_sit_in_the_health_section() {
+        let config = load(
+            "\n[health]\nheartbeat_enabled = false\nmostro_health_enabled = true\n\
+             consecutive_samples = 5\n[health.thresholds]\nblock_lag_blocks = 4\n",
+        )
+        .unwrap();
+
+        let health = config.health.expect("section present");
+        assert!(health.monitor.mostro_health_enabled);
+        assert_eq!(health.monitor.consecutive_samples, 5);
+        assert_eq!(health.monitor.thresholds.block_lag_blocks, 4);
+        assert_eq!(health.monitor.info_silence_threshold, 10_800);
+    }
+
+    #[test]
+    fn invalid_health_monitoring_values_fail_at_load() {
+        let err = load("\n[health]\ncheck_interval = 10\n").unwrap_err();
+
+        assert!(format!("{err}").contains("check_interval"), "{err}");
+    }
+
+    #[test]
+    fn a_key_pasted_as_the_health_key_variable_is_rejected_without_echoing_it() {
+        let secret = Keys::generate().secret_key().to_secret_hex();
+
+        let err = load(&format!("\n[health]\nprivate_key_env = \"{secret}\"\n")).unwrap_err();
+
+        let printed = format!("{err:?}");
+        assert!(printed.contains("private_key_env"), "{printed}");
+        assert!(!printed.contains(&secret), "{printed}");
+    }
+
+    #[test]
+    fn the_health_key_is_optional_but_must_be_valid_when_set() {
+        let keys = Keys::generate();
+        let secret = keys.secret_key().to_secret_hex();
+
+        assert_eq!(read_optional_key("WD_KEY", |_| None), Ok(None));
+        assert_eq!(
+            read_optional_key("WD_KEY", |_| Some(secret.clone()))
+                .unwrap()
+                .map(|k| k.public_key()),
+            Some(keys.public_key())
+        );
+        let err = read_optional_key("WD_KEY", |_| Some("garbage".into())).unwrap_err();
+        assert!(err.contains("WD_KEY") && !err.contains("garbage"), "{err}");
     }
 
     #[test]

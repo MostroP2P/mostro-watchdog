@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 mod config;
 mod db;
 mod disputes;
+mod health;
 mod serbero;
 mod solver;
 mod timeline;
@@ -810,6 +811,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Mostro health monitoring: info event freshness, the health event and
+    // the watchdog's own heartbeat (MOSTRO_HEALTH.md).
+    let monitor_config = health_config.monitor.clone();
+    let health_summary = health::launch(
+        &monitor_config,
+        &client,
+        &bot,
+        config.telegram.chat_id,
+        mostro_pubkey,
+        dispute_store.pool(),
+    )?;
+
     // Answer Telegram commands while the Nostr event loop runs
     start_command_listener(
         bot.clone(),
@@ -825,7 +838,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_msg = format!(
         "🐕 *mostro\\-watchdog* is now online and monitoring for disputes\\.\n\n\
          📊 Heartbeat: {}\n\
-         🔔 Event silence alert: {}",
+         🔔 Event silence alert: {}\n\
+         🩺 Mostro health: {}",
         if health_config.heartbeat_enabled {
             format!("every {} seconds", health_config.heartbeat_interval)
         } else {
@@ -835,7 +849,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("{} seconds", health_config.event_alert_threshold)
         } else {
             "disabled".to_string()
-        }
+        },
+        escape_markdown(&health_summary)
     );
 
     if let Err(e) = bot
