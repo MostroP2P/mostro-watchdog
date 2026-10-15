@@ -505,9 +505,20 @@ fn status_down(s: &Snapshot) -> Reading {
     }
     let (list, since) = failing_checks(health);
     Reading::Bad {
-        detail: format!("Failing checks: {list}."),
+        detail: checks_detail("Failing checks", &list),
         since,
         min_duration: 0,
+    }
+}
+
+/// `"Failing checks: lnd_sync: fail."`, or, when no check this watchdog
+/// knows explains the published status, a note that one it doesn't know
+/// does: the published status always wins over the known checks.
+fn checks_detail(prefix: &str, list: &str) -> String {
+    if list.is_empty() {
+        "The reason is a check this watchdog doesn't know; it may need an update.".into()
+    } else {
+        format!("{prefix}: {list}.")
     }
 }
 
@@ -522,11 +533,13 @@ fn status_degraded(s: &Snapshot, min_duration: u64) -> Reading {
         Status::Degraded => {
             let (list, since) = failing_checks(health);
             // Degraded only because of maintenance: that has its own alert.
-            if list.is_empty() {
+            // Without maintenance, an empty list means a check this watchdog
+            // doesn't know is behind it, and the published status stands.
+            if list.is_empty() && health.maintenance_mode {
                 return Reading::GOOD;
             }
             Reading::Bad {
-                detail: format!("Checks not ok: {list}."),
+                detail: checks_detail("Checks not ok", &list),
                 since,
                 min_duration,
             }
@@ -1155,6 +1168,42 @@ mod tests {
 
         assert_eq!(reading(&s, RuleId::SettledUnpaid), Reading::Unknown);
         assert_eq!(reading(&s, RuleId::NoPayoutSuccess), Reading::Unknown);
+    }
+
+    #[test]
+    fn a_status_set_by_an_unknown_check_is_never_read_as_better() {
+        let mostro = Keys::generate();
+        let degraded = report_with(&mostro, |tags| {
+            set_tag(tags, "status", &["degraded"]);
+            // A check from a newer version, which this watchdog skips.
+            tags.push(vec![
+                "check".into(),
+                "quantum".into(),
+                "warn".into(),
+                "1791900000".into(),
+            ]);
+        });
+        let down = report_with(&mostro, |tags| {
+            set_tag(tags, "status", &["down"]);
+            tags.push(vec![
+                "check".into(),
+                "quantum".into(),
+                "fail".into(),
+                "1791900000".into(),
+            ]);
+        });
+
+        let s = snapshot(&mostro, Some(&degraded), None);
+        let Reading::Bad { detail, .. } = reading(&s, RuleId::StatusDegraded) else {
+            panic!("the published degraded must stand");
+        };
+        assert!(detail.contains("doesn't know"), "{detail}");
+
+        let s = snapshot(&mostro, Some(&down), None);
+        let Reading::Bad { detail, .. } = reading(&s, RuleId::StatusDown) else {
+            panic!("the published down must stand");
+        };
+        assert!(detail.contains("doesn't know"), "{detail}");
     }
 
     #[test]
