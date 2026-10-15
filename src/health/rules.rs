@@ -374,16 +374,23 @@ fn info_silent(s: &Snapshot, threshold: u64) -> Reading {
 }
 
 fn maintenance(s: &Snapshot) -> Reading {
-    // The health event is newer and more frequent; the info event is the
-    // fallback that works with any mostrod, but only when it is newer than
-    // the last health event: an older one can't say maintenance ended.
-    let (enabled, reason) = match (s.fresh_health(), &s.info) {
-        (Some(health), _) => (
+    // Whichever event is newest says: mostrod republishes both when the
+    // flag changes, but not at the same moment. The info event works with
+    // any mostrod; it never overrides a newer health event, fresh or
+    // stale, since an older event can't say maintenance ended.
+    let from_health = |health: &HealthReport| {
+        (
             health.maintenance_mode,
             s.fresh_details()
                 .and_then(|d| d.maintenance.as_ref())
                 .and_then(|m| m.reason.clone()),
-        ),
+        )
+    };
+    let (enabled, reason) = match (s.fresh_health(), &s.info) {
+        (Some(health), Some(info)) if info.created_at > health.envelope.created_at => {
+            (info.maintenance_mode, None)
+        }
+        (Some(health), _) => from_health(health),
         (None, Some(info))
             if s.health
                 .is_none_or(|h| info.created_at >= h.envelope.created_at) =>
@@ -1274,6 +1281,33 @@ mod tests {
         s.info = Some(InfoSnapshot {
             created_at: NOW - 60,
             maintenance_mode: true,
+        });
+        assert!(is_bad(&reading(&s, RuleId::Maintenance)));
+    }
+
+    #[test]
+    fn the_newest_of_the_health_and_info_events_says_whether_maintenance_is_on() {
+        let mostro = Keys::generate();
+        let on = report_with(&mostro, |tags| {
+            set_tag(tags, "maintenance_mode", &["true"]);
+            set_tag(tags, "status", &["degraded"]);
+        });
+        let mut s = snapshot(&mostro, Some(&on), None);
+
+        // mostrod ended maintenance and republished its info event first.
+        s.info = Some(InfoSnapshot {
+            created_at: NOW + 5,
+            maintenance_mode: false,
+        });
+        assert!(matches!(
+            reading(&s, RuleId::Maintenance),
+            Reading::Good { .. }
+        ));
+
+        // An older info event doesn't override the fresh health event.
+        s.info = Some(InfoSnapshot {
+            created_at: NOW - 5,
+            maintenance_mode: false,
         });
         assert!(is_bad(&reading(&s, RuleId::Maintenance)));
     }

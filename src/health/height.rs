@@ -100,7 +100,7 @@ pub async fn explorer_tip(http: &reqwest::Client, urls: &[String]) -> Option<(u6
                     .send()
                     .await?
                     .error_for_status()?;
-                response.text().await
+                read_capped(response, MAX_ANSWER_BYTES).await
             }
             .await;
             (url, result)
@@ -111,7 +111,11 @@ pub async fn explorer_tip(http: &reqwest::Client, urls: &[String]) -> Option<(u6
         let Ok((url, result)) = joined else {
             continue;
         };
-        match result.map(|body| parse_tip(&body)) {
+        let tip = result.map(|body| {
+            body.and_then(|bytes| String::from_utf8(bytes).ok())
+                .and_then(|text| parse_tip(&text))
+        });
+        match tip {
             Ok(Some(height)) => {
                 debug!(%url, height, "Explorer tip");
                 if best.as_ref().is_none_or(|(h, _)| height > *h) {
@@ -123,6 +127,23 @@ pub async fn explorer_tip(http: &reqwest::Client, urls: &[String]) -> Option<(u6
         }
     }
     best
+}
+
+/// Reads at most `max` bytes of `response`, chunk by chunk. `None` when the
+/// body is longer: an explorer answer is a few digits, and a large body is
+/// never buffered whole.
+async fn read_capped(
+    mut response: reqwest::Response,
+    max: usize,
+) -> Result<Option<Vec<u8>>, reqwest::Error> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > max {
+            return Ok(None);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(Some(body))
 }
 
 /// The reference to compare with: the highest of the explorer tip and the
@@ -208,6 +229,40 @@ mod tests {
         for body in ["", "0", "-5", "971485.0", "<html>", &"9".repeat(40)] {
             assert_eq!(parse_tip(body), None, "{body:?}");
         }
+    }
+
+    /// A one-shot HTTP server answering `body`, for the explorer client.
+    async fn serve(body: Vec<u8>) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}/tip", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = stream.write_all(head.as_bytes()).await;
+            let _ = stream.write_all(&body).await;
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn an_explorer_answer_is_read_up_to_a_few_bytes_only() {
+        let http = reqwest::Client::new();
+
+        let small = serve(b"971485".to_vec()).await;
+        assert_eq!(
+            explorer_tip(&http, &[small]).await.map(|(h, _)| h),
+            Some(971_485)
+        );
+
+        // A megabyte of digits: refused without being read whole.
+        let huge = serve(vec![b'9'; 1 << 20]).await;
+        assert_eq!(explorer_tip(&http, &[huge]).await, None);
     }
 
     #[test]
