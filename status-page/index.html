@@ -304,37 +304,40 @@ export const TIP_MAX_AGE = 1800;
 export const KNOWN_MAX_AGE = 30 * 86400;
 
 /**
- * Whether `report` may be taken, given the revision `accepted`
- * (`{ seq, id }`) remembered from an earlier visit: never an older seq,
- * and with the same seq only the very same event.
+ * The one rule that orders revisions of a publisher, used everywhere:
+ * live events, what other tabs stored, and merging before a write. Whether
+ * revision `a` (`{ seq, id }`) beats `b`: a higher seq, or on an equal seq
+ * a lower id. The same event never beats itself, so a stored revision
+ * served again is simply kept. (The watchdog also lets its persisted id
+ * win a tie; a page is a stateless reader in the spec, and lowest id gives
+ * every tab and every reload the same answer.)
  */
-export function acceptable(report, accepted) {
-  if (!accepted) return true;
-  if (report.seq < accepted.seq) return false;
-  if (report.seq === accepted.seq) return report.id === accepted.id;
+export function better(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  return a.seq > b.seq || (a.seq === b.seq && a.id < b.id);
+}
+
+/**
+ * Takes `report` for its publisher unless the revision shown or the one
+ * `stored` (by any tab) beats it. Returns true when it replaced what was
+ * shown.
+ */
+export function keepNewest(store, report, stored) {
+  if (better(stored, report)) return false;
+  if (!better(report, store.get(report.pubkey))) return false;
+  store.set(report.pubkey, report);
   return true;
 }
 
 /**
- * Keeps, per pubkey, the valid revision with the highest seq, never one
- * older than `accepted` (the revision remembered from an earlier visit).
- * Ties are settled as the watchdog does (`newest` in event.rs), whatever
- * order relays answer in: the remembered revision first, else the lowest
- * id. Returns true when `report` replaced what was there.
+ * The publishers whose shown revision is beaten by one another tab
+ * stored: they are shown as waiting until that revision arrives here.
  */
-export function keepNewest(store, report, accepted) {
-  if (!acceptable(report, accepted)) return false;
-  const current = store.get(report.pubkey);
-  if (current) {
-    if (current.seq > report.seq) return false;
-    if (current.seq === report.seq) {
-      // The remembered revision was already taken by `acceptable`.
-      if (accepted && accepted.seq === report.seq) return false;
-      if (report.id >= current.id) return false;
-    }
-  }
-  store.set(report.pubkey, report);
-  return true;
+export function superseded(shown, stored) {
+  return [...shown.values()]
+    .filter((report) => better(stored[report.pubkey], report))
+    .map((report) => report.pubkey);
 }
 
 /**
@@ -383,8 +386,8 @@ export function forgetOld(known, now) {
 
 /**
  * Merges accepted revisions from storage and from this tab: per
- * publisher, the higher seq with its id (on a tie, the stored one). Two
- * tabs writing never lower what the other stored.
+ * publisher, the better one by `better`. Two tabs writing never lower
+ * what the other stored, and agree on ties.
  */
 export function mergeAccepted(stored, mine) {
   const merged = {};
@@ -392,7 +395,7 @@ export function mergeAccepted(stored, mine) {
     for (const [pubkey, entry] of Object.entries(source)) {
       const valid = /^[0-9a-f]{64}$/.test(pubkey)
         && entry && Number.isSafeInteger(entry.seq) && typeof entry.id === 'string';
-      if (valid && (!merged[pubkey] || entry.seq >= merged[pubkey].seq)) merged[pubkey] = entry;
+      if (valid && better(entry, merged[pubkey])) merged[pubkey] = { seq: entry.seq, id: entry.id };
     }
   }
   return merged;
@@ -499,13 +502,17 @@ let known = forgetOld(loadJSON(KNOWN_KEY, {}), Math.floor(Date.now() / 1000));
 // Watchers seen on earlier visits: a dead one shows as unknown, not gone.
 const KNOWN_WATCHERS_KEY = 'mostro-status:known-watchers';
 let knownWatchers = forgetOld(loadJSON(KNOWN_WATCHERS_KEY, {}), Math.floor(Date.now() / 1000));
-// What was accepted on earlier visits, fixed for this one: it settles ties.
-const remembered = Object.freeze(Object.fromEntries(
-  Object.entries(loadJSON(ACCEPTED_KEY, {})).filter(([pubkey, a]) =>
-    /^[0-9a-f]{64}$/.test(pubkey) && a && Number.isSafeInteger(a.seq) && typeof a.id === 'string'),
-));
-// What to remember for the next visit.
-const accepted = { ...remembered };
+// The best revision per publisher seen by this tab. Merged with storage on
+// every read and write, it also stands in when storage is unavailable.
+let accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), {});
+// Publishers whose shown revision another tab beat: waiting for theirs.
+const waiting = new Set();
+
+/** The best revision per publisher, from this tab and every other. */
+function currentAccepted() {
+  accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), accepted);
+  return accepted;
+}
 
 function toHex(key) {
   if (/^[0-9a-f]{64}$/.test(key)) return key;
@@ -611,9 +618,11 @@ function render() {
       el('article', { class: 'card unknown' },
         el('div', { class: 'row' }, el('h3', {}, seen?.name || 'Mostro instance'), pill('unknown')),
         el('div', { class: 'key', title: key }, npub(key)),
-        el('p', { class: 'note' }, seen
-          ? `No valid health event served now. Last seen ${ago(t - seen.lastSeen)} ago.`
-          : 'No valid health event seen.')),
+        el('p', { class: 'note' }, waiting.has(key)
+          ? 'Another tab has seen a newer revision; waiting for it to arrive here.'
+          : seen
+            ? `No valid health event served now. Last seen ${ago(t - seen.lastSeen)} ago.`
+            : 'No valid health event seen.')),
     );
   }
   document.getElementById('instances-empty').hidden = grid.children.length > 0;
@@ -682,11 +691,13 @@ function onEvent(event) {
   }
   const { report } = result;
   const store = report.shape === 'instance' ? instances : watchers;
-  if (!keepNewest(store, report, remembered[report.pubkey])) return;
-  // Other tabs may have stored newer revisions or other publishers since
-  // this one loaded: re-read and merge right before writing.
-  accepted[report.pubkey] = { seq: report.seq, id: report.id };
-  Object.assign(accepted, mergeAccepted(loadJSON(ACCEPTED_KEY, {}), accepted));
+  // Judged against what any tab stored by now, not a page-load snapshot.
+  if (!keepNewest(store, report, currentAccepted()[report.pubkey])) return;
+  waiting.delete(report.pubkey);
+  accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), {
+    ...accepted,
+    [report.pubkey]: { seq: report.seq, id: report.id },
+  });
   saveJSON(ACCEPTED_KEY, accepted);
   if (report.shape === 'instance') {
     known = mergeKnown(loadJSON(KNOWN_KEY, {}), remember(known, report, now()), now());
@@ -701,6 +712,27 @@ function onEvent(event) {
   }
   render();
 }
+
+// Another tab stored something: a better revision than the one shown here
+// replaces it with "waiting" until it arrives; new sightings are merged.
+window.addEventListener('storage', (event) => {
+  if (event.key === ACCEPTED_KEY) {
+    const stored = currentAccepted();
+    for (const shown of [instances, watchers]) {
+      for (const pubkey of superseded(shown, stored)) {
+        shown.delete(pubkey);
+        waiting.add(pubkey);
+      }
+    }
+  } else if (event.key === KNOWN_KEY) {
+    known = mergeKnown(loadJSON(KNOWN_KEY, {}), known, now());
+  } else if (event.key === KNOWN_WATCHERS_KEY) {
+    knownWatchers = mergeKnown(loadJSON(KNOWN_WATCHERS_KEY, {}), knownWatchers, now());
+  } else {
+    return;
+  }
+  render();
+});
 
 /** Shows a problem with the page's parameters or connection. */
 function warn(text) {

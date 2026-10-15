@@ -12,7 +12,7 @@ import { readFileSync } from 'node:fs';
 const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
 const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END health-lib'));
 const {
-  parseHealthEvent, isFresh, displayState, keepNewest, ago, acceptable, freshTip, remember, forgetOld,
+  parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
@@ -160,20 +160,27 @@ test('durations read naturally', () => {
   assert.equal(ago(74460), '20 h 41 min');
 });
 
-test('a revision older than the one accepted on an earlier visit is refused', () => {
-  const at = (seq, id = 'e'.repeat(64)) => ({ ...parseHealthEvent(instance({ seq: [String(seq)] }), NOW, yes).report, id });
-  const remembered = { seq: 7, id: 'e'.repeat(64) };
+test('one rule orders revisions: higher seq, then lower id', () => {
+  const r = (seq, id) => ({ seq, id });
 
-  assert.equal(acceptable(at(6), remembered), false);
-  assert.equal(acceptable(at(7), remembered), true, 'the same event restores the state');
-  assert.equal(acceptable(at(7, 'f'.repeat(64)), remembered), false, 'same seq, other event');
-  assert.equal(acceptable(at(8), remembered), true);
-  assert.equal(acceptable(at(1), undefined), true);
+  assert.equal(better(r(8, 'b'), r(7, 'a')), true);
+  assert.equal(better(r(7, 'a'), r(7, 'b')), true);
+  assert.equal(better(r(7, 'b'), r(7, 'a')), false);
+  assert.equal(better(r(7, 'a'), r(7, 'a')), false, 'never beats itself');
+  assert.equal(better(r(1, 'z'), undefined), true);
+  assert.equal(better(undefined, r(1, 'z')), false);
+});
 
+test('a revision another tab beat is refused, the stored one restored', () => {
+  const at = (seq, id) => ({ ...parseHealthEvent(instance({ seq: [String(seq)] }), NOW, yes).report, id });
+  const stored = { seq: 9, id: 'e'.repeat(64) };
+
+  // Another tab persisted seq 9: this tab must not show seq 8.
   const store = new Map();
-  assert.equal(keepNewest(store, at(6), remembered), false);
+  assert.equal(keepNewest(store, at(8, 'e'.repeat(64)), stored), false);
   assert.equal(store.size, 0);
-  assert.equal(keepNewest(store, at(7), remembered), true);
+  // The stored revision itself is taken when it arrives.
+  assert.equal(keepNewest(store, at(9, 'e'.repeat(64)), stored), true);
 });
 
 test('an explorer tip is used only while it is fresh', () => {
@@ -212,7 +219,7 @@ test('integers past 2^53 − 1 are refused instead of rounded', () => {
   assert.equal(parseHealthEvent(bigSince, NOW, yes).reason, 'bad check');
 });
 
-test('a tie on seq is settled like the watchdog, whatever the arrival order', () => {
+test('a tie on seq goes to the lower id, whatever the arrival order or storage', () => {
   const at = (id) => ({ ...parseHealthEvent(instance(), NOW, yes).report, id });
   const low = at('1'.repeat(64));
   const high = at('9'.repeat(64));
@@ -220,15 +227,14 @@ test('a tie on seq is settled like the watchdog, whatever the arrival order', ()
   for (const order of [[low, high], [high, low]]) {
     const store = new Map();
     for (const report of order) keepNewest(store, report, undefined);
-    assert.equal(store.get(PK).id, low.id, 'lowest id');
+    assert.equal(store.get(PK).id, low.id);
   }
 
-  // The revision remembered from an earlier visit wins over a lower id.
+  // Storage holding the high id doesn't stop the low id.
   const store = new Map();
-  const remembered = { seq: high.seq, id: high.id };
-  keepNewest(store, low, remembered);
-  keepNewest(store, high, remembered);
-  assert.equal(store.get(PK).id, high.id);
+  keepNewest(store, high, { seq: high.seq, id: high.id });
+  assert.equal(keepNewest(store, low, { seq: high.seq, id: high.id }), true);
+  assert.equal(store.get(PK).id, low.id);
 });
 
 test('an instance parameter with no valid key is an error, not every instance', () => {
@@ -270,6 +276,24 @@ test('watchers are remembered with their software', () => {
   const { report } = parseHealthEvent(event, NOW, yes);
 
   assert.deepEqual(remember({}, report, NOW)[PK], { name: 'mostro-watchdog', lastSeen: NOW });
+});
+
+test('merging storage keeps the tie-break: the lower id survives an equal seq', () => {
+  const A = 'a'.repeat(64);
+  const stored = { [A]: { seq: 7, id: '9'.repeat(64) } };
+  const mine = { [A]: { seq: 7, id: '1'.repeat(64) } };
+
+  assert.deepEqual(mergeAccepted(stored, mine)[A], { seq: 7, id: '1'.repeat(64) });
+  assert.deepEqual(mergeAccepted(mine, stored)[A], { seq: 7, id: '1'.repeat(64) });
+});
+
+test('a revision shown here that another tab beat is marked as waiting', () => {
+  const at = (seq) => ({ ...parseHealthEvent(instance({ seq: [String(seq)] }), NOW, yes).report });
+  const shown = new Map([[PK, at(8)]]);
+
+  assert.deepEqual(superseded(shown, { [PK]: { seq: 9, id: 'x' } }), [PK]);
+  assert.deepEqual(superseded(shown, { [PK]: { seq: 8, id: shown.get(PK).id } }), []);
+  assert.deepEqual(superseded(shown, {}), []);
 });
 
 test('two tabs merging their accepted seq never lower each other', () => {

@@ -33,8 +33,13 @@ remembers in the browser's `localStorage`, when it is available:
   after 30 days), so one whose events are no longer served shows as **unknown** with
   "last seen" instead of vanishing.
 
-Before each write it re-reads what is stored and merges (highest `seq` per publisher,
-latest sighting per instance), so two open tabs never lower each other's data.
+One rule orders the revisions of a publisher everywhere: a higher `seq` wins, and on
+an equal `seq` the lower event id. Each incoming event is judged against what any tab
+has stored by then, writes merge with the stored data by the same rule, and when
+another tab stores a revision that beats the one shown here, this tab shows the
+publisher as waiting until that revision arrives. Tabs and reloads therefore always
+agree. (The watchdog also lets its persisted event id win a tie; the spec treats a page
+as a stateless reader, and lowest id gives every tab the same answer.)
 Without storage (private mode, some `file://` setups) it works as before. Explorer
 tips are used for 30 minutes after they were fetched; when every explorer has failed
 for longer, the card says "no reference" instead of comparing with a stale tip.
