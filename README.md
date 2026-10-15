@@ -353,6 +353,34 @@ Setup:
 See [SOLVER_NOTIFICATIONS.md](SOLVER_NOTIFICATIONS.md) for how it works, the protocol
 Mostrix speaks, and its limits.
 
+## Mostro Health Monitoring
+
+The watchdog also alerts when the Mostro instance stops **working**, not only when it
+stops running:
+
+- **Phase 0**, with any mostrod: Mostro's info event must keep arriving, and
+  maintenance mode is reported when it starts and ends.
+- **Phase 1** (`mostro_health_enabled = true`), with a mostrod that publishes the
+  health event (kind 38389): the event must stay fresh, and its checks, its block
+  height (compared with public explorers and other instances), its payouts and its
+  HTLCs are watched. It would have caught the 2026-10-14 incident, where an instance
+  paid nobody for 21 hours, within about half an hour.
+
+The watchdog publishes its own heartbeat, so "relays down" is never mistaken for
+"Mostro silent" and two watchdogs can watch each other. Telegram only gets state
+changes: an alert, reminders while a critical one lasts, and a "resolved" message.
+
+```text
+🚨 Mostro health alert
+Mostro 82fa8cb9…8390
+
+🔴 LND behind the chain
+LND is 136 blocks behind (971349 vs 971485 from mempool.space).
+Since: 2026-10-14 04:20:00 UTC
+```
+
+See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the setup.
+
 ## Configuration Reference
 
 | Field | Description |
@@ -369,12 +397,24 @@ Mostrix speaks, and its limits.
 | `serbero.pubkey` | Serbero's public key (hex or npub); read from the Mostro node's info event when omitted |
 | `solver_notifications.private_key_env` | Environment variable with the watchdog's Nostr secret key (default: `WATCHDOG_NOSTR_PRIVATE_KEY`) |
 | `solver_notifications.grace_period` | Seconds to wait for the solver's `sent` receipt before notifying (default: `20`, at most `600`) |
+| `health.info_silence_threshold` | Alert when Mostro's info event is older than this many seconds; 3 × its `publish_mostro_info_interval`, `0` turns it off (default: `10800`) |
+| `health.alert_on_maintenance` | Report when Mostro enters and leaves maintenance mode (default: `true`) |
+| `health.mostro_health_enabled` | Read Mostro's health event, kind 38389 (default: `false`) |
+| `health.check_interval` | Seconds between checks and the heartbeat interval, 30 to 3600 (default: `60`) |
+| `health.consecutive_samples` | Bad readings in a row before an alert, good ones before it is resolved (default: `3`) |
+| `health.renotify_interval` | Seconds between reminders of an active critical alert, `0` never (default: `3600`) |
+| `health.publish_heartbeat` | Publish the watchdog's own heartbeat, the relay round-trip probe (default: `true`) |
+| `health.peer_watchdogs` | Other watchdogs (npub or hex) whose heartbeat this one watches (default: none) |
+| `health.alerts_chat_id` | Telegram chat for health alerts (default: `telegram.chat_id`) |
+| `health.thresholds.*` | When a reading counts as bad; see [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md#configuration) |
 
 ## Roadmap
 
 - [x] **Pre-built binaries for Linux, macOS, Windows** ✅ *Available now with automatic installation script*
 - [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
 - [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
+- [x] **Mostro health monitoring** ✅ *Alert when Mostro stops working, not only when it stops running*
+- [ ] Static status page for Mostro instances
 - [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
 
