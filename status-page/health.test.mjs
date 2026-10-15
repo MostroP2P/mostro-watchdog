@@ -14,7 +14,7 @@ const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
-  syncAccepted, withLock,
+  syncAccepted, withLock, parseTip, MAX_PLAUSIBLE_HEIGHT,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -437,4 +437,22 @@ test('without the lock API the critical section still runs', async () => {
   assert.equal(result, 42);
   const locks = fakeLocks();
   await withLock(locks, 'mostro-status:accepted', () => assert.deepEqual(locks.held, ['mostro-status:accepted']));
+});
+
+test('an explorer tip must be an exact, plausible height', () => {
+  assert.equal(parseTip('971485\n'), 971485);
+  assert.equal(parseTip(String(MAX_PLAUSIBLE_HEIGHT)), MAX_PLAUSIBLE_HEIGHT);
+  for (const body of [
+    '9007199254740993', // past 2^53 - 1: JavaScript would round it
+    '9999999999999999',
+    String(MAX_PLAUSIBLE_HEIGHT + 1),
+    '0',
+    '-5',
+    '971485.0',
+    '<html>',
+    '',
+    undefined,
+  ]) {
+    assert.equal(parseTip(body), null, String(body));
+  }
 });

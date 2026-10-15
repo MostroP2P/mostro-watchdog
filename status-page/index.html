@@ -164,6 +164,25 @@ export const EXPLORERS = new Map([
   ['signet', ['https://mempool.space/signet/api/blocks/tip/height']],
 ]);
 
+/**
+ * Highest tip believed from an explorer. Mainnet is under a million
+ * blocks and testnet3, the tallest test chain, under five; anything far
+ * above is a broken or hostile answer, not a chain.
+ */
+export const MAX_PLAUSIBLE_HEIGHT = 10_000_000;
+
+/**
+ * An explorer's plain-text answer as a height, or null: a positive
+ * base-10 integer that JavaScript holds exactly and that is plausible
+ * for any Bitcoin chain.
+ */
+export function parseTip(body) {
+  const text = typeof body === 'string' ? body.trim() : '';
+  if (!/^[1-9][0-9]*$/.test(text) || text.length > 16) return null;
+  const height = Number(text);
+  return Number.isSafeInteger(height) && height <= MAX_PLAUSIBLE_HEIGHT ? height : null;
+}
+
 /** The explorers for `network`, or none. */
 export function explorersFor(network) {
   return EXPLORERS.get(network) || [];
@@ -719,8 +738,8 @@ async function refreshTips() {
     const answers = await Promise.all(urls.map(async (url) => {
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
-        const body = (await response.text()).trim();
-        return response.ok && /^[1-9][0-9]{0,15}$/.test(body) ? { height: Number(body), source: new URL(url).host } : null;
+        const height = response.ok ? parseTip(await response.text()) : null;
+        return height === null ? null : { height, source: new URL(url).host };
       } catch {
         return null;
       }
