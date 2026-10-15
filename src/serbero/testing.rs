@@ -68,6 +68,8 @@ pub struct FakeTelegram {
     sent: AtomicI32,
     pub down: AtomicBool,
     pub edits_fail: AtomicBool,
+    /// When set, how many more sends succeed before they fail.
+    pub sends_left: Mutex<Option<usize>>,
 }
 
 impl FakeTelegram {
@@ -117,6 +119,12 @@ impl FakeTelegram {
 impl Messenger for FakeTelegram {
     async fn send(&self, chat_id: i64, text: &str) -> Result<i32, RequestError> {
         self.reachable()?;
+        if let Some(left) = self.sends_left.lock().unwrap().as_mut() {
+            if *left == 0 {
+                return Err(RequestError::Api(ApiError::Unknown("send limit".into())));
+            }
+            *left -= 1;
+        }
         self.calls.lock().unwrap().push(Call::Send {
             chat_id,
             text: text.into(),

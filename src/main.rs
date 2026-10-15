@@ -10,6 +10,7 @@ use tracing::{debug, error, info, warn};
 mod config;
 mod db;
 mod disputes;
+mod health;
 mod serbero;
 mod solver;
 mod timeline;
@@ -810,6 +811,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    // Mostro health monitoring: info event freshness, the health event and
+    // the watchdog's own heartbeat (MOSTRO_HEALTH.md).
+    let monitor_config = health_config.monitor.clone();
+    let health_summary = health::launch(
+        &monitor_config,
+        &client,
+        &bot,
+        config.telegram.chat_id,
+        mostro_pubkey,
+        dispute_store.pool(),
+    )?;
+
     // Answer Telegram commands while the Nostr event loop runs
     start_command_listener(
         bot.clone(),
@@ -825,7 +838,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let startup_msg = format!(
         "🐕 *mostro\\-watchdog* is now online and monitoring for disputes\\.\n\n\
          📊 Heartbeat: {}\n\
-         🔔 Event silence alert: {}",
+         🔔 Event silence alert: {}\n\
+         🩺 Mostro health: {}",
         if health_config.heartbeat_enabled {
             format!("every {} seconds", health_config.heartbeat_interval)
         } else {
@@ -835,7 +849,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             format!("{} seconds", health_config.event_alert_threshold)
         } else {
             "disabled".to_string()
-        }
+        },
+        escape_markdown(&health_summary)
     );
 
     if let Err(e) = bot
@@ -1152,8 +1167,11 @@ fn chrono_timestamp(unix: u64) -> String {
 }
 
 fn escape_markdown(text: &str) -> String {
+    // MarkdownV2 reserves the backslash too: one left unescaped escapes the
+    // character after it, `*` of the template included.
     let special_chars = [
-        '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
+        '\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.',
+        '!',
     ];
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
@@ -1527,6 +1545,7 @@ mod tests {
         assert_eq!(escape_markdown("{brace}"), "\\{brace\\}");
         assert_eq!(escape_markdown(".dot"), "\\.dot");
         assert_eq!(escape_markdown("!exclaim"), "\\!exclaim");
+        assert_eq!(escape_markdown("back\\slash\\"), "back\\\\slash\\\\");
 
         // Test complex case with special characters from CodeRabbit example
         assert_eq!(
@@ -1640,9 +1659,11 @@ mod tests {
         assert_eq!(escape_markdown_code(""), "");
         assert_eq!(chrono_timestamp(0), "1970-01-01 00:00:00 UTC"); // Unix epoch
 
-        // Test boundary conditions - backslash is NOT in escape_markdown special chars
-        assert_eq!(escape_markdown("\\"), "\\"); // backslash not escaped by escape_markdown
-        assert_eq!(escape_markdown_code("\\"), "\\\\"); // but IS escaped by escape_markdown_code
+        // Backslashes are escaped everywhere: unescaped, one at the end of a
+        // value would escape the template's next delimiter (Telegram allows
+        // escaping any character from 1 to 126).
+        assert_eq!(escape_markdown("\\"), "\\\\");
+        assert_eq!(escape_markdown_code("\\"), "\\\\");
         assert_eq!(escape_markdown_code("`"), "\\`");
     }
 

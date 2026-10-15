@@ -113,6 +113,94 @@ http_port = 8080
 # Set to "0.0.0.0" when running in Docker to allow port mapping
 # http_bind = "0.0.0.0"
 
+# --- Mostro health monitoring (see MOSTRO_HEALTH.md) ---
+# Alerts when the Mostro instance stops working, not only when it stops
+# running. Telegram gets state changes only: an alert, reminders while a
+# critical one lasts, and a "resolved" message. Never periodic "all good".
+
+# Phase 0: alert when Mostro's info event (kind 38385) is older than this many
+# seconds. Set it to 3 x the instance's publish_mostro_info_interval (900 for
+# mostrod's default of 300). 0 turns it off. (default: 10800)
+# info_silence_threshold = 10800
+
+# Report when Mostro enters and leaves maintenance mode. (default: true)
+# alert_on_maintenance = true
+
+# Phase 1: read Mostro's health event (kind 38389). Turn it on once mostrod
+# publishes it; until then Mostro would be reported as silent. (default: false)
+# mostro_health_enabled = false
+
+# Seconds between two checks; also the interval of the watchdog's own
+# heartbeat. Between 30 and 3600. (default: 60)
+# check_interval = 60
+
+# Bad readings in a row before an alert, and good ones before it is resolved.
+# (default: 3)
+# consecutive_samples = 3
+
+# Seconds between reminders of a critical alert that is still active. 0 never
+# reminds; warnings never do. (default: 3600)
+# renotify_interval = 3600
+
+# Other Mostro instances (npub or hex) you trust: the median block height of
+# those on the same network (at least 3 fresh) is a reference too, next to the
+# explorers. Never every discovered instance: anyone can sign an event with a
+# made-up height. (default: none, explorers only)
+# trusted_peers = []
+
+# Publish the watchdog's own heartbeat (kind 38389, z = watcher). It is also
+# the relay round-trip probe that tells "relays down" from "Mostro silent".
+# Needs the watchdog's key, and only happens once mostro_health_enabled or
+# peer_watchdogs is set: an upgrade alone publishes nothing. (default: true)
+# publish_heartbeat = true
+
+# Name Mostro in a public `watching` tag of the heartbeat. It links the
+# watchdog's key to the instance in public. (default: false)
+# heartbeat_watching_tag = false
+
+
+# Other watchdogs (npub or hex) whose heartbeat this one watches. Run two on
+# different machines, each with the other's key here. (default: none)
+# peer_watchdogs = []
+
+# Telegram chat for health alerts. (default: [telegram].chat_id)
+# alerts_chat_id = -1001234567890
+
+# Environment variable with the watchdog's Nostr secret key: it decrypts the
+# health event's details and signs the heartbeat. Optional here: without it
+# only the public tags are read. Set the watchdog's hex pubkey (logged at
+# startup) as the health recipient in mostrod.
+# (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
+# private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+
+# Environment variable with a key that only decrypts the health details. Two
+# watchdogs must sign their heartbeats with different private_key_env keys but
+# may share this one. When the variable is unset, the private_key_env key
+# decrypts. (default: "WATCHDOG_HEALTH_DECRYPT_KEY")
+# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"
+
+# Explorers asked for the chain tip, per lnd_network. A table here replaces
+# the defaults (mainnet, testnet, testnet4, signet), so list every network you
+# need. Networks without explorers (regtest) skip the cross-check.
+# [health.block_height_sources]
+# mainnet = [
+#     "https://mempool.space/api/blocks/tip/height",
+#     "https://blockstream.info/api/blocks/tip/height",
+# ]
+
+# When a reading counts as bad. (defaults shown)
+# [health.thresholds]
+# block_lag_blocks = 3
+# block_lag_for_secs = 900
+# unsynced_for_secs = 600
+# no_payout_success_secs = 7200
+# payout_failure_rate = 0.5
+# payout_failure_min_attempts = 3
+# htlc_expiry_blocks = 72
+# settled_unpaid_warn_secs = 900
+# inactive_channels_warn_secs = 1800
+# degraded_for_secs = 600
+
 # Serbero alerts (optional)
 # Serbero is Mostro's dispute assistant. With this section, the watchdog shows
 # Serbero's progress on each dispute and pings the chat when Serbero hands a
@@ -153,6 +241,12 @@ http_port = 8080
 # Use the same one as [serbero] so the watchdog has a single key.
 # (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+
+# Environment variable with a key that only decrypts the health details. Two
+# watchdogs must sign their heartbeats with different private_key_env keys but
+# may share this one. When the variable is unset, the private_key_env key
+# decrypts. (default: "WATCHDOG_HEALTH_DECRYPT_KEY")
+# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"
 
 # Seconds to wait for the solver's own-message receipt before notifying; also
 # groups a burst of messages into one notification. (default: 20, at most 600)

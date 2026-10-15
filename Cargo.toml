@@ -27,6 +27,9 @@ mostro-core = "0.16.0"
 # Dispute ids in Mostro messages (already in the tree through mostro-core)
 uuid = "1.26.1"
 thiserror = "2.0.21"
+# Block height cross-check against public explorers. Already in the tree
+# through teloxide, with the same TLS backend (native-tls).
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 
 [dev-dependencies]
 futures = "0.3.34"

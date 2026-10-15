@@ -57,6 +57,7 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 | `src/config.rs` | TOML configuration parsing and validation |
 | `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, their timeline steps, and Serbero's state per dispute |
 | `src/serbero/` | Serbero alerts: decoding Serbero's DMs (`dm.rs`), key discovery (`discovery.rs`), subscription and catch-up (`sync.rs`), relaying to Telegram (`alerts.rs`, `render.rs`, `telegram.rs`) |
+| `src/health/` | Mostro health monitoring: verifying info and health events (`info.rs`, `event.rs`, `content.rs`), the rules and their incidents (`rules.rs`, `tracker.rs`), block-height references (`height.rs`), the watchdog's heartbeat (`heartbeat.rs`), storage (`store.rs`) and messages (`render.rs`). See `MOSTRO_HEALTH.md` |
 | `src/solver/` | Solver notifications: Mostrix's messages (`protocol.rs`), link codes and Telegram commands (`code.rs`, `commands.rs`), storage (`store.rs`), subscriptions and catch-up (`sync.rs`), batching and delivery (`notifier.rs`, `inbox.rs`) |
 | `src/version.rs` | Version and commit reporting for the CLI and the `/version` command |
 | `build.rs` | Embeds the git commit hash at build time |
@@ -125,8 +126,14 @@ logged with `tracing`, never sent to Telegram. False positives in that channel
 erode the signal admins rely on.
 
 The deliberate exceptions are the startup message, which is sent
-unconditionally on every launch, and the heartbeat, which is off by default and
-enabled with `heartbeat_enabled`.
+unconditionally on every launch, the heartbeat, which is off by default and
+enabled with `heartbeat_enabled`, and Mostro health alerts (`src/health/`).
+Health alerts are about the Mostro instance failing, not about the watchdog's
+own connections, and they follow strict rules: only state changes (an alert,
+reminders of a critical one, a "resolved" message), after
+`consecutive_samples` readings in a row, grouped into one message per
+evaluation, and never a periodic "all good". They can go to their own chat
+with `[health].alerts_chat_id`. A single relay dropping is still logged only.
 
 ### One message per dispute
 
@@ -161,6 +168,10 @@ add a test covering the escaping.
 ### Nostr events
 
 - Dispute events are kind 38386, filtered by the configured Mostro pubkey.
+- Health events are kind 38389 (`z` = `health` for an instance, `watcher` for a
+  watchdog's heartbeat). Follow the protocol's "What a reader owes" in
+  `health_event.md`: verify before reading, take the highest `seq` and persist
+  it, and treat a missing or stale event as unknown, never as ok.
 - Relay lists are discovered via NIP-65 (kind 10002), with the configured relays
   acting as bootstrap and fallback.
 - Treat every field of an incoming event as untrusted input. Parse defensively
