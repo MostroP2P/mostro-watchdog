@@ -56,16 +56,20 @@ pub enum Change {
     Upsert(Incident),
     /// An incident that never reached Telegram cleared: forget it.
     Delete(Subject, RuleId),
-    /// A delivered incident cleared at `at`: keep it until its "resolved"
-    /// message is delivered, so a restart can't lose that message.
+    /// A delivered incident cleared at `at`: it is no longer open, and its
+    /// "resolved" message is kept until delivered, so neither a restart nor
+    /// the same rule opening again can lose it.
     Resolve {
-        subject: Subject,
-        rule: RuleId,
+        incident: Incident,
         at: u64,
         detail: Option<String>,
     },
-    /// The "resolved" message of an incident was delivered.
-    Delivered(Subject, RuleId),
+    /// The "resolved" message of the incident cleared at `at` was delivered.
+    Delivered {
+        subject: Subject,
+        rule: RuleId,
+        at: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -189,8 +193,7 @@ impl Tracker {
                     return (None, Some(delete));
                 }
                 let change = Change::Resolve {
-                    subject: incident.subject.clone(),
-                    rule: incident.rule,
+                    incident: incident.clone(),
                     at: now,
                     detail: detail.clone(),
                 };
@@ -453,14 +456,11 @@ mod tests {
 
         assert!(matches!(changes[0], Change::Upsert(ref i) if i.notified_at.is_none()));
         assert!(matches!(changes[1], Change::Upsert(ref i) if i.notified_at == Some(T0 + 2)));
-        assert_eq!(
+        assert!(matches!(
             changes[2],
-            Change::Resolve {
-                subject: s,
-                rule,
-                at: T0 + 5,
-                detail: Some("fine".into()),
-            }
-        );
+            Change::Resolve { ref incident, at, ref detail }
+                if incident.subject == s && incident.rule == rule && at == T0 + 5
+                    && detail.as_deref() == Some("fine")
+        ));
     }
 }

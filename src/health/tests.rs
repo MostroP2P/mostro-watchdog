@@ -534,3 +534,85 @@ async fn an_upgraded_watchdog_with_a_key_publishes_no_heartbeat() {
 
     assert!(h.monitor.next_heartbeat(NOW * 1000).await.is_none());
 }
+
+#[tokio::test]
+async fn one_evaluation_sends_one_message_across_subjects_and_kinds() {
+    let peer = Keys::generate();
+    let config = MonitorConfig {
+        peer_watchdogs: vec![peer.public_key().to_hex()],
+        ..config()
+    };
+    let mut h = Harness::new(config).await;
+    // Mostro stalls and the peer watchdog is silent from the start: both
+    // open in the same round.
+    minutes(&mut h, NOW, 3, true, 1).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(
+        sends[0].contains("*LND not synced to chain*"),
+        "{}",
+        sends[0]
+    );
+    assert!(sends[0].contains("*Peer watchdog silent*"), "{}", sends[0]);
+
+    // Mostro recovers while the peer appears: one round resolves both.
+    let beat =
+        heartbeat::build(&peer, heartbeat::next(None, (NOW + 180) * 1000), 60, None).unwrap();
+    for i in 0..3 {
+        let now = NOW + 180 + 60 * i;
+        let events = [h.info(now), h.health(now, 10 + i, false), beat.clone()];
+        h.round(now, &events, true).await;
+    }
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert!(
+        sends[1].contains("*LND not synced to chain*"),
+        "{}",
+        sends[1]
+    );
+    assert!(sends[1].contains("*Peer watchdog silent*"), "{}", sends[1]);
+}
+
+#[tokio::test]
+async fn an_older_revision_of_a_trusted_peer_cannot_lower_the_median() {
+    let peers: Vec<Keys> = (0..3).map(|_| Keys::generate()).collect();
+    let config = MonitorConfig {
+        trusted_peers: peers.iter().map(|k| k.public_key().to_hex()).collect(),
+        ..config()
+    };
+    let mut h = Harness::new(config.clone()).await;
+    let event = |keys: &Keys, seq: u64, height: &str, at: u64| {
+        let mut tags = health_tags(keys, at, seq);
+        set_tag(&mut tags, "lnd_block_height", &[height]);
+        sign(keys, tags, "", at)
+    };
+    let mostro = h.health(NOW, 1, false);
+    let current: Vec<Event> = peers.iter().map(|k| event(k, 10, "971485", NOW)).collect();
+    // Older revisions, still fresh, with a lower height.
+    let older: Vec<Event> = peers
+        .iter()
+        .map(|k| event(k, 9, "971300", NOW - 30))
+        .collect();
+
+    h.monitor
+        .ingest(&[current, vec![mostro.clone()]].concat(), NOW)
+        .await;
+    assert_eq!(h.monitor.peer_heights, vec![971_485; 3]);
+
+    h.monitor
+        .ingest(&[older.clone(), vec![mostro.clone()]].concat(), NOW + 10)
+        .await;
+    assert_eq!(h.monitor.peer_heights, vec![971_485; 3]);
+
+    // After a restart the persisted seq still rejects them.
+    h.restart(config).await;
+    h.monitor
+        .ingest(&[older, vec![mostro]].concat(), NOW + 20)
+        .await;
+    assert!(
+        h.monitor.peer_heights.is_empty(),
+        "{:?}",
+        h.monitor.peer_heights
+    );
+}

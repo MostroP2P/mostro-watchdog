@@ -340,20 +340,7 @@ fn parse_checks(event: &Event, created_at: u64) -> Result<Vec<Check>, Rejection>
 
 /// Verifies an instance health event from `author` and reads its tags.
 pub fn parse_health(event: &Event, author: PublicKey, now: u64) -> Result<HealthReport, Rejection> {
-    parse_health_from(event, Some(author), now)
-}
-
-/// Like [`parse_health`], for an instance discovered by kind and `z`.
-pub fn parse_any_health(event: &Event, now: u64) -> Result<HealthReport, Rejection> {
-    parse_health_from(event, None, now)
-}
-
-fn parse_health_from(
-    event: &Event,
-    author: Option<PublicKey>,
-    now: u64,
-) -> Result<HealthReport, Rejection> {
-    let envelope = verify_envelope(event, author, Z_HEALTH, now)?;
+    let envelope = verify_envelope(event, Some(author), Z_HEALTH, now)?;
     let y = single_tag(event, "y")?.ok_or(Rejection::Malformed("y"))?;
     if y.get(1).map(String::as_str) != Some("mostro") {
         return Err(Rejection::Malformed("y"));

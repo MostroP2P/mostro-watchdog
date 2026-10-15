@@ -1,7 +1,6 @@
-//! Telegram messages for health incidents, in MarkdownV2. The notices of
-//! one evaluation are grouped: one message per subject for new alerts, one
-//! for reminders, one for recoveries, so an incident that trips several
-//! rules at once rings the phones once.
+//! Telegram messages for health incidents, in MarkdownV2. All the notices of
+//! one evaluation go out as one message: a section per subject for new
+//! alerts, reminders and recoveries, so a round rings the phones once.
 
 use super::rules::{human_duration, Severity, Subject};
 use super::tracker::Notice;
@@ -117,6 +116,27 @@ pub fn resolved(label: &str, notices: &[&Notice]) -> String {
     format!("✅ *Resolved*\n{label}\n\n{body}")
 }
 
+/// Telegram's limit on a message, in characters, minus some room.
+const MAX_MESSAGE_CHARS: usize = 4000;
+
+/// Joins `sections` into as few messages as fit Telegram's limit, never
+/// splitting a section. Almost always one message.
+pub fn pack(sections: &[String]) -> Vec<String> {
+    let mut messages: Vec<String> = Vec::new();
+    for section in sections {
+        match messages.last_mut() {
+            Some(last)
+                if last.chars().count() + 2 + section.chars().count() <= MAX_MESSAGE_CHARS =>
+            {
+                last.push_str("\n\n");
+                last.push_str(section);
+            }
+            _ => messages.push(section.clone()),
+        }
+    }
+    messages
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +233,21 @@ mod tests {
 
         assert!(text.contains("For: 2 h 0 min"), "{text}");
         assert!(text.contains(r"synced\_to\_chain"), "{text}");
+    }
+
+    #[test]
+    fn sections_share_one_message_unless_it_would_be_too_long() {
+        let sections = vec!["a".repeat(100), "b".repeat(100), "c".repeat(100)];
+        assert_eq!(pack(&sections).len(), 1);
+        assert!(pack(&sections)[0].contains(&format!(
+            "{}\n\n{}",
+            "a".repeat(100),
+            "b".repeat(100)
+        )));
+
+        let big = vec!["a".repeat(3000), "b".repeat(3000)];
+        assert_eq!(pack(&big), big);
+        assert!(pack(&[]).is_empty());
     }
 
     #[test]

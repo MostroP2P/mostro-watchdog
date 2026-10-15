@@ -2,8 +2,9 @@
 //! repeats nor loses anything:
 //!
 //! - open incidents, so an alert is not sent twice and its recovery is
-//!   still reported, and cleared ones until their "resolved" message is
-//!   delivered;
+//!   still reported;
+//! - "resolved" messages not delivered yet, in a table of their own, so
+//!   neither a restart nor the same rule opening again loses one;
 //! - the highest `seq` accepted per pubkey, so a relay serving an older,
 //!   unexpired revision after a restart is not believed (spec rule 2);
 //! - the watchdog's own heartbeat `seq` and `created_at`, which must keep
@@ -16,7 +17,7 @@ use super::event::Accepted;
 use super::rules::{RuleId, Severity, Subject};
 use super::tracker::{Change, Incident, Notice};
 
-const SCHEMA: [&str; 3] = [
+const SCHEMA: [&str; 4] = [
     r#"
     CREATE TABLE IF NOT EXISTS health_incidents (
         subject TEXT NOT NULL,
@@ -26,9 +27,21 @@ const SCHEMA: [&str; 3] = [
         opened_at INTEGER NOT NULL,
         notified_at INTEGER,
         detail TEXT NOT NULL,
-        resolved_at INTEGER,
-        resolution TEXT,
         PRIMARY KEY (subject, rule)
+    )
+    "#,
+    r#"
+    CREATE TABLE IF NOT EXISTS health_pending_recoveries (
+        subject TEXT NOT NULL,
+        rule TEXT NOT NULL,
+        severity TEXT NOT NULL,
+        started_at INTEGER NOT NULL,
+        opened_at INTEGER NOT NULL,
+        notified_at INTEGER,
+        detail TEXT NOT NULL,
+        resolved_at INTEGER NOT NULL,
+        resolution TEXT,
+        PRIMARY KEY (subject, rule, resolved_at)
     )
     "#,
     r#"
@@ -73,7 +86,7 @@ impl HealthStore {
     pub async fn open_incidents(&self) -> Result<Vec<Incident>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT subject, rule, severity, started_at, opened_at, notified_at, detail \
-             FROM health_incidents WHERE resolved_at IS NULL",
+             FROM health_incidents",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -84,7 +97,7 @@ impl HealthStore {
     pub async fn pending_recoveries(&self) -> Result<Vec<Notice>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT subject, rule, severity, started_at, opened_at, notified_at, detail, \
-             resolved_at, resolution FROM health_incidents WHERE resolved_at IS NOT NULL",
+             resolved_at, resolution FROM health_pending_recoveries ORDER BY resolved_at",
         )
         .fetch_all(&self.pool)
         .await?;
@@ -114,9 +127,7 @@ impl HealthStore {
                         started_at = excluded.started_at,
                         opened_at = excluded.opened_at,
                         notified_at = excluded.notified_at,
-                        detail = excluded.detail,
-                        resolved_at = NULL,
-                        resolution = NULL
+                        detail = excluded.detail
                     "#,
                 )
                 .bind(incident.subject.key())
@@ -137,30 +148,47 @@ impl HealthStore {
                     .await?;
             }
             Change::Resolve {
-                subject,
-                rule,
+                incident,
                 at,
                 detail,
             } => {
+                // One transaction: the incident is never both open and
+                // pending, nor neither.
+                let mut tx = self.pool.begin().await?;
                 sqlx::query(
-                    "UPDATE health_incidents SET resolved_at = ?, resolution = ? \
-                     WHERE subject = ? AND rule = ?",
+                    r#"
+                    INSERT OR REPLACE INTO health_pending_recoveries
+                        (subject, rule, severity, started_at, opened_at, notified_at, detail,
+                         resolved_at, resolution)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    "#,
                 )
+                .bind(incident.subject.key())
+                .bind(incident.rule.as_str())
+                .bind(incident.severity.as_str())
+                .bind(incident.started_at as i64)
+                .bind(incident.opened_at as i64)
+                .bind(incident.notified_at.map(|at| at as i64))
+                .bind(&incident.detail)
                 .bind(*at as i64)
                 .bind(detail)
-                .bind(subject.key())
-                .bind(rule.as_str())
-                .execute(&self.pool)
+                .execute(&mut *tx)
                 .await?;
+                sqlx::query("DELETE FROM health_incidents WHERE subject = ? AND rule = ?")
+                    .bind(incident.subject.key())
+                    .bind(incident.rule.as_str())
+                    .execute(&mut *tx)
+                    .await?;
+                tx.commit().await?;
             }
-            // Only a cleared row: the same rule may have opened again since.
-            Change::Delivered(subject, rule) => {
+            Change::Delivered { subject, rule, at } => {
                 sqlx::query(
-                    "DELETE FROM health_incidents \
-                     WHERE subject = ? AND rule = ? AND resolved_at IS NOT NULL",
+                    "DELETE FROM health_pending_recoveries \
+                     WHERE subject = ? AND rule = ? AND resolved_at = ?",
                 )
                 .bind(subject.key())
                 .bind(rule.as_str())
+                .bind(*at as i64)
                 .execute(&self.pool)
                 .await?;
             }
@@ -295,7 +323,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn a_resolved_incident_waits_for_its_message_and_a_reopened_one_survives() {
+    async fn a_pending_recovery_survives_the_same_rule_opening_again() {
         let (_dir, store) = store().await;
         let incident = incident(Some(300));
         let (subject, rule) = (incident.subject.clone(), incident.rule);
@@ -306,36 +334,50 @@ pub(crate) mod tests {
 
         store
             .apply(&Change::Resolve {
-                subject: subject.clone(),
-                rule,
+                incident: incident.clone(),
                 at: 900,
                 detail: Some("back".into()),
             })
             .await
             .unwrap();
-
         assert!(store.open_incidents().await.unwrap().is_empty());
+
+        // The rule opens again while Telegram still hasn't taken the
+        // recovery: both are kept.
+        let reopened = Incident {
+            started_at: 950,
+            opened_at: 1000,
+            notified_at: None,
+            ..incident.clone()
+        };
+        store
+            .apply(&Change::Upsert(reopened.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store.open_incidents().await.unwrap(),
+            vec![reopened.clone()]
+        );
         assert_eq!(
             store.pending_recoveries().await.unwrap(),
             vec![Notice::Resolved {
-                incident: incident.clone(),
+                incident,
                 at: 900,
                 detail: Some("back".into()),
             }]
         );
 
-        // The rule opens again before the recovery was delivered: the new
-        // incident replaces the row and outlives the late delivery.
         store
-            .apply(&Change::Upsert(incident.clone()))
+            .apply(&Change::Delivered {
+                subject,
+                rule,
+                at: 900,
+            })
             .await
             .unwrap();
-        store
-            .apply(&Change::Delivered(subject.clone(), rule))
-            .await
-            .unwrap();
-        assert_eq!(store.open_incidents().await.unwrap(), vec![incident]);
         assert!(store.pending_recoveries().await.unwrap().is_empty());
+        assert_eq!(store.open_incidents().await.unwrap(), vec![reopened]);
     }
 
     #[tokio::test]

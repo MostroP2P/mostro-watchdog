@@ -11,13 +11,12 @@
 //!
 //! With neither (for example on regtest), the cross-check is skipped.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use nostr_sdk::prelude::*;
 use tracing::{debug, warn};
 
-use super::event::{newest, parse_any_health, EscrowMode, HealthReport};
+use super::event::{parse_health, EscrowMode, HealthReport};
 use super::rules::Reference;
 
 /// Fewest other instances whose median is trusted.
@@ -38,25 +37,28 @@ pub fn median(mut heights: Vec<u64>) -> Option<u64> {
     Some(heights[(heights.len() - 1) / 2])
 }
 
-/// Heights of the `trusted` instances on `network`, from their fresh
-/// health events, one per instance (its highest `seq`).
-pub fn peer_heights(events: &[Event], trusted: &[PublicKey], network: &str, now: u64) -> Vec<u64> {
-    let mut by_instance: HashMap<PublicKey, Vec<HealthReport>> = HashMap::new();
-    for report in events
+/// The valid health events of `peer` among `events`, newest first by
+/// nothing in particular: [`newest`] picks among them against the
+/// revision already accepted, so an older one a relay still serves is
+/// never taken over it.
+pub fn peer_reports(events: &[Event], peer: PublicKey, now: u64) -> Vec<HealthReport> {
+    events
         .iter()
-        .filter(|event| trusted.contains(&event.pubkey))
-        .filter_map(|event| parse_any_health(event, now).ok())
-    {
-        if report.envelope.is_fresh(now) {
-            by_instance
-                .entry(report.envelope.pubkey)
-                .or_default()
-                .push(report);
-        }
-    }
-    by_instance
-        .values()
-        .filter_map(|reports| newest(reports, |r| &r.envelope, None))
+        .filter(|event| event.pubkey == peer)
+        .filter_map(|event| parse_health(event, peer, now).ok())
+        .collect()
+}
+
+/// Heights on `network` of the trusted instances' current revisions that
+/// are still fresh.
+pub fn peer_heights<'a>(
+    current: impl IntoIterator<Item = &'a HealthReport>,
+    network: &str,
+    now: u64,
+) -> Vec<u64> {
+    current
+        .into_iter()
+        .filter(|r| r.envelope.is_fresh(now))
         .filter(|r| {
             r.escrow_mode == EscrowMode::Lightning && r.lnd_network.as_deref() == Some(network)
         })
@@ -160,34 +162,44 @@ mod tests {
     }
 
     #[test]
-    fn peer_heights_only_count_fresh_trusted_instances_on_the_same_network() {
+    fn peer_heights_only_count_fresh_reports_on_the_same_network() {
         let (a, b, c, d) = (
             Keys::generate(),
             Keys::generate(),
             Keys::generate(),
             Keys::generate(),
         );
-        let stranger = Keys::generate();
-        let events = vec![
-            instance(&a, "971485", "mainnet", NOW),
-            instance(&b, "971486", "mainnet", NOW - 30),
-            instance(&c, "2000", "signet", NOW),
-            instance(&d, "971000", "mainnet", NOW - 1000),
-            // Validly signed, made-up height, not trusted: ignored.
-            instance(&stranger, "999999", "mainnet", NOW),
-        ];
-        let trusted = [
-            a.public_key(),
-            b.public_key(),
-            c.public_key(),
-            d.public_key(),
-        ];
+        let reports: Vec<HealthReport> = [
+            (&a, "971485", "mainnet", NOW),
+            (&b, "971486", "mainnet", NOW - 30),
+            (&c, "2000", "signet", NOW),
+            (&d, "971000", "mainnet", NOW - 1000),
+        ]
+        .into_iter()
+        .map(|(keys, height, network, at)| {
+            parse_health(&instance(keys, height, network, at), keys.public_key(), NOW).unwrap()
+        })
+        .collect();
 
-        let mut heights = peer_heights(&events, &trusted, "mainnet", NOW);
+        let mut heights = peer_heights(&reports, "mainnet", NOW);
         heights.sort();
 
         assert_eq!(heights, vec![971_485, 971_486]);
-        assert!(peer_heights(&events, &[], "mainnet", NOW).is_empty());
+    }
+
+    #[test]
+    fn peer_reports_keep_only_the_peers_valid_events() {
+        let peer = Keys::generate();
+        let stranger = Keys::generate();
+        let events = vec![
+            instance(&peer, "971485", "mainnet", NOW),
+            instance(&stranger, "999999", "mainnet", NOW),
+        ];
+
+        let reports = peer_reports(&events, peer.public_key(), NOW);
+
+        assert_eq!(reports.len(), 1);
+        assert_eq!(reports[0].lnd_block_height, Some(971_485));
     }
 
     #[test]

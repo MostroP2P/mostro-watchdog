@@ -650,7 +650,10 @@ fn payout_failure_rate(s: &Snapshot, max_rate: f64, min_attempts: u64) -> Readin
     else {
         return Reading::Unknown;
     };
-    let attempts = succeeded + failed;
+    // Untrusted counters: a sum that overflows is no reading.
+    let Some(attempts) = succeeded.checked_add(failed) else {
+        return Reading::Unknown;
+    };
     if attempts < min_attempts || (failed as f64) <= max_rate * attempts as f64 {
         return Reading::good("Most buyer payouts succeed again.");
     }
@@ -1133,6 +1136,19 @@ mod tests {
         let lightning = report_with(&mostro, |_| {});
         let s = snapshot(&mostro, Some(&lightning), None);
         assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
+    }
+
+    #[test]
+    fn overflowing_payout_counters_are_unknown() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let overflow = details(|body| {
+            body["payouts"]["payouts_succeeded_1h"] = u64::MAX.into();
+            body["payouts"]["payouts_failed_1h"] = 1.into();
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&overflow));
+
+        assert_eq!(reading(&s, RuleId::PayoutFailureRate), Reading::Unknown);
     }
 
     #[test]

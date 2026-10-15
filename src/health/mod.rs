@@ -97,6 +97,8 @@ pub struct Monitor<M> {
     health: Option<HealthReport>,
     details: Option<HealthDetails>,
     peer_beats: HashMap<PublicKey, Envelope>,
+    /// The current revision of each trusted peer, by persisted `seq`.
+    trusted_reports: HashMap<PublicKey, HealthReport>,
     peer_heights: Vec<u64>,
     last_heartbeat: Option<LastHeartbeat>,
     /// The last content outcome logged, so a problem is logged once.
@@ -127,14 +129,14 @@ impl<M: Messenger> Monitor<M> {
         store: HealthStore,
     ) -> Result<Self, sqlx::Error> {
         let peers = config.peer_watchdogs().unwrap_or_default();
-        let trusted_peers = config
+        let trusted_peers: Vec<PublicKey> = config
             .trusted_peers()
             .unwrap_or_default()
             .into_iter()
             .filter(|pk| *pk != mostro)
             .collect();
         let mut accepted = HashMap::new();
-        for pubkey in std::iter::once(&mostro).chain(&peers) {
+        for pubkey in std::iter::once(&mostro).chain(&peers).chain(&trusted_peers) {
             if let Some(last) = store.accepted(pubkey).await? {
                 accepted.insert(*pubkey, last);
             }
@@ -158,6 +160,7 @@ impl<M: Messenger> Monitor<M> {
             health: None,
             details: None,
             peer_beats: HashMap::new(),
+            trusted_reports: HashMap::new(),
             peer_heights: Vec::new(),
             last_heartbeat,
             content_logged: None,
@@ -265,8 +268,18 @@ impl<M: Messenger> Monitor<M> {
                 self.peer_beats.insert(peer, beat.envelope);
             }
         }
+        // Trusted peers follow the same seq rules as Mostro: an older
+        // revision a relay still serves must not lower the median.
+        for peer in self.trusted_peers.clone() {
+            let reports = height::peer_reports(events, peer, now);
+            let last = self.accepted.get(&peer).copied();
+            if let Some(report) = newest(&reports, |r| &r.envelope, last).cloned() {
+                self.accept(&report.envelope).await;
+                self.trusted_reports.insert(peer, report);
+            }
+        }
         self.peer_heights = match self.reference_network() {
-            Some(network) => height::peer_heights(events, &self.trusted_peers, network, now),
+            Some(network) => height::peer_heights(self.trusted_reports.values(), network, now),
             None => Vec::new(),
         };
     }
@@ -421,59 +434,74 @@ impl<M: Messenger> Monitor<M> {
     }
 
     async fn deliver(&mut self, notices: Vec<Notice>, now: u64) {
-        // One message per subject and kind of notice.
-        let mut groups: BTreeMap<(Subject, u8), Vec<Notice>> = BTreeMap::new();
-        for notice in notices {
+        if notices.is_empty() {
+            return;
+        }
+        // One message for the whole evaluation: a section per subject and
+        // kind of notice (new alerts, reminders, recoveries), so a round
+        // rings the phones once.
+        let mut groups: BTreeMap<(u8, Subject), Vec<&Notice>> = BTreeMap::new();
+        for notice in &notices {
             let kind = match notice {
                 Notice::Opened(_) => 0,
                 Notice::Reminder(_) => 1,
                 Notice::Resolved { .. } => 2,
             };
             groups
-                .entry((notice.incident().subject.clone(), kind))
+                .entry((kind, notice.incident().subject.clone()))
                 .or_default()
                 .push(notice);
         }
         let mostro_name = self.health.as_ref().and_then(|h| h.name.clone());
-        for ((subject, kind), group) in groups {
-            let label = render::subject_label(&subject, mostro_name.as_deref());
-            let refs: Vec<&Notice> = group.iter().collect();
-            let text = match kind {
-                0 => render::opened(&label, &refs),
-                1 => render::reminders(&label, &refs, now),
-                _ => render::resolved(&label, &refs),
-            };
-            let rules: Vec<&str> = group.iter().map(|n| n.incident().rule.as_str()).collect();
-            match self.messenger.send(self.chat_id, &text).await {
-                Ok(_) => {
-                    info!(subject = %subject.key(), ?rules, kind, "🩺 Health notice sent");
-                    for notice in &group {
-                        let incident = notice.incident();
-                        let change = match notice {
-                            Notice::Resolved { .. } => {
-                                Some(Change::Delivered(incident.subject.clone(), incident.rule))
-                            }
-                            _ => self
-                                .tracker
-                                .mark_notified(&incident.subject, incident.rule, now),
-                        };
-                        if let Some(change) = change {
-                            if let Err(e) = self.store.apply(&change).await {
-                                error!(error = %e, "Failed to persist a health incident");
-                            }
-                        }
-                    }
+        let sections: Vec<String> = groups
+            .iter()
+            .map(|((kind, subject), group)| {
+                let label = render::subject_label(subject, mostro_name.as_deref());
+                match kind {
+                    0 => render::opened(&label, group),
+                    1 => render::reminders(&label, group, now),
+                    _ => render::resolved(&label, group),
                 }
-                Err(e) => {
-                    // Alerts and reminders are retried by the tracker on the
-                    // next bad reading; recoveries are kept here, and in the
-                    // store until delivered.
-                    error!(subject = %subject.key(), ?rules, error = %e, "Failed to send a health notice");
-                    self.undelivered.extend(
-                        group
-                            .into_iter()
-                            .filter(|n| matches!(n, Notice::Resolved { .. })),
-                    );
+            })
+            .collect();
+        let rules: Vec<&str> = notices.iter().map(|n| n.incident().rule.as_str()).collect();
+        // Telegram caps a message; a round that doesn't fit (many peer
+        // watchdogs at once) is split at section boundaries.
+        let mut delivered = true;
+        for text in render::pack(&sections) {
+            if let Err(e) = self.messenger.send(self.chat_id, &text).await {
+                error!(?rules, error = %e, "Failed to send a health notice");
+                delivered = false;
+                break;
+            }
+        }
+        if !delivered {
+            // Alerts and reminders are retried by the tracker on the next
+            // bad reading; recoveries are kept here, and in the store until
+            // delivered.
+            self.undelivered.extend(
+                notices
+                    .into_iter()
+                    .filter(|n| matches!(n, Notice::Resolved { .. })),
+            );
+            return;
+        }
+        info!(?rules, "🩺 Health notice sent");
+        for notice in &notices {
+            let incident = notice.incident();
+            let change = match notice {
+                Notice::Resolved { at, .. } => Some(Change::Delivered {
+                    subject: incident.subject.clone(),
+                    rule: incident.rule,
+                    at: *at,
+                }),
+                _ => self
+                    .tracker
+                    .mark_notified(&incident.subject, incident.rule, now),
+            };
+            if let Some(change) = change {
+                if let Err(e) = self.store.apply(&change).await {
+                    error!(error = %e, "Failed to persist a health incident");
                 }
             }
         }
