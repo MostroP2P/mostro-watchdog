@@ -182,6 +182,12 @@ goes silent.
   give them the **same** `WATCHDOG_HEALTH_DECRYPT_KEY` and set its pubkey as the health
   recipient in mostrod.
 
+## Status page
+
+[`status-page/`](status-page/) is a static page, with no backend and no key, that reads
+the same events from relays and shows every instance as ok, degraded, down or
+unknown, with its block height next to an explorer's, and the watchers' heartbeats.
+
 ## Configuration
 
 All keys go in `[health]`, next to the watchdog's own process monitoring

@@ -383,6 +383,8 @@ Since: 2026-10-14 04:20:00 UTC
 ```
 
 See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the setup.
+For a public view of the same events, without Telegram, see the static
+[status page](status-page/).
 
 ## Configuration Reference
 
@@ -420,7 +422,7 @@ See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the set
 - [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
 - [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
 - [x] **Mostro health monitoring** ✅ *Alert when Mostro stops working, not only when it stops running*
-- [ ] Static status page for Mostro instances
+- [x] **Static status page** ✅ *Live health of every Mostro instance, no backend ([status-page/](status-page/))*
 - [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
 

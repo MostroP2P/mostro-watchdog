@@ -1,0 +1,858 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mostro Status</title>
+<meta name="description" content="Live health of Mostro instances, read from their signed Nostr health events (kind 38389).">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #1d2330;
+    --muted: #5d6677;
+    --border: #dfe3ea;
+    --ok: #1a7f37;
+    --ok-bg: #dcf5e3;
+    --degraded: #8a5a00;
+    --degraded-bg: #fdf0cc;
+    --down: #b42318;
+    --down-bg: #fde3e1;
+    --unknown: #4b5563;
+    --unknown-bg: #e7e9ee;
+    --accent: #3b5bdb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141a;
+      --card: #1a1f28;
+      --text: #e6e9ef;
+      --muted: #9aa3b2;
+      --border: #2c3341;
+      --ok: #6fdc8c;
+      --ok-bg: #173a24;
+      --degraded: #f4c45a;
+      --degraded-bg: #3d3014;
+      --down: #ff8a80;
+      --down-bg: #45201d;
+      --unknown: #b4bcc8;
+      --unknown-bg: #2a303b;
+      --accent: #8da2fb;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 6px solid var(--unknown);
+    border-radius: 10px;
+    padding: 14px 16px;
+    min-width: 0;
+  }
+  .card.ok { border-left-color: var(--ok); }
+  .card.degraded { border-left-color: var(--degraded); }
+  .card.down { border-left-color: var(--down); }
+  .card h3 { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
+  .key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+  .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .pill {
+    display: inline-block;
+    padding: 1px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.degraded, .pill.warn { color: var(--degraded); background: var(--degraded-bg); }
+  .pill.down, .pill.fail { color: var(--down); background: var(--down-bg); }
+  .pill.unknown { color: var(--unknown); background: var(--unknown-bg); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 10px 0 0; font-size: 0.9rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .lag { color: var(--down); font-weight: 600; }
+  ul.checks { list-style: none; padding: 0; margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .note { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+  h2 { font-size: 1.15rem; margin: 32px 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 0.9rem; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  .empty { color: var(--muted); padding: 16px 0; }
+  .param-error { color: var(--down); background: var(--down-bg); border-radius: 8px; padding: 10px 14px; margin: 16px 0 0; }
+  footer { margin-top: 32px; color: var(--muted); font-size: 0.85rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Mostro Status</h1>
+    <p>Live health of Mostro instances, from their signed Nostr health events (kind 38389). Public tags only: no key, no backend.</p>
+  </header>
+
+  <div id="param-errors" role="alert"></div>
+  <div class="summary" id="summary" aria-live="polite"></div>
+
+  <section aria-labelledby="instances-title">
+    <h2 id="instances-title">Instances</h2>
+    <div class="grid" id="instances"></div>
+    <p class="empty" id="instances-empty">Waiting for health events from the relays…</p>
+  </section>
+
+  <section aria-labelledby="watchers-title" id="watchers-section">
+    <h2 id="watchers-title">Watchers</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Watcher</th><th>Software</th><th>Watching</th><th>Last seen</th><th>State</th></tr></thead>
+        <tbody id="watchers"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="watchers-empty">No watcher heartbeat seen yet.</p>
+  </section>
+
+  <footer>
+    <p id="relays-line"></p>
+    <p>An instance with no valid event, or whose last event expired or is older than three intervals, is shown as <strong>unknown</strong>, never as ok. Block heights are compared with public explorers for the same network; a lag of 3 blocks or more is highlighted.</p>
+  </footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/nostr-tools@2.25.2/lib/nostr.bundle.js"
+        integrity="sha384-FXQAsrQPF8+Yw4G9sjW+s9sUIozKgjjidpD4OPcUaIxR5Z7gMcDFArOKmEq+KES2"
+        crossorigin="anonymous"></script>
+
+<script type="module">
+// BEGIN health-lib
+// The reader rules of the protocol's health event (health_event.md, "What a
+// reader owes"), as pure functions so they are tested with node (see
+// health.test.mjs). `verify` checks the NIP-01 signature.
+export const HEALTH_KIND = 38389;
+export const MIN_INTERVAL = 30;
+export const MAX_INTERVAL = 3600;
+export const MAX_SEQ = 9007199254740991;
+export const MAX_FUTURE_SKEW = 300;
+
+const INSTANCE_REQUIRED = ['d', 'y', 'z', 'status', 'escrow_mode', 'maintenance_mode', 'mostro_version', 'interval', 'seq', 'expiration'];
+const INSTANCE_OPTIONAL = ['lnd_block_height', 'lnd_synced_to_chain', 'lnd_network', 'p'];
+const WATCHER_REQUIRED = ['d', 'y', 'z', 'interval', 'seq', 'expiration'];
+const STATUSES = ['ok', 'degraded', 'down'];
+const CHECK_STATES = ['ok', 'warn', 'fail', 'unknown'];
+const KNOWN_CHECKS = ['lnd_sync', 'payouts', 'relays', 'database', 'cashu_mint'];
+/** The `lnd_network` values of the spec; anything else is malformed. */
+const NETWORKS = ['mainnet', 'testnet', 'testnet4', 'signet', 'regtest', 'simnet'];
+
+/**
+ * Explorers per network, in a Map: a network name never reaches an object
+ * prototype (`toString`, `__proto__`). Networks without one (regtest,
+ * simnet) get no comparison.
+ */
+export const EXPLORERS = new Map([
+  ['mainnet', ['https://mempool.space/api/blocks/tip/height', 'https://blockstream.info/api/blocks/tip/height']],
+  ['testnet', ['https://mempool.space/testnet/api/blocks/tip/height', 'https://blockstream.info/testnet/api/blocks/tip/height']],
+  ['testnet4', ['https://mempool.space/testnet4/api/blocks/tip/height']],
+  ['signet', ['https://mempool.space/signet/api/blocks/tip/height']],
+]);
+
+/**
+ * Highest tip believed from an explorer. Mainnet is under a million
+ * blocks and testnet3, the tallest test chain, under five; anything far
+ * above is a broken or hostile answer, not a chain.
+ */
+export const MAX_PLAUSIBLE_HEIGHT = 10_000_000;
+
+/**
+ * An explorer's plain-text answer as a height, or null: a positive
+ * base-10 integer that JavaScript holds exactly and that is plausible
+ * for any Bitcoin chain.
+ */
+export function parseTip(body) {
+  const text = typeof body === 'string' ? body.trim() : '';
+  if (!/^[1-9][0-9]*$/.test(text) || text.length > 16) return null;
+  const height = Number(text);
+  return Number.isSafeInteger(height) && height <= MAX_PLAUSIBLE_HEIGHT ? height : null;
+}
+
+/** The explorers for `network`, or none. */
+export function explorersFor(network) {
+  return EXPLORERS.get(network) || [];
+}
+
+/**
+ * A base-10 integer tag value as a number, or null. Values past 2^53 − 1
+ * are refused: JavaScript would round them, so a height or seq could
+ * silently change.
+ */
+function toInteger(value) {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : null;
+}
+
+function isHexKey(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/** The single value of tag `name`, or undefined. */
+function single(tags, name) {
+  const tag = tags.find((t) => t[0] === name);
+  return tag ? tag[1] : undefined;
+}
+
+/**
+ * Validates a kind-38389 event. Returns `{ valid: true, report }` or
+ * `{ valid: false, reason }`. Never trusts a field before checking it.
+ */
+export function parseHealthEvent(event, now, verify) {
+  const fail = (reason) => ({ valid: false, reason });
+  if (!event || event.kind !== HEALTH_KIND || !Array.isArray(event.tags)) return fail('not kind 38389');
+  if (!event.tags.every((t) => Array.isArray(t) && t.length >= 1 && t.every((v) => typeof v === 'string'))) {
+    return fail('malformed tags');
+  }
+  if (!verify(event)) return fail('invalid signature');
+  const tags = event.tags;
+  const z = single(tags, 'z');
+  const shape = z === 'health' ? 'instance' : z === 'watcher' ? 'watcher' : null;
+  if (!shape) return fail('z is neither health nor watcher');
+
+  // Every tag of the table appears at most once; `check` once per name;
+  // `watching` once per pubkey.
+  const singles = shape === 'instance' ? [...INSTANCE_REQUIRED, ...INSTANCE_OPTIONAL] : WATCHER_REQUIRED;
+  for (const name of singles) {
+    const found = tags.filter((t) => t[0] === name);
+    if (found.length > 1) return fail(`repeated ${name}`);
+    // Present but with no value is malformed, never "absent".
+    if (found.length === 1 && found[0].length < 2) return fail(`bad ${name}`);
+  }
+  const required = shape === 'instance' ? INSTANCE_REQUIRED : WATCHER_REQUIRED;
+  for (const name of required) {
+    const value = single(tags, name);
+    if (value === undefined) return fail(`missing ${name}`);
+  }
+  if (single(tags, 'd') !== event.pubkey) return fail('d is not the author');
+  if (!Number.isSafeInteger(event.created_at) || event.created_at < 0) return fail('bad created_at');
+  if (event.created_at > now + MAX_FUTURE_SKEW) return fail('dated in the future');
+
+  const interval = single(tags, 'interval');
+  const seq = single(tags, 'seq');
+  const expiration = single(tags, 'expiration');
+  const intervalN = toInteger(interval);
+  const seqN = toInteger(seq);
+  const expirationN = toInteger(expiration);
+  if (intervalN === null || intervalN < MIN_INTERVAL || intervalN > MAX_INTERVAL) return fail('bad interval');
+  if (seqN === null || seqN < 1 || seqN > MAX_SEQ) return fail('bad seq');
+  if (expirationN === null || expirationN !== event.created_at + 3 * intervalN) return fail('bad expiration');
+
+  const base = {
+    pubkey: event.pubkey,
+    id: event.id,
+    createdAt: event.created_at,
+    interval: intervalN,
+    seq: seqN,
+    expiration: expirationN,
+  };
+
+  if (shape === 'watcher') {
+    const watching = [];
+    for (const tag of tags.filter((t) => t[0] === 'watching')) {
+      if (!isHexKey(tag[1]) || watching.includes(tag[1])) return fail('bad watching');
+      watching.push(tag[1]);
+    }
+    return { valid: true, report: { ...base, shape, software: single(tags, 'y'), watching } };
+  }
+
+  const y = tags.find((t) => t[0] === 'y');
+  if (y[1] !== 'mostro') return fail('y is not mostro');
+  const status = single(tags, 'status');
+  if (!STATUSES.includes(status)) return fail('bad status');
+  const escrowMode = single(tags, 'escrow_mode');
+  if (escrowMode !== 'lightning' && escrowMode !== 'cashu') return fail('bad escrow_mode');
+  const maintenance = single(tags, 'maintenance_mode');
+  if (maintenance !== 'true' && maintenance !== 'false') return fail('bad maintenance_mode');
+
+  const checks = [];
+  const seen = new Set();
+  for (const tag of tags.filter((t) => t[0] === 'check')) {
+    const [, name, state, since] = tag;
+    const sinceN = toInteger(since);
+    if (tag.length < 4 || sinceN === null || sinceN > event.created_at || seen.has(name)) {
+      return fail('bad check');
+    }
+    seen.add(name);
+    if (KNOWN_CHECKS.includes(name)) {
+      checks.push({ name, state: CHECK_STATES.includes(state) ? state : 'unknown', since: sinceN });
+    }
+  }
+  if (checks.length === 0) return fail('no check');
+
+  const height = single(tags, 'lnd_block_height');
+  const heightN = height === undefined ? null : toInteger(height);
+  if (height !== undefined && heightN === null) return fail('bad lnd_block_height');
+  const synced = single(tags, 'lnd_synced_to_chain');
+  if (synced !== undefined && synced !== 'true' && synced !== 'false') return fail('bad lnd_synced_to_chain');
+  const network = single(tags, 'lnd_network');
+  if (network !== undefined && !NETWORKS.includes(network)) return fail('bad lnd_network');
+  const p = single(tags, 'p');
+  if (p !== undefined && !isHexKey(p)) return fail('bad p');
+  if ((p !== undefined) === (event.content === '')) return fail('p without content or content without p');
+
+  return {
+    valid: true,
+    report: {
+      ...base,
+      shape,
+      name: y[2] || null,
+      status,
+      escrowMode,
+      maintenance: maintenance === 'true',
+      version: single(tags, 'mostro_version'),
+      blockHeight: heightN,
+      synced: synced === undefined ? null : synced === 'true',
+      network: network ?? null,
+      checks,
+    },
+  };
+}
+
+/** Whether `report` can still be trusted at `now`. */
+export function isFresh(report, now) {
+  return now < report.expiration && now - report.createdAt <= 3 * report.interval;
+}
+
+/** The state to show: the reported status while fresh, else unknown. */
+export function displayState(report, now) {
+  if (!report || !isFresh(report, now)) return 'unknown';
+  return report.shape === 'instance' ? report.status : 'ok';
+}
+
+/** How long an explorer tip is used, in seconds, after it was fetched. */
+export const TIP_MAX_AGE = 1800;
+
+/** Instances not seen for this long are forgotten, in seconds. */
+export const KNOWN_MAX_AGE = 30 * 86400;
+
+/**
+ * The one rule that orders revisions of a publisher, used everywhere:
+ * live events, what other tabs stored, and merging before a write. Whether
+ * revision `a` (`{ seq, id }`) beats `b`: a higher seq, or on an equal seq
+ * a lower id. The same event never beats itself, so a stored revision
+ * served again is simply kept. (The watchdog also lets its persisted id
+ * win a tie; a page is a stateless reader in the spec, and lowest id gives
+ * every tab and every reload the same answer.)
+ */
+export function better(a, b) {
+  if (!a) return false;
+  if (!b) return true;
+  return a.seq > b.seq || (a.seq === b.seq && a.id < b.id);
+}
+
+/**
+ * Takes `report` for its publisher unless the revision shown or the one
+ * `stored` (by any tab) beats it. Returns true when it replaced what was
+ * shown.
+ */
+export function keepNewest(store, report, stored) {
+  if (better(stored, report)) return false;
+  if (!better(report, store.get(report.pubkey))) return false;
+  store.set(report.pubkey, report);
+  return true;
+}
+
+/**
+ * The publishers whose shown revision is beaten by one another tab
+ * stored: they are shown as waiting until that revision arrives here.
+ */
+export function superseded(shown, stored) {
+  return [...shown.values()]
+    .filter((report) => better(stored[report.pubkey], report))
+    .map((report) => report.pubkey);
+}
+
+/**
+ * The `instance` URL parameter: whether it was given (`present`, from
+ * `URLSearchParams.has`), its valid keys (hex) and its invalid entries. A
+ * parameter given with no valid key, empty ones included, is an error,
+ * never "every instance". `toHex` turns an npub or hex key into hex, or
+ * null.
+ */
+export function parseInstanceParam(raw, toHex, present = raw !== null && raw !== undefined) {
+  const entries = (raw || '').split(',').map((k) => k.trim()).filter(Boolean);
+  const keys = [...new Set(entries.map(toHex).filter(Boolean))];
+  const invalid = entries.filter((entry) => !toHex(entry));
+  return { given: present, keys, invalid };
+}
+
+/** `tip` while it is younger than `maxAge` seconds, else null. */
+export function freshTip(tip, now, maxAge = TIP_MAX_AGE) {
+  return tip && now - tip.at <= maxAge ? tip : null;
+}
+
+/**
+ * The publishers seen so far (`{ pubkey: { name, lastSeen } }`), with
+ * `report` added, and without those not seen for KNOWN_MAX_AGE. The name
+ * is an instance's name, or a watcher's software. Returns a new object.
+ */
+export function remember(known, report, now) {
+  const next = forgetOld(known, now);
+  const previous = next[report.pubkey];
+  if (!previous || previous.lastSeen <= report.createdAt) {
+    const name = report.shape === 'watcher' ? report.software : report.name;
+    next[report.pubkey] = { name: name ?? null, lastSeen: report.createdAt };
+  }
+  return next;
+}
+
+/** `known` without the instances not seen for KNOWN_MAX_AGE. */
+export function forgetOld(known, now) {
+  const next = {};
+  for (const [pubkey, entry] of Object.entries(known || {})) {
+    const valid = /^[0-9a-f]{64}$/.test(pubkey)
+      && entry && Number.isFinite(entry.lastSeen)
+      && (entry.name === null || typeof entry.name === 'string');
+    if (valid && now - entry.lastSeen <= KNOWN_MAX_AGE) next[pubkey] = entry;
+  }
+  return next;
+}
+
+/**
+ * Merges accepted revisions from storage and from this tab: per
+ * publisher, the better one by `better`. Two tabs writing never lower
+ * what the other stored, and agree on ties.
+ */
+export function mergeAccepted(stored, mine) {
+  const merged = {};
+  for (const source of [mine || {}, stored || {}]) {
+    for (const [pubkey, entry] of Object.entries(source)) {
+      const valid = /^[0-9a-f]{64}$/.test(pubkey)
+        && entry && Number.isSafeInteger(entry.seq) && typeof entry.id === 'string';
+      if (valid && better(entry, merged[pubkey])) merged[pubkey] = { seq: entry.seq, id: entry.id };
+    }
+  }
+  // Sorted keys: the same content always serializes the same, so writing
+  // back an unchanged merge is a no-op and tabs don't wake each other.
+  return Object.fromEntries(Object.entries(merged).sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/**
+ * Reads what is stored, merges `mine` into it and writes the result back
+ * when it differs. Run it under `withLock`, so another tab can't write
+ * between the read and the write. Returns the merged map.
+ */
+export function syncAccepted(read, write, mine) {
+  const stored = read();
+  const merged = mergeAccepted(stored, mine);
+  if (JSON.stringify(merged) !== JSON.stringify(mergeAccepted(stored, {}))) write(merged);
+  return merged;
+}
+
+/**
+ * Runs `critical` holding the Web Locks lock `name` when the browser has
+ * the API (`navigator.locks`), which makes a read-merge-write atomic
+ * across tabs. Without it, runs it directly: the merge still never lowers
+ * what another tab stored.
+ */
+export async function withLock(locks, name, critical) {
+  if (locks && typeof locks.request === 'function') return locks.request(name, critical);
+  return critical();
+}
+
+/** Merges two known-publisher maps: per publisher, the latest sighting. */
+export function mergeKnown(stored, mine, now) {
+  const merged = { ...forgetOld(stored, now) };
+  for (const [pubkey, entry] of Object.entries(forgetOld(mine, now))) {
+    if (!merged[pubkey] || entry.lastSeen > merged[pubkey].lastSeen) merged[pubkey] = entry;
+  }
+  return merged;
+}
+
+/**
+ * The `relays` URL parameter: the valid relay URLs (ws: or wss: with a
+ * host) and the invalid entries, so they can be named. Not given, or no
+ * valid entry: the defaults.
+ */
+export function parseRelayParam(raw, defaults) {
+  const entries = (raw || '').split(',').map((r) => r.trim()).filter(Boolean);
+  const relays = [];
+  const invalid = [];
+  for (const entry of entries) {
+    let url = null;
+    try {
+      url = new URL(entry);
+    } catch {
+      url = null;
+    }
+    if (url && (url.protocol === 'wss:' || url.protocol === 'ws:') && url.hostname) {
+      if (!relays.includes(url.href)) relays.push(url.href);
+    } else {
+      invalid.push(entry);
+    }
+  }
+  return { relays: relays.length ? relays : defaults, invalid, usedDefaults: relays.length === 0 };
+}
+
+/** "45 s", "7 min", "2 h 5 min", "3 d 4 h". */
+export function ago(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} d ${h} h`;
+  if (h) return `${h} h ${m} min`;
+  if (m) return `${m} min`;
+  return `${s} s`;
+}
+// END health-lib
+
+const DEFAULT_RELAYS = ['wss://relay.mostro.network', 'wss://nos.lol', 'wss://relay.damus.io'];
+const LAG_BLOCKS = 3;
+const EXPLORER_REFRESH_MS = 60_000;
+
+const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
+const params = new URLSearchParams(location.search);
+const relayParam = parseRelayParam(params.get('relays'), DEFAULT_RELAYS);
+const relayList = relayParam.relays;
+const instanceParam = parseInstanceParam(params.get('instance'), toHex, params.has('instance'));
+const onlyInstances = instanceParam.keys;
+// Asked for specific instances, but none of the keys is valid: show that,
+// and watch nothing rather than every instance.
+const badInstanceParam = instanceParam.given && onlyInstances.length === 0;
+const showWatchers = params.get('watchers') !== '0';
+
+const instances = new Map();
+const watchers = new Map();
+const tips = new Map();
+
+// Best-effort memory across visits (the spec treats a page as a stateless
+// reader): the instances seen, so one whose events are no longer served
+// shows as unknown instead of vanishing, and the highest seq accepted per
+// publisher, so a reload doesn't take an older revision. Storage may be
+// unavailable (private mode, file://): the page then works without it.
+const KNOWN_KEY = 'mostro-status:known';
+const ACCEPTED_KEY = 'mostro-status:accepted';
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Storage unavailable or full: stay stateless.
+  }
+}
+
+let known = forgetOld(loadJSON(KNOWN_KEY, {}), Math.floor(Date.now() / 1000));
+// Watchers seen on earlier visits: a dead one shows as unknown, not gone.
+const KNOWN_WATCHERS_KEY = 'mostro-status:known-watchers';
+let knownWatchers = forgetOld(loadJSON(KNOWN_WATCHERS_KEY, {}), Math.floor(Date.now() / 1000));
+// The best revision per publisher seen by this tab. Merged with storage on
+// every read and write, it also stands in when storage is unavailable.
+let accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), {});
+// Publishers whose shown revision another tab beat: waiting for theirs.
+const waiting = new Set();
+
+/** The best revision per publisher, from this tab and every other. */
+function currentAccepted() {
+  accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), accepted);
+  return accepted;
+}
+
+/** Merges this tab's revisions into storage, writing only a change. */
+function storeAccepted() {
+  accepted = syncAccepted(() => loadJSON(ACCEPTED_KEY, {}), (merged) => saveJSON(ACCEPTED_KEY, merged), accepted);
+}
+
+/** The lock that makes the read-merge-write of the seq store atomic. */
+const ACCEPTED_LOCK = 'mostro-status:accepted';
+const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
+
+function toHex(key) {
+  if (/^[0-9a-f]{64}$/.test(key)) return key;
+  try {
+    const decoded = nip19.decode(key);
+    return decoded.type === 'npub' ? decoded.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function npub(hex) {
+  try {
+    const encoded = nip19.npubEncode(hex);
+    return `${encoded.slice(0, 12)}…${encoded.slice(-6)}`;
+  } catch {
+    return `${hex.slice(0, 8)}…`;
+  }
+}
+
+function now() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === 'class') node.className = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child === null || child === undefined) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function pill(state, text = state) {
+  return el('span', { class: `pill ${state}` }, text);
+}
+
+function heightLine(report) {
+  if (report.blockHeight === null) return 'LND unreachable';
+  const tip = report.network ? freshTip(tips.get(report.network), now()) : null;
+  const base = `${report.blockHeight}${report.network ? ` (${report.network})` : ''}`;
+  if (!tip) {
+    // A network with explorers whose tip is missing or too old.
+    return explorersFor(report.network).length ? `${base} · no reference` : base;
+  }
+  const lag = tip.height - report.blockHeight;
+  if (lag >= LAG_BLOCKS) {
+    return el('span', {}, `${base} · reference ${tip.height} from ${tip.source} · `, el('span', { class: 'lag' }, `${lag} blocks behind`));
+  }
+  return `${base} · reference ${tip.height} from ${tip.source}`;
+}
+
+function instanceCard(report, t) {
+  const state = displayState(report, t);
+  const fresh = state !== 'unknown';
+  const card = el('article', { class: `card ${state}` });
+  card.append(
+    el('div', { class: 'row' }, el('h3', {}, report.name || 'Mostro instance'), pill(state)),
+    el('div', { class: 'key', title: report.pubkey }, npub(report.pubkey)),
+  );
+  const dl = el('dl');
+  const add = (term, value) => dl.append(el('dt', {}, term), el('dd', {}, value));
+  add('Last seen', `${ago(t - report.createdAt)} ago`);
+  if (!fresh) {
+    add('Why unknown', t >= report.expiration ? 'its last event expired' : 'its last event is older than three intervals');
+  }
+  add('Escrow', report.escrowMode);
+  if (report.escrowMode === 'lightning') add('Block height', heightLine(report));
+  if (report.maintenance) add('Maintenance', 'on: new orders are rejected');
+  add('Version', report.version);
+  card.append(dl);
+  const checks = el('ul', { class: 'checks', 'aria-label': 'Checks' });
+  for (const check of report.checks) {
+    checks.append(el('li', { title: `${check.state} for ${ago(report.createdAt - check.since)} at the time of the event` }, pill(check.state, `${check.name}: ${check.state}`)));
+  }
+  card.append(checks);
+  if (!fresh) card.append(el('p', { class: 'note' }, 'The states above are from the last valid event and may no longer hold.'));
+  return card;
+}
+
+function render() {
+  const t = now();
+  // Most urgent first: down, degraded, ok, then unknown.
+  const rank = { down: 0, degraded: 1, ok: 2, unknown: 3 };
+  const list = [...instances.values()]
+    .filter((r) => !onlyInstances.length || onlyInstances.includes(r.pubkey))
+    .sort((a, b) => rank[displayState(a, t)] - rank[displayState(b, t)]
+      || (a.name || '').localeCompare(b.name || '')
+      || a.pubkey.localeCompare(b.pubkey));
+  const grid = document.getElementById('instances');
+  grid.replaceChildren(...list.map((r) => instanceCard(r, t)));
+  // Instances asked for by key, or seen on an earlier visit, that no relay
+  // serves now: unknown, never gone.
+  const expected = onlyInstances.length ? onlyInstances : Object.keys(known);
+  const missing = expected.filter((key) => !instances.has(key));
+  for (const key of missing) {
+    const seen = known[key];
+    grid.append(
+      el('article', { class: 'card unknown' },
+        el('div', { class: 'row' }, el('h3', {}, seen?.name || 'Mostro instance'), pill('unknown')),
+        el('div', { class: 'key', title: key }, npub(key)),
+        el('p', { class: 'note' }, waiting.has(key)
+          ? 'Another tab has seen a newer revision; waiting for it to arrive here.'
+          : seen
+            ? `No valid health event served now. Last seen ${ago(t - seen.lastSeen)} ago.`
+            : 'No valid health event seen.')),
+    );
+  }
+  document.getElementById('instances-empty').hidden = grid.children.length > 0;
+
+  const counts = { ok: 0, degraded: 0, down: 0, unknown: 0 };
+  for (const r of list) counts[displayState(r, t)] += 1;
+  counts.unknown += missing.length;
+  document.getElementById('summary').replaceChildren(
+    ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
+  );
+
+  const section = document.getElementById('watchers-section');
+  section.hidden = !showWatchers;
+  const rows = [...watchers.values()].sort((a, b) => a.pubkey.localeCompare(b.pubkey)).map((w) => {
+    const state = displayState(w, t);
+    const watching = w.watching.length
+      ? w.watching.map((k) => instances.get(k)?.name || npub(k)).join(', ')
+      : '—';
+    return el('tr', {},
+      el('td', { class: 'key', title: w.pubkey }, npub(w.pubkey)),
+      el('td', {}, w.software),
+      el('td', {}, watching),
+      el('td', {}, `${ago(t - w.createdAt)} ago`),
+      el('td', {}, pill(state === 'ok' ? 'ok' : 'unknown', state === 'ok' ? 'alive' : 'unknown')));
+  });
+  // Watchers seen on an earlier visit that no relay serves now.
+  for (const [key, seen] of Object.entries(knownWatchers)) {
+    if (watchers.has(key)) continue;
+    rows.push(el('tr', {},
+      el('td', { class: 'key', title: key }, npub(key)),
+      el('td', {}, seen.name || '—'),
+      el('td', {}, '—'),
+      el('td', {}, `${ago(t - seen.lastSeen)} ago`),
+      el('td', {}, pill('unknown'))));
+  }
+  document.getElementById('watchers').replaceChildren(...rows);
+  document.getElementById('watchers-empty').hidden = rows.length > 0;
+}
+
+async function refreshTips() {
+  const networks = new Set([...instances.values()].map((r) => r.network).filter(Boolean));
+  for (const network of networks) {
+    const urls = explorersFor(network);
+    if (!urls.length) continue; // No independent reference (regtest): no comparison.
+    const answers = await Promise.all(urls.map(async (url) => {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+        const height = response.ok ? parseTip(await response.text()) : null;
+        return height === null ? null : { height, source: new URL(url).host };
+      } catch {
+        return null;
+      }
+    }));
+    const best = answers.filter(Boolean).sort((a, b) => b.height - a.height)[0];
+    // A failed refresh keeps the old tip, which freshTip stops using.
+    if (best) tips.set(network, { ...best, at: now() });
+  }
+  render();
+}
+
+function onEvent(event) {
+  const result = parseHealthEvent(event, now(), (e) => verifyEvent(e));
+  if (!result.valid) {
+    console.debug('Ignored kind 38389 event', event.id, result.reason);
+    return;
+  }
+  // One event at a time, and no other tab writing between our read and
+  // our write.
+  withLock(locks, ACCEPTED_LOCK, () => acceptEvent(result.report)).catch((error) => {
+    console.error('Could not record a health event', error);
+  });
+}
+
+function acceptEvent(report) {
+  const store = report.shape === 'instance' ? instances : watchers;
+  // Judged against what any tab stored by now, not a page-load snapshot.
+  if (!keepNewest(store, report, currentAccepted()[report.pubkey])) return;
+  waiting.delete(report.pubkey);
+  accepted = { ...accepted, [report.pubkey]: { seq: report.seq, id: report.id } };
+  storeAccepted();
+  if (report.shape === 'instance') {
+    known = mergeKnown(loadJSON(KNOWN_KEY, {}), remember(known, report, now()), now());
+    saveJSON(KNOWN_KEY, known);
+  } else {
+    knownWatchers = mergeKnown(
+      loadJSON(KNOWN_WATCHERS_KEY, {}),
+      remember(knownWatchers, report, now()),
+      now(),
+    );
+    saveJSON(KNOWN_WATCHERS_KEY, knownWatchers);
+  }
+  render();
+}
+
+// Another tab stored something: a better revision than the one shown here
+// replaces it with "waiting" until it arrives; new sightings are merged.
+window.addEventListener('storage', (event) => {
+  if (event.key === ACCEPTED_KEY) {
+    withLock(locks, ACCEPTED_LOCK, () => {
+      const stored = currentAccepted();
+      for (const shown of [instances, watchers]) {
+        for (const pubkey of superseded(shown, stored)) {
+          shown.delete(pubkey);
+          waiting.add(pubkey);
+        }
+      }
+      // A tab without the lock API may have overwritten a better revision
+      // this one knows: write the winners back (only if anything changed).
+      storeAccepted();
+      render();
+    }).catch((error) => console.error('Could not reconcile stored revisions', error));
+    return;
+  } else if (event.key === KNOWN_KEY) {
+    known = mergeKnown(loadJSON(KNOWN_KEY, {}), known, now());
+  } else if (event.key === KNOWN_WATCHERS_KEY) {
+    knownWatchers = mergeKnown(loadJSON(KNOWN_WATCHERS_KEY, {}), knownWatchers, now());
+  } else {
+    return;
+  }
+  render();
+});
+
+/** Shows a problem with the page's parameters or connection. */
+function warn(text) {
+  document.getElementById('param-errors').append(el('p', { class: 'param-error' }, text));
+}
+
+document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;
+if (relayParam.invalid.length) {
+  const list = relayParam.invalid.map((r) => `"${r}"`).join(', ');
+  warn(relayParam.usedDefaults
+    ? `No valid relay in the "relays" parameter (${list}); using the default relays.`
+    : `Ignored invalid relays in the "relays" parameter: ${list}.`);
+}
+if (badInstanceParam && !instanceParam.invalid.length) {
+  warn('The "instance" parameter is empty, so nothing is shown. Give npub or hex keys, or remove the parameter to see every instance.');
+}
+if (instanceParam.invalid.length) {
+  // Named, so a typo doesn't silently drop an instance from the page.
+  const list = instanceParam.invalid.map((k) => `"${k}"`).join(', ');
+  warn(badInstanceParam
+    ? `None of the keys in the "instance" parameter is a valid npub or hex public key (${list}), so nothing is shown. Fix the URL, or remove the parameter to see every instance.`
+    : `Ignored invalid keys in the "instance" parameter: ${list}. The other instances are shown.`);
+}
+if (!badInstanceParam) {
+  // A relay library error must not stop the page: the timers below still
+  // run, so remembered instances still turn unknown with time.
+  try {
+    const pool = new SimplePool({ enableReconnect: true });
+    const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
+    if (onlyInstances.length) instanceFilter.authors = onlyInstances;
+    pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
+    if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+  } catch (error) {
+    console.error('Could not subscribe to the relays', error);
+    warn(`Could not connect to the relays: ${error?.message || error}`);
+  }
+}
+render();
+setInterval(render, 1000);
+setTimeout(refreshTips, 3000);
+setInterval(refreshTips, EXPLORER_REFRESH_MS);
+</script>
+</body>
+</html>

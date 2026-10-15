@@ -58,6 +58,7 @@ Key crates: `nostr-sdk` (Nostr client), `teloxide` (Telegram bot), `tokio`
 | `src/db.rs` | SQLite store that maps disputes to sent Telegram messages, their timeline steps, and Serbero's state per dispute |
 | `src/serbero/` | Serbero alerts: decoding Serbero's DMs (`dm.rs`), key discovery (`discovery.rs`), subscription and catch-up (`sync.rs`), relaying to Telegram (`alerts.rs`, `render.rs`, `telegram.rs`) |
 | `src/health/` | Mostro health monitoring: verifying info and health events (`info.rs`, `event.rs`, `content.rs`), the rules and their incidents (`rules.rs`, `tracker.rs`), block-height references (`height.rs`), the watchdog's heartbeat (`heartbeat.rs`), storage (`store.rs`) and messages (`render.rs`). See `MOSTRO_HEALTH.md` |
+| `status-page/` | Static status page (one HTML file, nostr-tools from a pinned CDN) reading kind-38389 events; its reader rules are tested with `node --test status-page/health.test.mjs` |
 | `src/solver/` | Solver notifications: Mostrix's messages (`protocol.rs`), link codes and Telegram commands (`code.rs`, `commands.rs`), storage (`store.rs`), subscriptions and catch-up (`sync.rs`), batching and delivery (`notifier.rs`, `inbox.rs`) |
 | `src/version.rs` | Version and commit reporting for the CLI and the `/version` command |
 | `build.rs` | Embeds the git commit hash at build time |
