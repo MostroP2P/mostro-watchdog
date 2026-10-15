@@ -90,6 +90,7 @@
   th { color: var(--muted); font-weight: 600; }
   .table-wrap { overflow-x: auto; }
   .empty { color: var(--muted); padding: 16px 0; }
+  .param-error { color: var(--down); background: var(--down-bg); border-radius: 8px; padding: 10px 14px; margin: 16px 0 0; }
   footer { margin-top: 32px; color: var(--muted); font-size: 0.85rem; }
   a { color: var(--accent); }
 </style>
@@ -101,6 +102,7 @@
     <p>Live health of Mostro instances, from their signed Nostr health events (kind 38389). Public tags only: no key, no backend.</p>
   </header>
 
+  <p class="param-error" id="param-error" role="alert" hidden></p>
   <div class="summary" id="summary" aria-live="polite"></div>
 
   <section aria-labelledby="instances-title">
@@ -148,8 +150,15 @@ const STATUSES = ['ok', 'degraded', 'down'];
 const CHECK_STATES = ['ok', 'warn', 'fail', 'unknown'];
 const KNOWN_CHECKS = ['lnd_sync', 'payouts', 'relays', 'database', 'cashu_mint'];
 
-function isInteger(value) {
-  return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value);
+/**
+ * A base-10 integer tag value as a number, or null. Values past 2^53 − 1
+ * are refused: JavaScript would round them, so a height or seq could
+ * silently change.
+ */
+function toInteger(value) {
+  if (typeof value !== 'string' || !/^(0|[1-9][0-9]*)$/.test(value)) return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) ? number : null;
 }
 
 function isHexKey(value) {
@@ -190,22 +199,26 @@ export function parseHealthEvent(event, now, verify) {
     if (value === undefined) return fail(`missing ${name}`);
   }
   if (single(tags, 'd') !== event.pubkey) return fail('d is not the author');
+  if (!Number.isSafeInteger(event.created_at) || event.created_at < 0) return fail('bad created_at');
   if (event.created_at > now + MAX_FUTURE_SKEW) return fail('dated in the future');
 
   const interval = single(tags, 'interval');
   const seq = single(tags, 'seq');
   const expiration = single(tags, 'expiration');
-  if (!isInteger(interval) || Number(interval) < MIN_INTERVAL || Number(interval) > MAX_INTERVAL) return fail('bad interval');
-  if (!isInteger(seq) || Number(seq) < 1 || Number(seq) > MAX_SEQ) return fail('bad seq');
-  if (!isInteger(expiration) || Number(expiration) !== event.created_at + 3 * Number(interval)) return fail('bad expiration');
+  const intervalN = toInteger(interval);
+  const seqN = toInteger(seq);
+  const expirationN = toInteger(expiration);
+  if (intervalN === null || intervalN < MIN_INTERVAL || intervalN > MAX_INTERVAL) return fail('bad interval');
+  if (seqN === null || seqN < 1 || seqN > MAX_SEQ) return fail('bad seq');
+  if (expirationN === null || expirationN !== event.created_at + 3 * intervalN) return fail('bad expiration');
 
   const base = {
     pubkey: event.pubkey,
     id: event.id,
     createdAt: event.created_at,
-    interval: Number(interval),
-    seq: Number(seq),
-    expiration: Number(expiration),
+    interval: intervalN,
+    seq: seqN,
+    expiration: expirationN,
   };
 
   if (shape === 'watcher') {
@@ -230,18 +243,20 @@ export function parseHealthEvent(event, now, verify) {
   const seen = new Set();
   for (const tag of tags.filter((t) => t[0] === 'check')) {
     const [, name, state, since] = tag;
-    if (tag.length < 4 || !isInteger(since) || Number(since) > event.created_at || seen.has(name)) {
+    const sinceN = toInteger(since);
+    if (tag.length < 4 || sinceN === null || sinceN > event.created_at || seen.has(name)) {
       return fail('bad check');
     }
     seen.add(name);
     if (KNOWN_CHECKS.includes(name)) {
-      checks.push({ name, state: CHECK_STATES.includes(state) ? state : 'unknown', since: Number(since) });
+      checks.push({ name, state: CHECK_STATES.includes(state) ? state : 'unknown', since: sinceN });
     }
   }
   if (checks.length === 0) return fail('no check');
 
   const height = single(tags, 'lnd_block_height');
-  if (height !== undefined && !isInteger(height)) return fail('bad lnd_block_height');
+  const heightN = height === undefined ? null : toInteger(height);
+  if (height !== undefined && heightN === null) return fail('bad lnd_block_height');
   const synced = single(tags, 'lnd_synced_to_chain');
   if (synced !== undefined && synced !== 'true' && synced !== 'false') return fail('bad lnd_synced_to_chain');
   const network = single(tags, 'lnd_network');
@@ -260,7 +275,7 @@ export function parseHealthEvent(event, now, verify) {
       escrowMode,
       maintenance: maintenance === 'true',
       version: single(tags, 'mostro_version'),
-      blockHeight: height === undefined ? null : Number(height),
+      blockHeight: heightN,
       synced: synced === undefined ? null : synced === 'true',
       network: network ?? null,
       checks,
@@ -299,15 +314,35 @@ export function acceptable(report, accepted) {
 
 /**
  * Keeps, per pubkey, the valid revision with the highest seq, never one
- * older than `accepted`. Returns true when `report` replaced what was
- * there.
+ * older than `accepted` (the revision remembered from an earlier visit).
+ * Ties are settled as the watchdog does (`newest` in event.rs), whatever
+ * order relays answer in: the remembered revision first, else the lowest
+ * id. Returns true when `report` replaced what was there.
  */
 export function keepNewest(store, report, accepted) {
   if (!acceptable(report, accepted)) return false;
   const current = store.get(report.pubkey);
-  if (current && current.seq >= report.seq) return false;
+  if (current) {
+    if (current.seq > report.seq) return false;
+    if (current.seq === report.seq) {
+      // The remembered revision was already taken by `acceptable`.
+      if (accepted && accepted.seq === report.seq) return false;
+      if (report.id >= current.id) return false;
+    }
+  }
   store.set(report.pubkey, report);
   return true;
+}
+
+/**
+ * The `instance` URL parameter: whether it was given, and its valid keys
+ * (hex). A parameter given with no valid key is an error, never "every
+ * instance". `toHex` turns an npub or hex key into hex, or null.
+ */
+export function parseInstanceParam(raw, toHex) {
+  const entries = (raw || '').split(',').map((k) => k.trim()).filter(Boolean);
+  const keys = [...new Set(entries.map(toHex).filter(Boolean))];
+  return { given: entries.length > 0, keys, invalid: entries.length - entries.map(toHex).filter(Boolean).length };
 }
 
 /** `tip` while it is younger than `maxAge` seconds, else null. */
@@ -371,12 +406,11 @@ const relays = (params.get('relays') || '')
   .map((r) => r.trim())
   .filter((r) => /^wss?:\/\//.test(r));
 const relayList = relays.length ? relays : DEFAULT_RELAYS;
-const onlyInstances = (params.get('instance') || '')
-  .split(',')
-  .map((k) => k.trim())
-  .filter(Boolean)
-  .map(toHex)
-  .filter(Boolean);
+const instanceParam = parseInstanceParam(params.get('instance'), toHex);
+const onlyInstances = instanceParam.keys;
+// Asked for specific instances, but none of the keys is valid: show that,
+// and watch nothing rather than every instance.
+const badInstanceParam = instanceParam.given && onlyInstances.length === 0;
 const showWatchers = params.get('watchers') !== '0';
 
 const instances = new Map();
@@ -409,10 +443,13 @@ function saveJSON(key, value) {
 }
 
 let known = forgetOld(loadJSON(KNOWN_KEY, {}), Math.floor(Date.now() / 1000));
-const accepted = Object.fromEntries(
+// What was accepted on earlier visits, fixed for this one: it settles ties.
+const remembered = Object.freeze(Object.fromEntries(
   Object.entries(loadJSON(ACCEPTED_KEY, {})).filter(([pubkey, a]) =>
     /^[0-9a-f]{64}$/.test(pubkey) && a && Number.isSafeInteger(a.seq) && typeof a.id === 'string'),
-);
+));
+// What to remember for the next visit.
+const accepted = { ...remembered };
 
 function toHex(key) {
   if (/^[0-9a-f]{64}$/.test(key)) return key;
@@ -579,7 +616,7 @@ function onEvent(event) {
   }
   const { report } = result;
   const store = report.shape === 'instance' ? instances : watchers;
-  if (!keepNewest(store, report, accepted[report.pubkey])) return;
+  if (!keepNewest(store, report, remembered[report.pubkey])) return;
   accepted[report.pubkey] = { seq: report.seq, id: report.id };
   saveJSON(ACCEPTED_KEY, accepted);
   if (report.shape === 'instance') {
@@ -590,11 +627,17 @@ function onEvent(event) {
 }
 
 document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;
-const pool = new SimplePool({ enableReconnect: true });
-const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
-if (onlyInstances.length) instanceFilter.authors = onlyInstances;
-pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
-if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+if (badInstanceParam) {
+  const error = document.getElementById('param-error');
+  error.textContent = 'None of the keys in the "instance" parameter is a valid npub or hex public key, so nothing is shown. Fix the URL, or remove the parameter to see every instance.';
+  error.hidden = false;
+} else {
+  const pool = new SimplePool({ enableReconnect: true });
+  const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
+  if (onlyInstances.length) instanceFilter.authors = onlyInstances;
+  pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
+  if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+}
 render();
 setInterval(render, 1000);
 setTimeout(refreshTips, 3000);

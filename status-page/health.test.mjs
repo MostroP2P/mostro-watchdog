@@ -13,7 +13,7 @@ const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
 const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END health-lib'));
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, acceptable, freshTip, remember, forgetOld,
-  KNOWN_MAX_AGE, TIP_MAX_AGE,
+  KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -197,4 +197,44 @@ test('instances seen before are remembered, and forgotten after a month', () => 
   assert.deepEqual(forgetOld(known, NOW + KNOWN_MAX_AGE + 1), {});
   // Garbage from storage is dropped, not trusted.
   assert.deepEqual(forgetOld({ nothex: { lastSeen: NOW }, [PK]: { lastSeen: 'x' } }, NOW), {});
+});
+
+test('integers past 2^53 − 1 are refused instead of rounded', () => {
+  const unsafe = '9007199254740993';
+
+  assert.equal(parseHealthEvent(instance({ lnd_block_height: [unsafe] }), NOW, yes).reason, 'bad lnd_block_height');
+  assert.equal(parseHealthEvent(instance({ seq: [unsafe] }), NOW, yes).reason, 'bad seq');
+  const unsafeTime = instance();
+  unsafeTime.created_at = 2 ** 60;
+  assert.equal(parseHealthEvent(unsafeTime, NOW, yes).reason, 'bad created_at');
+  const bigSince = instance();
+  bigSince.tags.find((t) => t[0] === 'check')[3] = unsafe;
+  assert.equal(parseHealthEvent(bigSince, NOW, yes).reason, 'bad check');
+});
+
+test('a tie on seq is settled like the watchdog, whatever the arrival order', () => {
+  const at = (id) => ({ ...parseHealthEvent(instance(), NOW, yes).report, id });
+  const low = at('1'.repeat(64));
+  const high = at('9'.repeat(64));
+
+  for (const order of [[low, high], [high, low]]) {
+    const store = new Map();
+    for (const report of order) keepNewest(store, report, undefined);
+    assert.equal(store.get(PK).id, low.id, 'lowest id');
+  }
+
+  // The revision remembered from an earlier visit wins over a lower id.
+  const store = new Map();
+  const remembered = { seq: high.seq, id: high.id };
+  keepNewest(store, low, remembered);
+  keepNewest(store, high, remembered);
+  assert.equal(store.get(PK).id, high.id);
+});
+
+test('an instance parameter with no valid key is an error, not every instance', () => {
+  const toHex = (k) => (/^[0-9a-f]{64}$/.test(k) ? k : null);
+
+  assert.deepEqual(parseInstanceParam(null, toHex), { given: false, keys: [], invalid: 0 });
+  assert.deepEqual(parseInstanceParam('nope,bad', toHex), { given: true, keys: [], invalid: 2 });
+  assert.deepEqual(parseInstanceParam(`${PK},nope,${PK}`, toHex), { given: true, keys: [PK], invalid: 1 });
 });
