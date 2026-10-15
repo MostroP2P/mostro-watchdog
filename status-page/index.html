@@ -102,7 +102,7 @@
     <p>Live health of Mostro instances, from their signed Nostr health events (kind 38389). Public tags only: no key, no backend.</p>
   </header>
 
-  <p class="param-error" id="param-error" role="alert" hidden></p>
+  <div id="param-errors" role="alert"></div>
   <div class="summary" id="summary" aria-live="polite"></div>
 
   <section aria-labelledby="instances-title">
@@ -381,6 +381,57 @@ export function forgetOld(known, now) {
   return next;
 }
 
+/**
+ * Merges accepted revisions from storage and from this tab: per
+ * publisher, the higher seq with its id (on a tie, the stored one). Two
+ * tabs writing never lower what the other stored.
+ */
+export function mergeAccepted(stored, mine) {
+  const merged = {};
+  for (const source of [mine || {}, stored || {}]) {
+    for (const [pubkey, entry] of Object.entries(source)) {
+      const valid = /^[0-9a-f]{64}$/.test(pubkey)
+        && entry && Number.isSafeInteger(entry.seq) && typeof entry.id === 'string';
+      if (valid && (!merged[pubkey] || entry.seq >= merged[pubkey].seq)) merged[pubkey] = entry;
+    }
+  }
+  return merged;
+}
+
+/** Merges two known-publisher maps: per publisher, the latest sighting. */
+export function mergeKnown(stored, mine, now) {
+  const merged = { ...forgetOld(stored, now) };
+  for (const [pubkey, entry] of Object.entries(forgetOld(mine, now))) {
+    if (!merged[pubkey] || entry.lastSeen > merged[pubkey].lastSeen) merged[pubkey] = entry;
+  }
+  return merged;
+}
+
+/**
+ * The `relays` URL parameter: the valid relay URLs (ws: or wss: with a
+ * host) and the invalid entries, so they can be named. Not given, or no
+ * valid entry: the defaults.
+ */
+export function parseRelayParam(raw, defaults) {
+  const entries = (raw || '').split(',').map((r) => r.trim()).filter(Boolean);
+  const relays = [];
+  const invalid = [];
+  for (const entry of entries) {
+    let url = null;
+    try {
+      url = new URL(entry);
+    } catch {
+      url = null;
+    }
+    if (url && (url.protocol === 'wss:' || url.protocol === 'ws:') && url.hostname) {
+      if (!relays.includes(url.href)) relays.push(url.href);
+    } else {
+      invalid.push(entry);
+    }
+  }
+  return { relays: relays.length ? relays : defaults, invalid, usedDefaults: relays.length === 0 };
+}
+
 /** "45 s", "7 min", "2 h 5 min", "3 d 4 h". */
 export function ago(seconds) {
   const s = Math.max(0, Math.floor(seconds));
@@ -406,11 +457,8 @@ const EXPLORER_REFRESH_MS = 60_000;
 
 const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
 const params = new URLSearchParams(location.search);
-const relays = (params.get('relays') || '')
-  .split(',')
-  .map((r) => r.trim())
-  .filter((r) => /^wss?:\/\//.test(r));
-const relayList = relays.length ? relays : DEFAULT_RELAYS;
+const relayParam = parseRelayParam(params.get('relays'), DEFAULT_RELAYS);
+const relayList = relayParam.relays;
 const instanceParam = parseInstanceParam(params.get('instance'), toHex);
 const onlyInstances = instanceParam.keys;
 // Asked for specific instances, but none of the keys is valid: show that,
@@ -635,34 +683,57 @@ function onEvent(event) {
   const { report } = result;
   const store = report.shape === 'instance' ? instances : watchers;
   if (!keepNewest(store, report, remembered[report.pubkey])) return;
+  // Other tabs may have stored newer revisions or other publishers since
+  // this one loaded: re-read and merge right before writing.
   accepted[report.pubkey] = { seq: report.seq, id: report.id };
+  Object.assign(accepted, mergeAccepted(loadJSON(ACCEPTED_KEY, {}), accepted));
   saveJSON(ACCEPTED_KEY, accepted);
   if (report.shape === 'instance') {
-    known = remember(known, report, now());
+    known = mergeKnown(loadJSON(KNOWN_KEY, {}), remember(known, report, now()), now());
     saveJSON(KNOWN_KEY, known);
   } else {
-    knownWatchers = remember(knownWatchers, report, now());
+    knownWatchers = mergeKnown(
+      loadJSON(KNOWN_WATCHERS_KEY, {}),
+      remember(knownWatchers, report, now()),
+      now(),
+    );
     saveJSON(KNOWN_WATCHERS_KEY, knownWatchers);
   }
   render();
 }
 
+/** Shows a problem with the page's parameters or connection. */
+function warn(text) {
+  document.getElementById('param-errors').append(el('p', { class: 'param-error' }, text));
+}
+
 document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;
+if (relayParam.invalid.length) {
+  const list = relayParam.invalid.map((r) => `"${r}"`).join(', ');
+  warn(relayParam.usedDefaults
+    ? `No valid relay in the "relays" parameter (${list}); using the default relays.`
+    : `Ignored invalid relays in the "relays" parameter: ${list}.`);
+}
 if (instanceParam.invalid.length) {
   // Named, so a typo doesn't silently drop an instance from the page.
-  const error = document.getElementById('param-error');
   const list = instanceParam.invalid.map((k) => `"${k}"`).join(', ');
-  error.textContent = badInstanceParam
+  warn(badInstanceParam
     ? `None of the keys in the "instance" parameter is a valid npub or hex public key (${list}), so nothing is shown. Fix the URL, or remove the parameter to see every instance.`
-    : `Ignored invalid keys in the "instance" parameter: ${list}. The other instances are shown.`;
-  error.hidden = false;
+    : `Ignored invalid keys in the "instance" parameter: ${list}. The other instances are shown.`);
 }
 if (!badInstanceParam) {
-  const pool = new SimplePool({ enableReconnect: true });
-  const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
-  if (onlyInstances.length) instanceFilter.authors = onlyInstances;
-  pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
-  if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+  // A relay library error must not stop the page: the timers below still
+  // run, so remembered instances still turn unknown with time.
+  try {
+    const pool = new SimplePool({ enableReconnect: true });
+    const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
+    if (onlyInstances.length) instanceFilter.authors = onlyInstances;
+    pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
+    if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+  } catch (error) {
+    console.error('Could not subscribe to the relays', error);
+    warn(`Could not connect to the relays: ${error?.message || error}`);
+  }
 }
 render();
 setInterval(render, 1000);

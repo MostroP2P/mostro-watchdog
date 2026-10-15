@@ -33,6 +33,8 @@ remembers in the browser's `localStorage`, when it is available:
   after 30 days), so one whose events are no longer served shows as **unknown** with
   "last seen" instead of vanishing.
 
+Before each write it re-reads what is stored and merges (highest `seq` per publisher,
+latest sighting per instance), so two open tabs never lower each other's data.
 Without storage (private mode, some `file://` setups) it works as before. Explorer
 tips are used for 30 minutes after they were fetched; when every explorer has failed
 for longer, the card says "no reference" instead of comparing with a stale tip.
@@ -54,7 +56,7 @@ All options are URL query parameters:
 
 | Parameter | Example | Effect |
 |---|---|---|
-| `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`) |
+| `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`). Entries that aren't `ws:`/`wss:` URLs with a host are named in a warning and skipped; with none valid, the defaults are used |
 | `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Invalid keys are named in a warning; if none is valid, nothing is shown |
 | `watchers` | `?watchers=0` | Hide the watchers |
 

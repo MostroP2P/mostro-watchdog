@@ -13,7 +13,7 @@ const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
 const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END health-lib'));
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, acceptable, freshTip, remember, forgetOld,
-  KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam,
+  KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -270,4 +270,43 @@ test('watchers are remembered with their software', () => {
   const { report } = parseHealthEvent(event, NOW, yes);
 
   assert.deepEqual(remember({}, report, NOW)[PK], { name: 'mostro-watchdog', lastSeen: NOW });
+});
+
+test('two tabs merging their accepted seq never lower each other', () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const stored = { [A]: { seq: 9, id: 'x' }, [B]: { seq: 3, id: 'y' } };
+  // This tab loaded earlier: stale for A, newer for B.
+  const mine = { [A]: { seq: 5, id: 'old' }, [B]: { seq: 4, id: 'z' } };
+
+  assert.deepEqual(mergeAccepted(stored, mine), {
+    [A]: { seq: 9, id: 'x' },
+    [B]: { seq: 4, id: 'z' },
+  });
+  // Garbage from storage is dropped.
+  assert.deepEqual(mergeAccepted({ nope: { seq: 1, id: 'q' }, [A]: { seq: 'x' } }, {}), {});
+});
+
+test('two tabs merging known publishers keep the latest sighting of each', () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const stored = { [A]: { name: 'A', lastSeen: NOW }, [B]: { name: 'B', lastSeen: NOW - 100 } };
+  const mine = { [A]: { name: 'A', lastSeen: NOW - 50 }, [B]: { name: 'B', lastSeen: NOW } };
+
+  const merged = mergeKnown(stored, mine, NOW);
+
+  assert.equal(merged[A].lastSeen, NOW);
+  assert.equal(merged[B].lastSeen, NOW);
+});
+
+test('relay URLs need a ws or wss scheme and a host, and bad ones are named', () => {
+  const defaults = ['wss://relay.example'];
+
+  assert.deepEqual(parseRelayParam(null, defaults), { relays: defaults, invalid: [], usedDefaults: true });
+  assert.deepEqual(
+    parseRelayParam('wss://,https://x.org,nonsense,wss://relay.mostro.network', defaults),
+    { relays: ['wss://relay.mostro.network/'], invalid: ['wss://', 'https://x.org', 'nonsense'], usedDefaults: false },
+  );
+  assert.deepEqual(parseRelayParam('wss://', defaults), { relays: defaults, invalid: ['wss://'], usedDefaults: true });
+  assert.deepEqual(parseRelayParam('ws://localhost:10547', defaults).relays, ['ws://localhost:10547/']);
 });
