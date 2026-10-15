@@ -824,3 +824,49 @@ fn startup_notes_only_speak_of_what_is_on() {
     assert_eq!(notes.len(), 1);
     assert!(!notes[0].1.contains("Heartbeat"));
 }
+
+#[tokio::test]
+async fn a_revision_in_use_but_not_stored_is_never_rolled_back() {
+    let mut h = Harness::new(config()).await;
+    let five = h.health(NOW, 5, false);
+    let six = h.health(NOW + 60, 6, true);
+    h.monitor.ingest(std::slice::from_ref(&five), NOW).await;
+    // The store fails while seq 6 comes in: it is used, not stored.
+    sqlx::query("DROP TABLE health_accepted_seq")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    h.monitor.ingest(std::slice::from_ref(&six), NOW + 60).await;
+    assert_eq!(h.monitor.health.as_ref().map(|r| r.envelope.seq), Some(6));
+
+    // A relay serves only the older revision now.
+    h.monitor
+        .ingest(std::slice::from_ref(&five), NOW + 120)
+        .await;
+    assert_eq!(h.monitor.health.as_ref().map(|r| r.envelope.seq), Some(6));
+}
+
+#[tokio::test]
+async fn an_unstored_alert_whose_incident_cleared_is_never_sent() {
+    let mut h = Harness::new(config()).await;
+    sqlx::query(
+        "CREATE TRIGGER no_open BEFORE INSERT ON health_incidents \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+    // Opens (unstored, held), then clears while the store is still down.
+    minutes(&mut h, NOW, 4, true, 1).await;
+    minutes(&mut h, NOW + 240, 4, false, 100).await;
+    assert!(h.sends().is_empty());
+
+    sqlx::query("DROP TRIGGER no_open")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    minutes(&mut h, NOW + 480, 2, false, 200).await;
+
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+    assert!(h.store.open_incidents().await.unwrap().is_empty());
+}

@@ -40,7 +40,7 @@ use info::{newest_info, InfoSnapshot};
 use rules::{evaluate, Snapshot, Subject};
 use settings::MonitorConfig;
 use store::{HealthStore, LastHeartbeat};
-use tracker::{Change, Notice, Policy, Tracker};
+use tracker::{Change, Incident, Notice, Policy, Tracker};
 
 /// How long a round of relay queries may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -263,7 +263,7 @@ impl<M: Messenger> Monitor<M> {
                 .iter()
                 .filter_map(|e| parse_watcher(e, Some(peer), now).ok())
                 .collect();
-            let last = self.accepted.get(&peer).copied();
+            let last = self.mark(&peer, self.peer_beats.get(&peer));
             if let Some(beat) = newest(&beats, |b| &b.envelope, last).cloned() {
                 self.accept(&beat.envelope).await;
                 self.peer_beats.insert(peer, beat.envelope);
@@ -273,7 +273,7 @@ impl<M: Messenger> Monitor<M> {
         // revision a relay still serves must not lower the median.
         for peer in self.trusted_peers.clone() {
             let reports = height::peer_reports(events, peer, now);
-            let last = self.accepted.get(&peer).copied();
+            let last = self.mark(&peer, self.trusted_reports.get(&peer).map(|r| &r.envelope));
             if let Some(report) = newest(&reports, |r| &r.envelope, last).cloned() {
                 self.accept(&report.envelope).await;
                 self.trusted_reports.insert(peer, report);
@@ -298,7 +298,7 @@ impl<M: Messenger> Monitor<M> {
                 }
             }
         }
-        let last = self.accepted.get(&self.mostro).copied();
+        let last = self.mark(&self.mostro, self.health.as_ref().map(|h| &h.envelope));
         let Some(report) = newest(&reports, |r| &r.envelope, last).cloned() else {
             if !reports.is_empty() {
                 debug!("Only older revisions of the health event were served");
@@ -317,6 +317,23 @@ impl<M: Messenger> Monitor<M> {
             _ => None,
         };
         self.health = Some(report);
+    }
+
+    /// The revision nothing older may replace: the higher of the one stored
+    /// and the one in use, which is ahead of the store when its write
+    /// failed. Without it, a relay serving an older revision after a failed
+    /// write would roll the state back.
+    fn mark(&self, pubkey: &PublicKey, installed: Option<&Envelope>) -> Option<Accepted> {
+        let stored = self.accepted.get(pubkey).copied();
+        let installed = installed.map(|e| Accepted {
+            seq: e.seq,
+            id: e.id,
+        });
+        match (stored, installed) {
+            (Some(s), Some(i)) if i.seq > s.seq => Some(i),
+            (Some(s), _) => Some(s),
+            (None, i) => i,
+        }
     }
 
     /// Records `envelope` as the newest revision from its publisher. Only
@@ -474,6 +491,22 @@ impl<M: Messenger> Monitor<M> {
     /// Queues `change` behind any earlier write that failed and writes the
     /// queue in order. Returns the notices whose writes are now stored.
     async fn persist(&mut self, change: Change, hold: Option<Notice>) -> Vec<Notice> {
+        // An incident deleted or resolved behind its own unstored opening
+        // never happened as far as Telegram knows: drop the held alert.
+        if let Change::Delete(subject, rule)
+        | Change::Resolve {
+            incident: Incident { subject, rule, .. },
+            ..
+        } = &change
+        {
+            for (queued, held) in &mut self.pending_writes {
+                let opens_it =
+                    matches!(queued, Change::Upsert(i) if &i.subject == subject && i.rule == *rule);
+                if opens_it && matches!(held, Some(Notice::Opened(_))) {
+                    *held = None;
+                }
+            }
+        }
         self.pending_writes.push((change, hold));
         self.flush().await
     }
