@@ -616,11 +616,11 @@ fn no_payout_success(s: &Snapshot, threshold: u64) -> Reading {
     let Some(waiting) = payouts.settled_unpaid_orders else {
         return Reading::Unknown;
     };
-    let oldest = match payouts.oldest_settled_unpaid_order_age_secs {
-        Some(age) => age,
-        None if waiting == 0 => 0,
-        // Orders waiting but no age: contradictory, so unknown.
-        None => return Reading::Unknown,
+    let oldest = match (waiting, payouts.oldest_settled_unpaid_order_age_secs) {
+        (0, None) => 0,
+        (1.., Some(age)) => age,
+        // Orders but no age, or an age but no order: contradictory.
+        _ => return Reading::Unknown,
     };
     let since_success = payouts
         .last_payout_success_at
@@ -724,6 +724,10 @@ fn settled_unpaid(s: &Snapshot, threshold: u64) -> Reading {
     let Some(waiting) = payouts.settled_unpaid_orders else {
         return Reading::Unknown;
     };
+    // An age with no order waiting is contradictory.
+    if waiting == 0 && payouts.oldest_settled_unpaid_order_age_secs.is_some() {
+        return Reading::Unknown;
+    }
     match payouts.oldest_settled_unpaid_order_age_secs {
         Some(age) if age >= threshold => Reading::Bad {
             detail: format!(
@@ -1136,6 +1140,21 @@ mod tests {
         let lightning = report_with(&mostro, |_| {});
         let s = snapshot(&mostro, Some(&lightning), None);
         assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
+    }
+
+    #[test]
+    fn an_age_without_a_waiting_order_is_unknown() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let contradictory = details(|body| {
+            body["payouts"]["settled_unpaid_orders"] = 0.into();
+            body["payouts"]["oldest_settled_unpaid_order_age_secs"] = 86_400.into();
+            body["payouts"]["last_payout_success_at"] = serde_json::Value::Null;
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&contradictory));
+
+        assert_eq!(reading(&s, RuleId::SettledUnpaid), Reading::Unknown);
+        assert_eq!(reading(&s, RuleId::NoPayoutSuccess), Reading::Unknown);
     }
 
     #[test]

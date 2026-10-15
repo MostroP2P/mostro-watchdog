@@ -304,10 +304,11 @@ impl<M: Messenger> Monitor<M> {
             }
             return;
         };
+        // Before the early return: a write that failed is retried here.
+        self.accept(&report.envelope).await;
         if self.health.as_ref().map(|h| h.envelope.id) == Some(report.envelope.id) {
             return;
         }
-        self.accept(&report.envelope).await;
         let content = content::read(&report, self.keys.decrypt.as_ref());
         self.log_content(&content);
         self.details = match content {
@@ -317,7 +318,9 @@ impl<M: Messenger> Monitor<M> {
         self.health = Some(report);
     }
 
-    /// Records `envelope` as the newest revision from its publisher.
+    /// Records `envelope` as the newest revision from its publisher. Only
+    /// once it is stored does the monitor remember it: a failed write is
+    /// retried the next time the revision is seen.
     async fn accept(&mut self, envelope: &Envelope) {
         let accepted = Accepted {
             seq: envelope.seq,
@@ -326,9 +329,11 @@ impl<M: Messenger> Monitor<M> {
         if self.accepted.get(&envelope.pubkey) == Some(&accepted) {
             return;
         }
-        self.accepted.insert(envelope.pubkey, accepted);
-        if let Err(e) = self.store.accept(&envelope.pubkey, accepted).await {
-            error!(error = %e, "Failed to persist the accepted seq");
+        match self.store.accept(&envelope.pubkey, accepted).await {
+            Ok(()) => {
+                self.accepted.insert(envelope.pubkey, accepted);
+            }
+            Err(e) => error!(error = %e, "Failed to persist the accepted seq; retried next round"),
         }
     }
 
@@ -440,8 +445,8 @@ impl<M: Messenger> Monitor<M> {
         // One message for the whole evaluation: a section per subject and
         // kind of notice (new alerts, reminders, recoveries), so a round
         // rings the phones once.
-        let mut groups: BTreeMap<(u8, Subject), Vec<&Notice>> = BTreeMap::new();
-        for notice in &notices {
+        let mut groups: BTreeMap<(u8, Subject), Vec<usize>> = BTreeMap::new();
+        for (index, notice) in notices.iter().enumerate() {
             let kind = match notice {
                 Notice::Opened(_) => 0,
                 Notice::Reminder(_) => 1,
@@ -450,46 +455,60 @@ impl<M: Messenger> Monitor<M> {
             groups
                 .entry((kind, notice.incident().subject.clone()))
                 .or_default()
-                .push(notice);
+                .push(index);
         }
         let mostro_name = self.health.as_ref().and_then(|h| h.name.clone());
-        let sections: Vec<String> = groups
+        let order: Vec<Vec<usize>> = groups.values().cloned().collect();
+        let sections: Vec<render::Section> = groups
             .iter()
-            .map(|((kind, subject), group)| {
+            .map(|((kind, subject), indices)| {
                 let label = render::subject_label(subject, mostro_name.as_deref());
+                let group: Vec<&Notice> = indices.iter().map(|&i| &notices[i]).collect();
                 match kind {
-                    0 => render::opened(&label, group),
-                    1 => render::reminders(&label, group, now),
-                    _ => render::resolved(&label, group),
+                    0 => render::opened(&label, &group),
+                    1 => render::reminders(&label, &group, now),
+                    _ => render::resolved(&label, &group),
                 }
             })
             .collect();
-        let rules: Vec<&str> = notices.iter().map(|n| n.incident().rule.as_str()).collect();
-        // Telegram caps a message; a round that doesn't fit (many peer
-        // watchdogs at once) is split at section boundaries.
-        let mut delivered = true;
-        for text in render::pack(&sections) {
-            if let Err(e) = self.messenger.send(self.chat_id, &text).await {
-                error!(?rules, error = %e, "Failed to send a health notice");
-                delivered = false;
-                break;
+        // Almost always one message. If a round doesn't fit and a later
+        // message fails, the ones already sent count as delivered.
+        let mut delivered: Vec<usize> = Vec::new();
+        let mut failed = false;
+        for message in render::pack(&sections) {
+            let carried: Vec<usize> = message
+                .items
+                .iter()
+                .map(|&(section, item)| order[section][item])
+                .collect();
+            if failed {
+                continue;
+            }
+            match self.messenger.send(self.chat_id, &message.text).await {
+                Ok(_) => delivered.extend(carried),
+                Err(e) => {
+                    let rules: Vec<&str> = carried
+                        .iter()
+                        .map(|&i| notices[i].incident().rule.as_str())
+                        .collect();
+                    error!(?rules, error = %e, "Failed to send a health notice");
+                    failed = true;
+                }
             }
         }
-        if !delivered {
-            // Alerts and reminders are retried by the tracker on the next
-            // bad reading; recoveries are kept here, and in the store until
-            // delivered.
-            self.undelivered.extend(
-                notices
-                    .into_iter()
-                    .filter(|n| matches!(n, Notice::Resolved { .. })),
-            );
-            return;
-        }
-        info!(?rules, "🩺 Health notice sent");
-        for notice in &notices {
+        for (index, notice) in notices.into_iter().enumerate() {
+            if !delivered.contains(&index) {
+                // Alerts and reminders are retried by the tracker on the
+                // next bad reading; recoveries are kept here, and in the
+                // store until delivered.
+                if matches!(notice, Notice::Resolved { .. }) {
+                    self.undelivered.push(notice);
+                }
+                continue;
+            }
             let incident = notice.incident();
-            let change = match notice {
+            info!(rule = incident.rule.as_str(), subject = %incident.subject.key(), "🩺 Health notice sent");
+            let change = match &notice {
                 Notice::Resolved { at, .. } => Some(Change::Delivered {
                     subject: incident.subject.clone(),
                     rule: incident.rule,

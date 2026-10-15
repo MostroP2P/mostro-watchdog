@@ -616,3 +616,88 @@ async fn an_older_revision_of_a_trusted_peer_cannot_lower_the_median() {
         h.monitor.peer_heights
     );
 }
+
+#[tokio::test]
+async fn a_failed_seq_write_is_retried_on_the_next_round() {
+    let mut h = Harness::new(config()).await;
+    let event = h.health(NOW, 5, false);
+    // The table is gone: the write fails.
+    sqlx::query("DROP TABLE health_accepted_seq")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+
+    h.monitor.ingest(std::slice::from_ref(&event), NOW).await;
+    assert!(h.monitor.health.is_some(), "the valid event is still used");
+    assert!(!h.monitor.accepted.contains_key(&h.mostro.public_key()));
+
+    // The store works again: the same revision is written this time.
+    HealthStore::new(h.store.pool().clone()).await.unwrap();
+    h.monitor
+        .ingest(std::slice::from_ref(&event), NOW + 60)
+        .await;
+    assert_eq!(
+        h.store
+            .accepted(&h.mostro.public_key())
+            .await
+            .unwrap()
+            .map(|a| a.seq),
+        Some(5)
+    );
+}
+
+#[tokio::test]
+async fn a_split_round_counts_the_messages_that_went_out_as_delivered() {
+    let peers: Vec<Keys> = (0..40).map(|_| Keys::generate()).collect();
+    let config = MonitorConfig {
+        peer_watchdogs: peers.iter().map(|k| k.public_key().to_hex()).collect(),
+        ..MonitorConfig::default()
+    };
+    let mut h = Harness::new(config).await;
+    for i in 0..3 {
+        let info = h.info(NOW + 60 * i);
+        h.round(NOW + 60 * i, &[info], true).await;
+    }
+    let alerts = h.sends();
+    assert!(alerts.len() > 1, "40 alerts don't fit one message");
+    let alerted: usize = alerts
+        .iter()
+        .map(|t| t.matches("*Peer watchdog silent*").count())
+        .sum();
+    assert_eq!(alerted, 40);
+    h.monitor.messenger.clear();
+
+    // Every peer comes back; Telegram takes only the first message.
+    *h.monitor.messenger.sends_left.lock().unwrap() = Some(1);
+    for i in 3..6 {
+        let now = NOW + 60 * i;
+        let mut events = vec![h.info(now)];
+        events.extend(
+            peers
+                .iter()
+                .map(|k| heartbeat::build(k, heartbeat::next(None, now * 1000), 60, None).unwrap()),
+        );
+        h.round(now, &events, true).await;
+    }
+    let first = h.sends();
+    assert_eq!(first.len(), 1);
+    let sent_first = first[0].matches("*Peer watchdog silent*").count();
+    assert!(sent_first > 0 && sent_first < 40);
+    assert_eq!(
+        h.store.pending_recoveries().await.unwrap().len(),
+        40 - sent_first
+    );
+
+    // Telegram is back: only what didn't go out is sent.
+    *h.monitor.messenger.sends_left.lock().unwrap() = None;
+    h.monitor.messenger.clear();
+    let info = h.info(NOW + 360);
+    h.round(NOW + 360, &[info], true).await;
+    let rest: usize = h
+        .sends()
+        .iter()
+        .map(|t| t.matches("*Peer watchdog silent*").count())
+        .sum();
+    assert_eq!(rest, 40 - sent_first);
+    assert!(h.store.pending_recoveries().await.unwrap().is_empty());
+}

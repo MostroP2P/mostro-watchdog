@@ -227,6 +227,11 @@ impl HealthStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+
     pub async fn last_heartbeat(&self) -> Result<Option<LastHeartbeat>, sqlx::Error> {
         let row = sqlx::query("SELECT seq, created_at FROM health_heartbeat WHERE id = 1")
             .fetch_optional(&self.pool)

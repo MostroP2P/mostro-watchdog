@@ -1,10 +1,34 @@
 //! Telegram messages for health incidents, in MarkdownV2. All the notices of
 //! one evaluation go out as one message: a section per subject for new
 //! alerts, reminders and recoveries, so a round rings the phones once.
+//!
+//! Untrusted text (instance names, details built from event data) is
+//! clipped before it is escaped, so no item can outgrow a message and no
+//! cut can split an escape sequence. A round too large for one message is
+//! split between items, repeating the section heading.
 
 use super::rules::{human_duration, Severity, Subject};
 use super::tracker::Notice;
 use crate::{chrono_timestamp, escape_markdown, escape_markdown_code};
+
+/// Telegram's limit on a message, in characters, minus some room.
+pub const MAX_MESSAGE_CHARS: usize = 4000;
+
+/// Longest instance name shown, in characters.
+const MAX_NAME_CHARS: usize = 64;
+
+/// Longest detail shown, in characters, before escaping.
+const MAX_DETAIL_CHARS: usize = 600;
+
+/// `text` cut to at most `max` characters, on a character boundary, with
+/// an ellipsis when cut. Applied before escaping.
+pub fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max.saturating_sub(1)).collect();
+    format!("{kept}…")
+}
 
 /// How a subject is named in messages.
 pub fn subject_label(subject: &Subject, mostro_name: Option<&str>) -> String {
@@ -14,7 +38,7 @@ pub fn subject_label(subject: &Subject, mostro_name: Option<&str>) -> String {
             match mostro_name {
                 Some(name) => format!(
                     "*{}* `{}`",
-                    escape_markdown(name),
+                    escape_markdown(&clip(name, MAX_NAME_CHARS)),
                     escape_markdown_code(&short)
                 ),
                 None => format!("Mostro `{}`", escape_markdown_code(&short)),
@@ -42,8 +66,30 @@ fn icon(severity: Severity) -> &'static str {
     }
 }
 
+fn detail(text: &str) -> String {
+    escape_markdown(&clip(text, MAX_DETAIL_CHARS))
+}
+
+/// A heading (kind of notice and subject) and one item per notice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Section {
+    pub heading: String,
+    pub items: Vec<String>,
+}
+
+#[cfg(test)]
+impl Section {
+    /// The section as one block of text.
+    pub fn text(&self) -> String {
+        std::iter::once(self.heading.as_str())
+            .chain(self.items.iter().map(String::as_str))
+            .collect::<Vec<_>>()
+            .join("\n\n")
+    }
+}
+
 /// New alerts about one subject.
-pub fn opened(label: &str, notices: &[&Notice]) -> String {
+pub fn opened(label: &str, notices: &[&Notice]) -> Section {
     let critical = notices
         .iter()
         .any(|n| n.incident().severity == Severity::Critical);
@@ -52,7 +98,7 @@ pub fn opened(label: &str, notices: &[&Notice]) -> String {
     } else {
         "⚠️ *Mostro health warning*"
     };
-    let body = notices
+    let items = notices
         .iter()
         .map(|notice| {
             let incident = notice.incident();
@@ -60,18 +106,20 @@ pub fn opened(label: &str, notices: &[&Notice]) -> String {
                 "{} *{}*\n{}\nSince: {}",
                 icon(incident.severity),
                 escape_markdown(incident.rule.title()),
-                escape_markdown(&incident.detail),
+                detail(&incident.detail),
                 escape_markdown(&chrono_timestamp(incident.started_at))
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("{header}\n{label}\n\n{body}")
+        .collect();
+    Section {
+        heading: format!("{header}\n{label}"),
+        items,
+    }
 }
 
 /// Reminders of critical alerts still active about one subject.
-pub fn reminders(label: &str, notices: &[&Notice], now: u64) -> String {
-    let body = notices
+pub fn reminders(label: &str, notices: &[&Notice], now: u64) -> Section {
+    let items = notices
         .iter()
         .map(|notice| {
             let incident = notice.incident();
@@ -79,59 +127,85 @@ pub fn reminders(label: &str, notices: &[&Notice], now: u64) -> String {
                 "{} *{}*\n{}\nFor: {}",
                 icon(incident.severity),
                 escape_markdown(incident.rule.title()),
-                escape_markdown(&incident.detail),
+                detail(&incident.detail),
                 escape_markdown(&human_duration(now.saturating_sub(incident.started_at)))
             )
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("🔁 *Still active*\n{label}\n\n{body}")
+        .collect();
+    Section {
+        heading: format!("🔁 *Still active*\n{label}"),
+        items,
+    }
 }
 
 /// Recoveries about one subject.
-pub fn resolved(label: &str, notices: &[&Notice]) -> String {
-    let body = notices
+pub fn resolved(label: &str, notices: &[&Notice]) -> Section {
+    let items = notices
         .iter()
-        .filter_map(|notice| match notice {
-            Notice::Resolved {
-                incident,
-                at,
-                detail,
-            } => {
-                let detail = detail
-                    .as_deref()
-                    .map(|d| format!("{}\n", escape_markdown(d)))
-                    .unwrap_or_default();
-                Some(format!(
-                    "*{}*\n{}Duration: {}",
-                    escape_markdown(incident.rule.title()),
-                    detail,
-                    escape_markdown(&human_duration(at.saturating_sub(incident.started_at)))
-                ))
-            }
-            _ => None,
+        .map(|notice| {
+            let incident = notice.incident();
+            let (at, resolution) = match notice {
+                Notice::Resolved { at, detail, .. } => (*at, detail.as_deref()),
+                _ => (incident.opened_at, None),
+            };
+            let resolution = resolution
+                .map(|d| format!("{}\n", detail(d)))
+                .unwrap_or_default();
+            format!(
+                "*{}*\n{}Duration: {}",
+                escape_markdown(incident.rule.title()),
+                resolution,
+                escape_markdown(&human_duration(at.saturating_sub(incident.started_at)))
+            )
         })
-        .collect::<Vec<_>>()
-        .join("\n\n");
-    format!("✅ *Resolved*\n{label}\n\n{body}")
+        .collect();
+    Section {
+        heading: format!("✅ *Resolved*\n{label}"),
+        items,
+    }
 }
 
-/// Telegram's limit on a message, in characters, minus some room.
-const MAX_MESSAGE_CHARS: usize = 4000;
+/// One message to send, and the items it carries as `(section, item)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub text: String,
+    pub items: Vec<(usize, usize)>,
+}
 
-/// Joins `sections` into as few messages as fit Telegram's limit, never
-/// splitting a section. Almost always one message.
-pub fn pack(sections: &[String]) -> Vec<String> {
-    let mut messages: Vec<String> = Vec::new();
-    for section in sections {
-        match messages.last_mut() {
-            Some(last)
-                if last.chars().count() + 2 + section.chars().count() <= MAX_MESSAGE_CHARS =>
-            {
-                last.push_str("\n\n");
-                last.push_str(section);
+/// Packs `sections` into as few messages as fit Telegram's limit. Almost
+/// always one. When a round doesn't fit, it is split between items, and a
+/// section that continues in the next message repeats its heading. Items
+/// are bounded by clipping, so each fits a message with its heading.
+pub fn pack(sections: &[Section]) -> Vec<Message> {
+    let mut messages: Vec<Message> = Vec::new();
+    // The section the last message ends in.
+    let mut open_section: Option<usize> = None;
+    for (s, section) in sections.iter().enumerate() {
+        for (i, item) in section.items.iter().enumerate() {
+            let continues = open_section == Some(s) && !messages.is_empty();
+            let addition = if continues {
+                format!("\n\n{item}")
+            } else {
+                format!("{}\n\n{item}", section.heading)
+            };
+            let fits = messages.last().is_some_and(|m| {
+                let separator = if continues { 0 } else { 2 };
+                m.text.chars().count() + separator + addition.chars().count() <= MAX_MESSAGE_CHARS
+            });
+            match messages.last_mut() {
+                Some(message) if fits => {
+                    if !continues {
+                        message.text.push_str("\n\n");
+                    }
+                    message.text.push_str(&addition);
+                    message.items.push((s, i));
+                }
+                _ => messages.push(Message {
+                    text: format!("{}\n\n{item}", section.heading),
+                    items: vec![(s, i)],
+                }),
             }
-            _ => messages.push(section.clone()),
+            open_section = Some(s);
         }
     }
     messages
@@ -184,7 +258,7 @@ mod tests {
             "4 order(s) settled but unpaid.",
         ));
 
-        let text = opened("Mostro `0123…cdef`", &[&lag, &waiting]);
+        let text = opened("Mostro `0123…cdef`", &[&lag, &waiting]).text();
 
         assert!(text.starts_with("🚨 *Mostro health alert*"), "{text}");
         assert!(text.contains("🔴 *LND behind the chain*"), "{text}");
@@ -204,7 +278,9 @@ mod tests {
     fn warnings_alone_are_headed_as_a_warning() {
         let n = Notice::Opened(incident(RuleId::Maintenance, "New orders are rejected."));
 
-        assert!(opened("x", &[&n]).starts_with("⚠️ *Mostro health warning*"));
+        assert!(opened("x", &[&n])
+            .text()
+            .starts_with("⚠️ *Mostro health warning*"));
     }
 
     #[test]
@@ -215,7 +291,7 @@ mod tests {
             detail: Some("LND at 971486, reference 971486 from mempool.space.".into()),
         };
 
-        let text = resolved("Mostro `0123…cdef`", &[&n]);
+        let text = resolved("Mostro `0123…cdef`", &[&n]).text();
 
         assert!(text.starts_with("✅ *Resolved*"), "{text}");
         assert!(text.contains("Duration: 20 h 41 min"), "{text}");
@@ -229,25 +305,77 @@ mod tests {
             "LND reports synced_to_chain = false.",
         ));
 
-        let text = reminders("x", &[&n], T0 + 7200);
+        let text = reminders("x", &[&n], T0 + 7200).text();
 
         assert!(text.contains("For: 2 h 0 min"), "{text}");
         assert!(text.contains(r"synced\_to\_chain"), "{text}");
     }
 
-    #[test]
-    fn sections_share_one_message_unless_it_would_be_too_long() {
-        let sections = vec!["a".repeat(100), "b".repeat(100), "c".repeat(100)];
-        assert_eq!(pack(&sections).len(), 1);
-        assert!(pack(&sections)[0].contains(&format!(
-            "{}\n\n{}",
-            "a".repeat(100),
-            "b".repeat(100)
-        )));
+    fn section(heading: &str, items: &[String]) -> Section {
+        Section {
+            heading: heading.into(),
+            items: items.to_vec(),
+        }
+    }
 
-        let big = vec!["a".repeat(3000), "b".repeat(3000)];
-        assert_eq!(pack(&big), big);
+    #[test]
+    fn sections_share_one_message_when_they_fit() {
+        let sections = [
+            section("A", &["a".repeat(100)]),
+            section("B", &["b".repeat(100), "c".repeat(100)]),
+        ];
+
+        let messages = pack(&sections);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(
+            messages[0].text,
+            format!(
+                "A\n\n{}\n\nB\n\n{}\n\n{}",
+                "a".repeat(100),
+                "b".repeat(100),
+                "c".repeat(100)
+            )
+        );
+        assert_eq!(messages[0].items, vec![(0, 0), (1, 0), (1, 1)]);
         assert!(pack(&[]).is_empty());
+    }
+
+    #[test]
+    fn an_oversized_section_is_split_between_items_repeating_its_heading() {
+        let items: Vec<String> = (0..10).map(|i| format!("{i}{}", "x".repeat(799))).collect();
+        let sections = [section("HEAD", &items)];
+
+        let messages = pack(&sections);
+
+        assert!(messages.len() > 1);
+        for message in &messages {
+            assert!(message.text.chars().count() <= MAX_MESSAGE_CHARS);
+            assert!(message.text.starts_with("HEAD\n\n"), "{}", message.text);
+        }
+        let carried: Vec<_> = messages.iter().flat_map(|m| m.items.clone()).collect();
+        assert_eq!(carried, (0..10).map(|i| (0, i)).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn untrusted_text_is_clipped_before_escaping_so_no_escape_is_cut() {
+        // A detail of 5000 dots: escaped, each becomes two characters.
+        let n = Notice::Opened(incident(RuleId::PayoutFailureRate, &".".repeat(5000)));
+
+        let section = opened("x", &[&n]);
+        let messages = pack(std::slice::from_ref(&section));
+
+        assert_eq!(messages.len(), 1);
+        assert!(messages[0].text.chars().count() <= MAX_MESSAGE_CHARS);
+        assert!(messages[0].text.contains("…"));
+        assert_escaped(&messages[0].text);
+        assert_eq!(clip("ñandú", 3), "ña…");
+        let label = subject_label(
+            &Subject::Mostro(Keys::generate().public_key()),
+            Some(&"_".repeat(500)),
+        );
+        assert!(label.chars().count() < 200, "{label}");
+        assert_escaped(&label);
     }
 
     #[test]
