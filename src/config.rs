@@ -305,12 +305,14 @@ fn check_key_variable(variable: &str) -> Result<(), KeyProblem> {
 }
 
 /// Reads the watchdog's secret key for health monitoring, which works
-/// without one: `Ok(None)` when `variable` is unset. A set but invalid key
-/// is an error that names the variable, never the value.
+/// without one: `Ok(None)` when `variable` is unset or empty (deployments
+/// often pass `KEY=${KEY:-}`). A set but invalid key is an error that names
+/// the variable, never the value.
 pub fn read_optional_key(
     variable: &str,
     env: impl Fn(&str) -> Option<String>,
 ) -> Result<Option<Keys>, String> {
+    let env = |name: &str| env(name).filter(|value| !value.trim().is_empty());
     match read_key(variable, env) {
         Ok(keys) => Ok(Some(keys)),
         Err(KeyProblem::Missing(_)) => Ok(None),
@@ -869,6 +871,12 @@ chat_id = -1001
         let secret = keys.secret_key().to_secret_hex();
 
         assert_eq!(read_optional_key("WD_KEY", |_| None), Ok(None));
+        // An empty or blank variable is unset, not an invalid key.
+        assert_eq!(
+            read_optional_key("WD_KEY", |_| Some(String::new())),
+            Ok(None)
+        );
+        assert_eq!(read_optional_key("WD_KEY", |_| Some("  ".into())), Ok(None));
         assert_eq!(
             read_optional_key("WD_KEY", |_| Some(secret.clone()))
                 .unwrap()

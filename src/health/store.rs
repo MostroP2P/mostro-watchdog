@@ -2,7 +2,8 @@
 //! repeats nor loses anything:
 //!
 //! - open incidents, so an alert is not sent twice and its recovery is
-//!   still reported;
+//!   still reported, and cleared ones until their "resolved" message is
+//!   delivered;
 //! - the highest `seq` accepted per pubkey, so a relay serving an older,
 //!   unexpired revision after a restart is not believed (spec rule 2);
 //! - the watchdog's own heartbeat `seq` and `created_at`, which must keep
@@ -13,7 +14,7 @@ use sqlx::{Row, SqlitePool};
 
 use super::event::Accepted;
 use super::rules::{RuleId, Severity, Subject};
-use super::tracker::{Change, Incident};
+use super::tracker::{Change, Incident, Notice};
 
 const SCHEMA: [&str; 3] = [
     r#"
@@ -25,6 +26,8 @@ const SCHEMA: [&str; 3] = [
         opened_at INTEGER NOT NULL,
         notified_at INTEGER,
         detail TEXT NOT NULL,
+        resolved_at INTEGER,
+        resolution TEXT,
         PRIMARY KEY (subject, rule)
     )
     "#,
@@ -70,23 +73,28 @@ impl HealthStore {
     pub async fn open_incidents(&self) -> Result<Vec<Incident>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT subject, rule, severity, started_at, opened_at, notified_at, detail \
-             FROM health_incidents",
+             FROM health_incidents WHERE resolved_at IS NULL",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.iter().filter_map(incident_from_row).collect())
+    }
+
+    /// The "resolved" messages not delivered before a restart.
+    pub async fn pending_recoveries(&self) -> Result<Vec<Notice>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT subject, rule, severity, started_at, opened_at, notified_at, detail, \
+             resolved_at, resolution FROM health_incidents WHERE resolved_at IS NOT NULL",
         )
         .fetch_all(&self.pool)
         .await?;
         Ok(rows
             .iter()
             .filter_map(|row| {
-                Some(Incident {
-                    subject: Subject::parse(row.get::<&str, _>("subject"))?,
-                    rule: RuleId::parse(row.get::<&str, _>("rule"))?,
-                    severity: Severity::parse(row.get::<&str, _>("severity"))?,
-                    started_at: row.get::<i64, _>("started_at").try_into().ok()?,
-                    opened_at: row.get::<i64, _>("opened_at").try_into().ok()?,
-                    notified_at: row
-                        .get::<Option<i64>, _>("notified_at")
-                        .and_then(|at| at.try_into().ok()),
-                    detail: row.get("detail"),
+                Some(Notice::Resolved {
+                    incident: incident_from_row(row)?,
+                    at: row.get::<i64, _>("resolved_at").try_into().ok()?,
+                    detail: row.get("resolution"),
                 })
             })
             .collect())
@@ -106,7 +114,9 @@ impl HealthStore {
                         started_at = excluded.started_at,
                         opened_at = excluded.opened_at,
                         notified_at = excluded.notified_at,
-                        detail = excluded.detail
+                        detail = excluded.detail,
+                        resolved_at = NULL,
+                        resolution = NULL
                     "#,
                 )
                 .bind(incident.subject.key())
@@ -125,6 +135,34 @@ impl HealthStore {
                     .bind(rule.as_str())
                     .execute(&self.pool)
                     .await?;
+            }
+            Change::Resolve {
+                subject,
+                rule,
+                at,
+                detail,
+            } => {
+                sqlx::query(
+                    "UPDATE health_incidents SET resolved_at = ?, resolution = ? \
+                     WHERE subject = ? AND rule = ?",
+                )
+                .bind(*at as i64)
+                .bind(detail)
+                .bind(subject.key())
+                .bind(rule.as_str())
+                .execute(&self.pool)
+                .await?;
+            }
+            // Only a cleared row: the same rule may have opened again since.
+            Change::Delivered(subject, rule) => {
+                sqlx::query(
+                    "DELETE FROM health_incidents \
+                     WHERE subject = ? AND rule = ? AND resolved_at IS NOT NULL",
+                )
+                .bind(subject.key())
+                .bind(rule.as_str())
+                .execute(&self.pool)
+                .await?;
             }
         }
         Ok(())
@@ -188,6 +226,20 @@ impl HealthStore {
     }
 }
 
+fn incident_from_row(row: &sqlx::sqlite::SqliteRow) -> Option<Incident> {
+    Some(Incident {
+        subject: Subject::parse(row.get::<&str, _>("subject"))?,
+        rule: RuleId::parse(row.get::<&str, _>("rule"))?,
+        severity: Severity::parse(row.get::<&str, _>("severity"))?,
+        started_at: row.get::<i64, _>("started_at").try_into().ok()?,
+        opened_at: row.get::<i64, _>("opened_at").try_into().ok()?,
+        notified_at: row
+            .get::<Option<i64>, _>("notified_at")
+            .and_then(|at| at.try_into().ok()),
+        detail: row.get("detail"),
+    })
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -240,6 +292,50 @@ pub(crate) mod tests {
             .await
             .unwrap();
         assert!(store.open_incidents().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resolved_incident_waits_for_its_message_and_a_reopened_one_survives() {
+        let (_dir, store) = store().await;
+        let incident = incident(Some(300));
+        let (subject, rule) = (incident.subject.clone(), incident.rule);
+        store
+            .apply(&Change::Upsert(incident.clone()))
+            .await
+            .unwrap();
+
+        store
+            .apply(&Change::Resolve {
+                subject: subject.clone(),
+                rule,
+                at: 900,
+                detail: Some("back".into()),
+            })
+            .await
+            .unwrap();
+
+        assert!(store.open_incidents().await.unwrap().is_empty());
+        assert_eq!(
+            store.pending_recoveries().await.unwrap(),
+            vec![Notice::Resolved {
+                incident: incident.clone(),
+                at: 900,
+                detail: Some("back".into()),
+            }]
+        );
+
+        // The rule opens again before the recovery was delivered: the new
+        // incident replaces the row and outlives the late delivery.
+        store
+            .apply(&Change::Upsert(incident.clone()))
+            .await
+            .unwrap();
+        store
+            .apply(&Change::Delivered(subject.clone(), rule))
+            .await
+            .unwrap();
+        assert_eq!(store.open_incidents().await.unwrap(), vec![incident]);
+        assert!(store.pending_recoveries().await.unwrap().is_empty());
     }
 
     #[tokio::test]

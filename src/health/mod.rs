@@ -40,7 +40,7 @@ use info::{newest_info, InfoSnapshot};
 use rules::{evaluate, Snapshot, Subject};
 use settings::MonitorConfig;
 use store::{HealthStore, LastHeartbeat};
-use tracker::{Notice, Policy, Tracker};
+use tracker::{Change, Notice, Policy, Tracker};
 
 /// How long a round of relay queries may take.
 const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
@@ -103,6 +103,8 @@ pub struct Monitor<M> {
     content_logged: Option<String>,
     /// Recoveries Telegram didn't take, retried next round.
     undelivered: Vec<Notice>,
+    /// The last relay state logged, so an outage is logged once.
+    relays_logged: Option<bool>,
 }
 
 /// What a round brings in from relays and explorers.
@@ -138,6 +140,7 @@ impl<M: Messenger> Monitor<M> {
             }
         }
         let tracker = Tracker::resume(store.open_incidents().await?);
+        let undelivered = store.pending_recoveries().await?;
         let last_heartbeat = store.last_heartbeat().await?;
         Ok(Self {
             config,
@@ -158,7 +161,8 @@ impl<M: Messenger> Monitor<M> {
             peer_heights: Vec::new(),
             last_heartbeat,
             content_logged: None,
-            undelivered: Vec::new(),
+            undelivered,
+            relays_logged: None,
         })
     }
 
@@ -205,7 +209,7 @@ impl<M: Messenger> Monitor<M> {
 
     /// The next heartbeat to publish, when the watchdog publishes one.
     pub async fn next_heartbeat(&mut self, now_ms: u64) -> Option<Event> {
-        if !self.config.publish_heartbeat {
+        if !self.config.heartbeat_enabled() {
             return None;
         }
         let keys = self.keys.sign.as_ref()?;
@@ -354,9 +358,31 @@ impl<M: Messenger> Monitor<M> {
         }
     }
 
+    /// Logs when the watchdog loses or regains its relays. The logs are
+    /// the default channel for the watchdog's own infrastructure.
+    fn log_relays(&mut self, reachable: Option<bool>) {
+        let Some(reachable) = reachable else {
+            return;
+        };
+        if self.relays_logged == Some(reachable) {
+            return;
+        }
+        let was_known = self.relays_logged.is_some();
+        self.relays_logged = Some(reachable);
+        if !reachable {
+            warn!(
+                "🔌 The watchdog can't round-trip an event through any relay; Mostro's \
+                 state is unknown until a relay answers"
+            );
+        } else if was_known {
+            info!("🔌 The watchdog reaches its relays again");
+        }
+    }
+
     /// Evaluates the round and tells Telegram what changed.
     pub async fn assess(&mut self, round: Round<'_>) {
         let now = round.now;
+        self.log_relays(round.relays_reachable);
         if !round.events.is_empty() {
             self.ingest(round.events, now).await;
         }
@@ -422,14 +448,16 @@ impl<M: Messenger> Monitor<M> {
                 Ok(_) => {
                     info!(subject = %subject.key(), ?rules, kind, "🩺 Health notice sent");
                     for notice in &group {
-                        if matches!(notice, Notice::Resolved { .. }) {
-                            continue;
-                        }
                         let incident = notice.incident();
-                        if let Some(change) =
-                            self.tracker
-                                .mark_notified(&incident.subject, incident.rule, now)
-                        {
+                        let change = match notice {
+                            Notice::Resolved { .. } => {
+                                Some(Change::Delivered(incident.subject.clone(), incident.rule))
+                            }
+                            _ => self
+                                .tracker
+                                .mark_notified(&incident.subject, incident.rule, now),
+                        };
+                        if let Some(change) = change {
                             if let Err(e) = self.store.apply(&change).await {
                                 error!(error = %e, "Failed to persist a health incident");
                             }
@@ -438,7 +466,8 @@ impl<M: Messenger> Monitor<M> {
                 }
                 Err(e) => {
                     // Alerts and reminders are retried by the tracker on the
-                    // next bad reading; recoveries are kept here.
+                    // next bad reading; recoveries are kept here, and in the
+                    // store until delivered.
                     error!(subject = %subject.key(), ?rules, error = %e, "Failed to send a health notice");
                     self.undelivered.extend(
                         group
@@ -580,7 +609,7 @@ fn summary(config: &MonitorConfig, has_key: bool) -> String {
     if config.mostro_health_enabled {
         parts.push("health event".to_string());
     }
-    if config.publish_heartbeat && has_key {
+    if config.heartbeat_enabled() && has_key {
         parts.push("heartbeat".to_string());
     }
     if !config.peer_watchdogs.is_empty() {

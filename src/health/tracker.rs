@@ -54,7 +54,18 @@ impl Notice {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Change {
     Upsert(Incident),
+    /// An incident that never reached Telegram cleared: forget it.
     Delete(Subject, RuleId),
+    /// A delivered incident cleared at `at`: keep it until its "resolved"
+    /// message is delivered, so a restart can't lose that message.
+    Resolve {
+        subject: Subject,
+        rule: RuleId,
+        at: u64,
+        detail: Option<String>,
+    },
+    /// The "resolved" message of an incident was delivered.
+    Delivered(Subject, RuleId),
 }
 
 #[derive(Debug, Clone, Default)]
@@ -172,14 +183,23 @@ impl Tracker {
                 }
                 track.good_streak = 0;
                 let incident = track.incident.take().expect("checked above");
-                let delete = Change::Delete(incident.subject.clone(), incident.rule);
                 // An alert never delivered needs no "resolved" either.
-                let notice = incident.notified_at.map(|_| Notice::Resolved {
+                if incident.notified_at.is_none() {
+                    let delete = Change::Delete(incident.subject.clone(), incident.rule);
+                    return (None, Some(delete));
+                }
+                let change = Change::Resolve {
+                    subject: incident.subject.clone(),
+                    rule: incident.rule,
+                    at: now,
+                    detail: detail.clone(),
+                };
+                let notice = Notice::Resolved {
                     incident,
                     at: now,
                     detail,
-                });
-                (notice, Some(delete))
+                };
+                (Some(notice), Some(change))
             }
         }
     }
@@ -433,6 +453,14 @@ mod tests {
 
         assert!(matches!(changes[0], Change::Upsert(ref i) if i.notified_at.is_none()));
         assert!(matches!(changes[1], Change::Upsert(ref i) if i.notified_at == Some(T0 + 2)));
-        assert_eq!(changes[2], Change::Delete(s, rule));
+        assert_eq!(
+            changes[2],
+            Change::Resolve {
+                subject: s,
+                rule,
+                at: T0 + 5,
+                detail: Some("fine".into()),
+            }
+        );
     }
 }

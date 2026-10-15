@@ -407,7 +407,9 @@ See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the set
 | `health.consecutive_samples` | Bad readings in a row before an alert, good ones before it is resolved (default: `3`) |
 | `health.renotify_interval` | Seconds between reminders of an active critical alert, `0` never (default: `3600`) |
 | `health.trusted_peers` | Mostro instances (npub or hex) whose median block height is also a reference (default: none, explorers only) |
-| `health.publish_heartbeat` | Publish the watchdog's own heartbeat, the relay round-trip probe (default: `true`) |
+| `health.publish_heartbeat` | Publish the watchdog's own heartbeat, the relay round-trip probe, once phase 1 or `peer_watchdogs` is on (default: `true`) |
+| `health.heartbeat_watching_tag` | Name Mostro in a public `watching` tag of the heartbeat (default: `false`) |
+| `health.alert_on_relays` | Send the watchdog's own relay outages to Telegram instead of only logging them (default: `false`) |
 | `health.peer_watchdogs` | Other watchdogs (npub or hex) whose heartbeat this one watches (default: none) |
 | `health.decrypt_key_env` | Environment variable with a key that only decrypts the health details, shareable between watchdogs (default: `WATCHDOG_HEALTH_DECRYPT_KEY`, falling back to the signing key when unset) |
 | `health.alerts_chat_id` | Telegram chat for health alerts (default: `telegram.chat_id`) |

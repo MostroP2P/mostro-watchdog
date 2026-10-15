@@ -150,11 +150,17 @@ http_port = 8080
 
 # Publish the watchdog's own heartbeat (kind 38389, z = watcher). It is also
 # the relay round-trip probe that tells "relays down" from "Mostro silent".
-# Needs the watchdog's key. (default: true)
+# Needs the watchdog's key, and only happens once mostro_health_enabled or
+# peer_watchdogs is set: an upgrade alone publishes nothing. (default: true)
 # publish_heartbeat = true
 
-# Name Mostro in a public `watching` tag of the heartbeat. (default: true)
-# heartbeat_watching_tag = true
+# Name Mostro in a public `watching` tag of the heartbeat. It links the
+# watchdog's key to the instance in public. (default: false)
+# heartbeat_watching_tag = false
+
+# Send the watchdog's own relay outages to Telegram. They are logged either
+# way, and they always hold the "silent" alerts. (default: false)
+# alert_on_relays = false
 
 # Other watchdogs (npub or hex) whose heartbeat this one watches. Run two on
 # different machines, each with the other's key here. (default: none)

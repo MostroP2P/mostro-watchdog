@@ -260,11 +260,17 @@ impl Snapshot<'_> {
 /// Every reading of `snapshot` under `config`.
 pub fn evaluate(snapshot: &Snapshot, config: &MonitorConfig) -> Vec<(Subject, RuleId, Reading)> {
     let mostro = Subject::Mostro(snapshot.mostro);
-    let mut readings = vec![(
-        Subject::Relays,
-        RuleId::RelaysUnreachable,
-        relays_unreachable(snapshot),
-    )];
+    let mut readings = Vec::new();
+    // The watchdog's own relays are its infrastructure: logged, and only
+    // sent to Telegram when the operator asks. Either way an outage holds
+    // the silence alerts (`Snapshot::relays_down`).
+    if config.alert_on_relays {
+        readings.push((
+            Subject::Relays,
+            RuleId::RelaysUnreachable,
+            relays_unreachable(snapshot),
+        ));
+    }
     if config.info_silence_threshold > 0 {
         readings.push((
             mostro.clone(),
@@ -395,7 +401,8 @@ fn info_silent(s: &Snapshot, threshold: u64) -> Reading {
 
 fn maintenance(s: &Snapshot) -> Reading {
     // The health event is newer and more frequent; the info event is the
-    // fallback that works with any mostrod.
+    // fallback that works with any mostrod, but only when it is newer than
+    // the last health event: an older one can't say maintenance ended.
     let (enabled, reason) = match (s.fresh_health(), &s.info) {
         (Some(health), _) => (
             health.maintenance_mode,
@@ -403,8 +410,13 @@ fn maintenance(s: &Snapshot) -> Reading {
                 .and_then(|d| d.maintenance.as_ref())
                 .and_then(|m| m.reason.clone()),
         ),
-        (None, Some(info)) => (info.maintenance_mode, None),
-        (None, None) => return Reading::Unknown,
+        (None, Some(info))
+            if s.health
+                .is_none_or(|h| info.created_at >= h.envelope.created_at) =>
+        {
+            (info.maintenance_mode, None)
+        }
+        _ => return Reading::Unknown,
     };
     if !enabled {
         return Reading::good("Mostro accepts new orders again.");
@@ -980,7 +992,7 @@ mod tests {
     }
 
     #[test]
-    fn unreachable_relays_make_silence_unknown_and_alert_on_their_own() {
+    fn unreachable_relays_make_silence_unknown() {
         let mostro = Keys::generate();
         let mut s = snapshot(&mostro, None, None);
         s.relays_reachable = Some(false);
@@ -988,7 +1000,6 @@ mod tests {
 
         assert_eq!(reading(&s, RuleId::HealthSilent), Reading::Unknown);
         assert_eq!(reading(&s, RuleId::InfoSilent), Reading::Unknown);
-        assert!(is_bad(&reading(&s, RuleId::RelaysUnreachable)));
     }
 
     #[test]
@@ -1192,6 +1203,54 @@ mod tests {
             maintenance_mode: true,
         });
         assert!(is_bad(&reading(&s, RuleId::Maintenance)));
+    }
+
+    #[test]
+    fn an_info_event_older_than_the_stale_health_event_cannot_end_maintenance() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |tags| set_tag(tags, "maintenance_mode", &["true"]));
+        let mut s = snapshot(&mostro, Some(&report), None);
+        // The health event went stale; the last info event predates it.
+        s.now = NOW + 600;
+        s.info = Some(InfoSnapshot {
+            created_at: NOW - 60,
+            maintenance_mode: false,
+        });
+
+        assert_eq!(reading(&s, RuleId::Maintenance), Reading::Unknown);
+
+        // A newer info event does tell.
+        s.info = Some(InfoSnapshot {
+            created_at: NOW + 300,
+            maintenance_mode: false,
+        });
+        assert!(matches!(
+            reading(&s, RuleId::Maintenance),
+            Reading::Good { .. }
+        ));
+    }
+
+    #[test]
+    fn the_watchdogs_own_relays_are_alerted_on_only_when_asked() {
+        let mostro = Keys::generate();
+        let mut s = snapshot(&mostro, None, None);
+        s.relays_reachable = Some(false);
+
+        let default = evaluate(&s, &MonitorConfig::default());
+        assert!(default
+            .iter()
+            .all(|(_, rule, _)| *rule != RuleId::RelaysUnreachable));
+
+        let opted_in = MonitorConfig {
+            alert_on_relays: true,
+            ..MonitorConfig::default()
+        };
+        let readings = evaluate(&s, &opted_in);
+        let (_, _, reading) = readings
+            .iter()
+            .find(|(_, rule, _)| *rule == RuleId::RelaysUnreachable)
+            .unwrap();
+        assert!(is_bad(reading));
     }
 
     #[test]

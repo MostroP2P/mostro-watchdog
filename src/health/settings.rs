@@ -94,11 +94,18 @@ pub struct MonitorConfig {
     /// with a made-up height.
     pub trusted_peers: Vec<String>,
     /// Publish the watchdog's own heartbeat (kind 38389, `z` = `watcher`).
-    /// It is also the relay round-trip probe. Needs the watchdog's key.
+    /// It is also the relay round-trip probe. Needs the watchdog's key, and
+    /// only happens once the operator opted into phase 1 or peer watchdogs
+    /// (see [`MonitorConfig::heartbeat_enabled`]).
     pub publish_heartbeat: bool,
     /// Put a `watching` tag with Mostro's pubkey in the heartbeat. It links
-    /// the watchdog to the instance in public.
+    /// the watchdog's key to the instance in public, so it is off unless
+    /// the operator turns it on.
     pub heartbeat_watching_tag: bool,
+    /// Send the watchdog's own relay outages to Telegram. Off by default:
+    /// they are the watchdog's infrastructure, logged with `tracing`. They
+    /// still hold the silence alerts either way.
+    pub alert_on_relays: bool,
     /// Other watchdogs (npub or hex) whose heartbeat this one watches.
     pub peer_watchdogs: Vec<String>,
     /// Telegram chat for health alerts. Defaults to `[telegram].chat_id`.
@@ -131,7 +138,8 @@ impl Default for MonitorConfig {
             block_height_sources: default_block_height_sources(),
             trusted_peers: Vec::new(),
             publish_heartbeat: true,
-            heartbeat_watching_tag: true,
+            heartbeat_watching_tag: false,
+            alert_on_relays: false,
             peer_watchdogs: Vec::new(),
             alerts_chat_id: None,
             private_key_env: DEFAULT_PRIVATE_KEY_ENV.to_string(),
@@ -196,6 +204,13 @@ impl MonitorConfig {
             || !self.peer_watchdogs.is_empty()
     }
 
+    /// Whether the heartbeat is published: asked for, and the operator
+    /// opted into the health event or into peer watchdogs. An upgrade alone
+    /// never starts publishing.
+    pub fn heartbeat_enabled(&self) -> bool {
+        self.publish_heartbeat && (self.mostro_health_enabled || !self.peer_watchdogs.is_empty())
+    }
+
     /// The configured peer watchdogs, parsed.
     pub fn peer_watchdogs(&self) -> Result<Vec<PublicKey>, String> {
         parse_keys("peer_watchdogs", &self.peer_watchdogs)
@@ -248,13 +263,18 @@ impl MonitorConfig {
     }
 }
 
+/// Parses `keys`, dropping repeats: the same key given twice, for example
+/// as npub and as hex, must count once.
 fn parse_keys(field: &str, keys: &[String]) -> Result<Vec<PublicKey>, String> {
-    keys.iter()
-        .map(|key| {
-            PublicKey::parse(key.trim())
-                .map_err(|_| format!("health.{field}: {key:?} is not a valid pubkey"))
-        })
-        .collect()
+    let mut parsed: Vec<PublicKey> = Vec::new();
+    for key in keys {
+        let pubkey = PublicKey::parse(key.trim())
+            .map_err(|_| format!("health.{field}: {key:?} is not a valid pubkey"))?;
+        if !parsed.contains(&pubkey) {
+            parsed.push(pubkey);
+        }
+    }
+    Ok(parsed)
 }
 
 #[cfg(test)]
@@ -383,10 +403,8 @@ mod tests {
             ..MonitorConfig::default()
         };
 
-        assert_eq!(
-            config.peer_watchdogs().unwrap(),
-            vec![keys.public_key(), keys.public_key()]
-        );
+        // The same key as npub and as hex counts once.
+        assert_eq!(config.peer_watchdogs().unwrap(), vec![keys.public_key()]);
 
         let bad = MonitorConfig {
             peer_watchdogs: vec!["not-a-key".into()],
@@ -407,6 +425,31 @@ mod tests {
         assert_eq!(config.trusted_peers().unwrap(), vec![keys.public_key()]);
         let bad = parse("trusted_peers = [\"nope\"]\n");
         assert!(bad.validate().unwrap_err().contains("trusted_peers"));
+    }
+
+    #[test]
+    fn an_upgrade_alone_publishes_nothing_and_alerts_on_no_relay_outage() {
+        let config = MonitorConfig::default();
+
+        assert!(!config.heartbeat_enabled());
+        assert!(!config.heartbeat_watching_tag);
+        assert!(!config.alert_on_relays);
+
+        let phase_one = MonitorConfig {
+            mostro_health_enabled: true,
+            ..MonitorConfig::default()
+        };
+        let peers = MonitorConfig {
+            peer_watchdogs: vec![nostr_sdk::prelude::Keys::generate().public_key().to_hex()],
+            ..MonitorConfig::default()
+        };
+        let opted_out = MonitorConfig {
+            publish_heartbeat: false,
+            ..phase_one.clone()
+        };
+        assert!(phase_one.heartbeat_enabled());
+        assert!(peers.heartbeat_enabled());
+        assert!(!opted_out.heartbeat_enabled());
     }
 
     #[test]

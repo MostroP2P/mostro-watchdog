@@ -181,8 +181,23 @@ async fn a_long_critical_incident_is_repeated_hourly() {
 }
 
 #[tokio::test]
-async fn unreachable_relays_alert_as_relays_not_as_a_silent_mostro() {
+async fn unreachable_relays_are_only_logged_by_default_and_hold_silence() {
     let mut h = Harness::new(config()).await;
+
+    for i in 0..10 {
+        h.round(NOW + 60 * i, &[], false).await;
+    }
+
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+}
+
+#[tokio::test]
+async fn unreachable_relays_alert_as_relays_not_as_a_silent_mostro() {
+    let mut h = Harness::new(MonitorConfig {
+        alert_on_relays: true,
+        ..config()
+    })
+    .await;
 
     for i in 0..10 {
         h.round(NOW + 60 * i, &[], false).await;
@@ -464,4 +479,58 @@ async fn a_shared_decrypt_key_reads_the_details_while_the_heartbeat_keeps_its_ow
     );
     assert!(h.sends()[0].contains("*Buyer payouts failing*"));
     assert_eq!(heartbeat.pubkey, h.watchdog.public_key());
+}
+
+#[tokio::test]
+async fn a_recovery_telegram_refused_is_sent_after_a_restart() {
+    let mut h = Harness::new(config()).await;
+    minutes(&mut h, NOW, 5, true, 1).await;
+    assert_eq!(h.sends().len(), 1);
+
+    // It clears while Telegram is down, then the watchdog restarts.
+    h.monitor.messenger.set_down(true);
+    minutes(&mut h, NOW + 300, 5, false, 100).await;
+    h.restart(config()).await;
+    minutes(&mut h, NOW + 600, 1, false, 200).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    assert!(sends[0].starts_with("✅ *Resolved*"), "{}", sends[0]);
+    assert!(h.store.pending_recoveries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_peer_watchdog_listed_twice_counts_once() {
+    let peer = Keys::generate();
+    let npub = nostr_sdk::prelude::ToBech32::to_bech32(&peer.public_key()).unwrap();
+    let mut h = Harness::new(MonitorConfig {
+        peer_watchdogs: vec![npub, peer.public_key().to_hex()],
+        ..MonitorConfig::default()
+    })
+    .await;
+
+    // Two rounds: with the key counted twice, the streak would reach three.
+    for i in 0..2 {
+        let info = h.info(NOW + 60 * i);
+        h.round(NOW + 60 * i, &[info], true).await;
+    }
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+
+    let info = h.info(NOW + 120);
+    h.round(NOW + 120, &[info], true).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1);
+    assert_eq!(
+        sends[0].matches("*Peer watchdog silent*").count(),
+        1,
+        "{}",
+        sends[0]
+    );
+}
+
+#[tokio::test]
+async fn an_upgraded_watchdog_with_a_key_publishes_no_heartbeat() {
+    let mut h = Harness::new(MonitorConfig::default()).await;
+
+    assert!(h.monitor.next_heartbeat(NOW * 1000).await.is_none());
 }
