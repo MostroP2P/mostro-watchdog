@@ -93,6 +93,8 @@ details, no reference height) counts for neither.
 | Buyer payouts stuck | an order settled-but-unpaid for 2 h and no successful payout for 2 h | Critical | details |
 | Buyer payouts failing | more than 50 % of at least 3 payout attempts failed in the event's window | Critical | details |
 | HTLC close to expiry | nearest pending HTLC expires in fewer than 72 blocks | Critical | details |
+| Cashu mint failing | the `cashu_mint` check is `fail` (Cashu instances) | Critical | phase 1 |
+| Cashu mint degraded | the `cashu_mint` check is `warn` (Cashu instances) | Warning | phase 1 |
 | Orders waiting for their payout | oldest settled-but-unpaid order older than 15 min | Warning | details |
 | Inactive Lightning channels | a channel inactive for 30 min | Warning | details |
 | Peer watchdog silent | a peer's heartbeat older than 3 × its interval, or never seen | Warning | `peer_watchdogs` |

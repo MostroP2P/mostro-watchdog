@@ -50,7 +50,9 @@ pub enum RuleId {
     NoPayoutSuccess,
     PayoutFailureRate,
     HtlcExpiry,
+    CashuMintFail,
     StatusDegraded,
+    CashuMintWarn,
     SettledUnpaid,
     InactiveChannels,
     Maintenance,
@@ -58,7 +60,7 @@ pub enum RuleId {
 }
 
 impl RuleId {
-    pub const ALL: [RuleId; 14] = [
+    pub const ALL: [RuleId; 16] = [
         Self::RelaysUnreachable,
         Self::InfoSilent,
         Self::HealthSilent,
@@ -68,7 +70,9 @@ impl RuleId {
         Self::NoPayoutSuccess,
         Self::PayoutFailureRate,
         Self::HtlcExpiry,
+        Self::CashuMintFail,
         Self::StatusDegraded,
+        Self::CashuMintWarn,
         Self::SettledUnpaid,
         Self::InactiveChannels,
         Self::Maintenance,
@@ -87,7 +91,9 @@ impl RuleId {
             Self::NoPayoutSuccess => "no_payout_success",
             Self::PayoutFailureRate => "payout_failure_rate",
             Self::HtlcExpiry => "htlc_expiry",
+            Self::CashuMintFail => "cashu_mint_fail",
             Self::StatusDegraded => "status_degraded",
+            Self::CashuMintWarn => "cashu_mint_warn",
             Self::SettledUnpaid => "settled_unpaid",
             Self::InactiveChannels => "inactive_channels",
             Self::Maintenance => "maintenance",
@@ -102,6 +108,7 @@ impl RuleId {
     pub fn severity(self) -> Severity {
         match self {
             Self::StatusDegraded
+            | Self::CashuMintWarn
             | Self::SettledUnpaid
             | Self::InactiveChannels
             | Self::Maintenance
@@ -122,7 +129,9 @@ impl RuleId {
             Self::NoPayoutSuccess => "Buyer payouts stuck",
             Self::PayoutFailureRate => "Buyer payouts failing",
             Self::HtlcExpiry => "HTLC close to expiry",
+            Self::CashuMintFail => "Cashu mint failing",
             Self::StatusDegraded => "Mostro reports itself degraded",
+            Self::CashuMintWarn => "Cashu mint degraded",
             Self::SettledUnpaid => "Orders waiting for their payout",
             Self::InactiveChannels => "Inactive Lightning channels",
             Self::Maintenance => "Mostro in maintenance mode",
@@ -299,6 +308,14 @@ pub fn evaluate(snapshot: &Snapshot, config: &MonitorConfig) -> Vec<(Subject, Ru
             (
                 RuleId::HtlcExpiry,
                 htlc_expiry(snapshot, t.htlc_expiry_blocks),
+            ),
+            (
+                RuleId::CashuMintFail,
+                cashu_mint(snapshot, CheckState::Fail),
+            ),
+            (
+                RuleId::CashuMintWarn,
+                cashu_mint(snapshot, CheckState::Warn),
             ),
             (
                 RuleId::SettledUnpaid,
@@ -662,6 +679,28 @@ fn htlc_expiry(s: &Snapshot, min_blocks: i64) -> Reading {
     }
 }
 
+/// The `cashu_mint` check in state `bad` (`Fail` for the critical rule,
+/// `Warn` for the warning). The other rule's state is no reading for this
+/// one, so a mint going from warn to fail is not "resolved" in between.
+/// Lightning instances don't emit the check: no reading.
+fn cashu_mint(s: &Snapshot, bad: CheckState) -> Reading {
+    let Some(check) = s
+        .fresh_health()
+        .and_then(|h| h.check(super::event::CheckName::CashuMint))
+    else {
+        return Reading::Unknown;
+    };
+    match check.state {
+        state if state == bad => Reading::Bad {
+            detail: format!("Mostro reports its Cashu mint check as {}.", state.as_str()),
+            since: Some(check.since),
+            min_duration: 0,
+        },
+        CheckState::Ok => Reading::good("The Cashu mint answers again."),
+        _ => Reading::Unknown,
+    }
+}
+
 fn settled_unpaid(s: &Snapshot, threshold: u64) -> Reading {
     let Some(payouts) = s.fresh_details().and_then(|d| d.payouts.as_ref()) else {
         return Reading::Unknown;
@@ -854,6 +893,11 @@ mod tests {
         let s = snapshot(&mostro, Some(&report), Some(&details));
 
         for (_, rule, reading) in evaluate(&s, &config()) {
+            if matches!(rule, RuleId::CashuMintFail | RuleId::CashuMintWarn) {
+                // Not a Cashu instance: no reading.
+                assert_eq!(reading, Reading::Unknown);
+                continue;
+            }
             assert!(
                 matches!(reading, Reading::Good { .. }),
                 "{rule:?}: {reading:?}"
@@ -1032,6 +1076,52 @@ mod tests {
         ] {
             assert_eq!(reading(&s, rule), Reading::Unknown, "{rule:?}");
         }
+    }
+
+    #[test]
+    fn a_cashu_mint_failing_is_critical_and_warning_is_a_warning() {
+        let mostro = Keys::generate();
+        let cashu = |state: &str| {
+            report_with(&mostro, |tags| {
+                set_tag(tags, "escrow_mode", &["cashu"]);
+                for name in ["lnd_block_height", "lnd_synced_to_chain", "lnd_network"] {
+                    set_tag(tags, name, &[]);
+                }
+                tags.retain(|t| t[0] != "check" || (t[1] != "lnd_sync" && t[1] != "payouts"));
+                tags.push(vec![
+                    "check".into(),
+                    "cashu_mint".into(),
+                    state.into(),
+                    "1791900000".into(),
+                ]);
+            })
+        };
+        let (fail, warn, ok) = (cashu("fail"), cashu("warn"), cashu("ok"));
+
+        let s = snapshot(&mostro, Some(&fail), None);
+        assert!(is_bad(&reading(&s, RuleId::CashuMintFail)));
+        assert_eq!(reading(&s, RuleId::CashuMintWarn), Reading::Unknown);
+        assert_eq!(RuleId::CashuMintFail.severity(), Severity::Critical);
+
+        let s = snapshot(&mostro, Some(&warn), None);
+        assert!(is_bad(&reading(&s, RuleId::CashuMintWarn)));
+        assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
+        assert_eq!(RuleId::CashuMintWarn.severity(), Severity::Warning);
+
+        let s = snapshot(&mostro, Some(&ok), None);
+        assert!(matches!(
+            reading(&s, RuleId::CashuMintFail),
+            Reading::Good { .. }
+        ));
+        assert!(matches!(
+            reading(&s, RuleId::CashuMintWarn),
+            Reading::Good { .. }
+        ));
+
+        // A Lightning instance has no such check: no reading at all.
+        let lightning = report_with(&mostro, |_| {});
+        let s = snapshot(&mostro, Some(&lightning), None);
+        assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
     }
 
     #[test]

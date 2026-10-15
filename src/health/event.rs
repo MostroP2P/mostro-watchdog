@@ -63,6 +63,8 @@ pub enum CheckName {
     Payouts,
     Relays,
     Database,
+    /// Cashu instances only: whether the mint answers.
+    CashuMint,
 }
 
 impl CheckName {
@@ -72,6 +74,7 @@ impl CheckName {
             "payouts" => Some(Self::Payouts),
             "relays" => Some(Self::Relays),
             "database" => Some(Self::Database),
+            "cashu_mint" => Some(Self::CashuMint),
             _ => None,
         }
     }
@@ -82,6 +85,7 @@ impl CheckName {
             Self::Payouts => "payouts",
             Self::Relays => "relays",
             Self::Database => "database",
+            Self::CashuMint => "cashu_mint",
         }
     }
 }
