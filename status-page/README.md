@@ -22,8 +22,20 @@ The page applies the spec's reader rules to every event: signature, `d` = author
 well-formed and unrepeated tags, `interval` in 30–3600, `expiration` exactly
 `created_at + 3 × interval`, no more than 300 s in the future, and the highest `seq`
 per pubkey. Events that fail are ignored (logged at debug level in the browser
-console). As a stateless reader it can't remember the highest `seq` across reloads;
-the freshness rule limits a replay to an event at most three intervals old.
+console).
+
+The spec treats a page as a stateless reader. As best-effort hardening, the page
+remembers in the browser's `localStorage`, when it is available:
+
+- the highest `seq` (and event id) accepted per publisher, so a reload doesn't take
+  an older revision a relay still serves;
+- the instances it has seen (name and last seen, forgotten after 30 days), so an
+  instance whose events are no longer served shows as **unknown** with "last seen"
+  instead of vanishing.
+
+Without storage (private mode, some `file://` setups) it works as before. Explorer
+tips are used for 30 minutes after they were fetched; when every explorer has failed
+for longer, the card says "no reference" instead of comparing with a stale tip.
 
 ## Hosting
 

@@ -279,15 +279,66 @@ export function displayState(report, now) {
   return report.shape === 'instance' ? report.status : 'ok';
 }
 
+/** How long an explorer tip is used, in seconds, after it was fetched. */
+export const TIP_MAX_AGE = 1800;
+
+/** Instances not seen for this long are forgotten, in seconds. */
+export const KNOWN_MAX_AGE = 30 * 86400;
+
 /**
- * Keeps, per pubkey, the valid revision with the highest seq. Returns
- * true when `report` replaced what was there.
+ * Whether `report` may be taken, given the revision `accepted`
+ * (`{ seq, id }`) remembered from an earlier visit: never an older seq,
+ * and with the same seq only the very same event.
  */
-export function keepNewest(store, report) {
+export function acceptable(report, accepted) {
+  if (!accepted) return true;
+  if (report.seq < accepted.seq) return false;
+  if (report.seq === accepted.seq) return report.id === accepted.id;
+  return true;
+}
+
+/**
+ * Keeps, per pubkey, the valid revision with the highest seq, never one
+ * older than `accepted`. Returns true when `report` replaced what was
+ * there.
+ */
+export function keepNewest(store, report, accepted) {
+  if (!acceptable(report, accepted)) return false;
   const current = store.get(report.pubkey);
   if (current && current.seq >= report.seq) return false;
   store.set(report.pubkey, report);
   return true;
+}
+
+/** `tip` while it is younger than `maxAge` seconds, else null. */
+export function freshTip(tip, now, maxAge = TIP_MAX_AGE) {
+  return tip && now - tip.at <= maxAge ? tip : null;
+}
+
+/**
+ * The instances seen so far (`{ pubkey: { name, lastSeen } }`), with
+ * `report` added, and without those not seen for KNOWN_MAX_AGE. Returns a
+ * new object.
+ */
+export function remember(known, report, now) {
+  const next = forgetOld(known, now);
+  const previous = next[report.pubkey];
+  if (!previous || previous.lastSeen <= report.createdAt) {
+    next[report.pubkey] = { name: report.name, lastSeen: report.createdAt };
+  }
+  return next;
+}
+
+/** `known` without the instances not seen for KNOWN_MAX_AGE. */
+export function forgetOld(known, now) {
+  const next = {};
+  for (const [pubkey, entry] of Object.entries(known || {})) {
+    const valid = /^[0-9a-f]{64}$/.test(pubkey)
+      && entry && Number.isFinite(entry.lastSeen)
+      && (entry.name === null || typeof entry.name === 'string');
+    if (valid && now - entry.lastSeen <= KNOWN_MAX_AGE) next[pubkey] = entry;
+  }
+  return next;
 }
 
 /** "45 s", "7 min", "2 h 5 min", "3 d 4 h". */
@@ -332,6 +383,37 @@ const instances = new Map();
 const watchers = new Map();
 const tips = new Map();
 
+// Best-effort memory across visits (the spec treats a page as a stateless
+// reader): the instances seen, so one whose events are no longer served
+// shows as unknown instead of vanishing, and the highest seq accepted per
+// publisher, so a reload doesn't take an older revision. Storage may be
+// unavailable (private mode, file://): the page then works without it.
+const KNOWN_KEY = 'mostro-status:known';
+const ACCEPTED_KEY = 'mostro-status:accepted';
+
+function loadJSON(key, fallback) {
+  try {
+    const raw = localStorage.getItem(key);
+    return raw ? JSON.parse(raw) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function saveJSON(key, value) {
+  try {
+    localStorage.setItem(key, JSON.stringify(value));
+  } catch {
+    // Storage unavailable or full: stay stateless.
+  }
+}
+
+let known = forgetOld(loadJSON(KNOWN_KEY, {}), Math.floor(Date.now() / 1000));
+const accepted = Object.fromEntries(
+  Object.entries(loadJSON(ACCEPTED_KEY, {})).filter(([pubkey, a]) =>
+    /^[0-9a-f]{64}$/.test(pubkey) && a && Number.isSafeInteger(a.seq) && typeof a.id === 'string'),
+);
+
 function toHex(key) {
   if (/^[0-9a-f]{64}$/.test(key)) return key;
   try {
@@ -374,9 +456,12 @@ function pill(state, text = state) {
 
 function heightLine(report) {
   if (report.blockHeight === null) return 'LND unreachable';
-  const tip = report.network ? tips.get(report.network) : undefined;
+  const tip = report.network ? freshTip(tips.get(report.network), now()) : null;
   const base = `${report.blockHeight}${report.network ? ` (${report.network})` : ''}`;
-  if (!tip) return base;
+  if (!tip) {
+    // A network with explorers whose tip is missing or too old.
+    return report.network && EXPLORERS[report.network] ? `${base} · no reference` : base;
+  }
   const lag = tip.height - report.blockHeight;
   if (lag >= LAG_BLOCKS) {
     return el('span', {}, `${base} · reference ${tip.height} from ${tip.source} · `, el('span', { class: 'lag' }, `${lag} blocks behind`));
@@ -423,22 +508,26 @@ function render() {
       || a.pubkey.localeCompare(b.pubkey));
   const grid = document.getElementById('instances');
   grid.replaceChildren(...list.map((r) => instanceCard(r, t)));
-  // Instances asked for by key but never seen are unknown too.
-  for (const key of onlyInstances) {
-    if (!instances.has(key)) {
-      grid.append(
-        el('article', { class: 'card unknown' },
-          el('div', { class: 'row' }, el('h3', {}, 'Mostro instance'), pill('unknown')),
-          el('div', { class: 'key', title: key }, npub(key)),
-          el('p', { class: 'note' }, 'No valid health event seen.')),
-      );
-    }
+  // Instances asked for by key, or seen on an earlier visit, that no relay
+  // serves now: unknown, never gone.
+  const expected = onlyInstances.length ? onlyInstances : Object.keys(known);
+  const missing = expected.filter((key) => !instances.has(key));
+  for (const key of missing) {
+    const seen = known[key];
+    grid.append(
+      el('article', { class: 'card unknown' },
+        el('div', { class: 'row' }, el('h3', {}, seen?.name || 'Mostro instance'), pill('unknown')),
+        el('div', { class: 'key', title: key }, npub(key)),
+        el('p', { class: 'note' }, seen
+          ? `No valid health event served now. Last seen ${ago(t - seen.lastSeen)} ago.`
+          : 'No valid health event seen.')),
+    );
   }
   document.getElementById('instances-empty').hidden = grid.children.length > 0;
 
   const counts = { ok: 0, degraded: 0, down: 0, unknown: 0 };
   for (const r of list) counts[displayState(r, t)] += 1;
-  counts.unknown += onlyInstances.filter((k) => !instances.has(k)).length;
+  counts.unknown += missing.length;
   document.getElementById('summary').replaceChildren(
     ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
   );
@@ -476,7 +565,8 @@ async function refreshTips() {
       }
     }));
     const best = answers.filter(Boolean).sort((a, b) => b.height - a.height)[0];
-    if (best) tips.set(network, best);
+    // A failed refresh keeps the old tip, which freshTip stops using.
+    if (best) tips.set(network, { ...best, at: now() });
   }
   render();
 }
@@ -487,8 +577,16 @@ function onEvent(event) {
     console.debug('Ignored kind 38389 event', event.id, result.reason);
     return;
   }
-  const store = result.report.shape === 'instance' ? instances : watchers;
-  if (keepNewest(store, result.report)) render();
+  const { report } = result;
+  const store = report.shape === 'instance' ? instances : watchers;
+  if (!keepNewest(store, report, accepted[report.pubkey])) return;
+  accepted[report.pubkey] = { seq: report.seq, id: report.id };
+  saveJSON(ACCEPTED_KEY, accepted);
+  if (report.shape === 'instance') {
+    known = remember(known, report, now());
+    saveJSON(KNOWN_KEY, known);
+  }
+  render();
 }
 
 document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;

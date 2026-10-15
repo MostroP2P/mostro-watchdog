@@ -11,7 +11,10 @@ import { readFileSync } from 'node:fs';
 
 const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
 const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END health-lib'));
-const { parseHealthEvent, isFresh, displayState, keepNewest, ago } = await import(
+const {
+  parseHealthEvent, isFresh, displayState, keepNewest, ago, acceptable, freshTip, remember, forgetOld,
+  KNOWN_MAX_AGE, TIP_MAX_AGE,
+} = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
 
@@ -155,4 +158,43 @@ test('durations read naturally', () => {
   assert.equal(ago(40), '40 s');
   assert.equal(ago(420), '7 min');
   assert.equal(ago(74460), '20 h 41 min');
+});
+
+test('a revision older than the one accepted on an earlier visit is refused', () => {
+  const at = (seq, id = 'e'.repeat(64)) => ({ ...parseHealthEvent(instance({ seq: [String(seq)] }), NOW, yes).report, id });
+  const remembered = { seq: 7, id: 'e'.repeat(64) };
+
+  assert.equal(acceptable(at(6), remembered), false);
+  assert.equal(acceptable(at(7), remembered), true, 'the same event restores the state');
+  assert.equal(acceptable(at(7, 'f'.repeat(64)), remembered), false, 'same seq, other event');
+  assert.equal(acceptable(at(8), remembered), true);
+  assert.equal(acceptable(at(1), undefined), true);
+
+  const store = new Map();
+  assert.equal(keepNewest(store, at(6), remembered), false);
+  assert.equal(store.size, 0);
+  assert.equal(keepNewest(store, at(7), remembered), true);
+});
+
+test('an explorer tip is used only while it is fresh', () => {
+  const tip = { height: 971485, source: 'mempool.space', at: NOW };
+
+  assert.equal(freshTip(tip, NOW + TIP_MAX_AGE), tip);
+  assert.equal(freshTip(tip, NOW + TIP_MAX_AGE + 1), null);
+  assert.equal(freshTip(undefined, NOW), null);
+});
+
+test('instances seen before are remembered, and forgotten after a month', () => {
+  const { report } = parseHealthEvent(instance(), NOW, yes);
+
+  const known = remember({}, report, NOW);
+  assert.deepEqual(known[PK], { name: 'Test Mostro', lastSeen: NOW });
+
+  // An older revision doesn't move "last seen" back.
+  const older = { ...report, createdAt: NOW - 600 };
+  assert.equal(remember(known, older, NOW)[PK].lastSeen, NOW);
+
+  assert.deepEqual(forgetOld(known, NOW + KNOWN_MAX_AGE + 1), {});
+  // Garbage from storage is dropped, not trusted.
+  assert.deepEqual(forgetOld({ nothex: { lastSeen: NOW }, [PK]: { lastSeen: 'x' } }, NOW), {});
 });
