@@ -29,9 +29,9 @@ remembers in the browser's `localStorage`, when it is available:
 
 - the highest `seq` (and event id) accepted per publisher, so a reload doesn't take
   an older revision a relay still serves;
-- the instances it has seen (name and last seen, forgotten after 30 days), so an
-  instance whose events are no longer served shows as **unknown** with "last seen"
-  instead of vanishing.
+- the instances and watchers it has seen (name or software and last seen, forgotten
+  after 30 days), so one whose events are no longer served shows as **unknown** with
+  "last seen" instead of vanishing.
 
 Without storage (private mode, some `file://` setups) it works as before. Explorer
 tips are used for 30 minutes after they were fetched; when every explorer has failed
@@ -55,7 +55,7 @@ All options are URL query parameters:
 | Parameter | Example | Effect |
 |---|---|---|
 | `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`) |
-| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives |
+| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Invalid keys are named in a warning; if none is valid, nothing is shown |
 | `watchers` | `?watchers=0` | Hide the watchers |
 
 ## Development

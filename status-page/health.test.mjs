@@ -234,7 +234,40 @@ test('a tie on seq is settled like the watchdog, whatever the arrival order', ()
 test('an instance parameter with no valid key is an error, not every instance', () => {
   const toHex = (k) => (/^[0-9a-f]{64}$/.test(k) ? k : null);
 
-  assert.deepEqual(parseInstanceParam(null, toHex), { given: false, keys: [], invalid: 0 });
-  assert.deepEqual(parseInstanceParam('nope,bad', toHex), { given: true, keys: [], invalid: 2 });
-  assert.deepEqual(parseInstanceParam(`${PK},nope,${PK}`, toHex), { given: true, keys: [PK], invalid: 1 });
+  assert.deepEqual(parseInstanceParam(null, toHex), { given: false, keys: [], invalid: [] });
+  assert.deepEqual(parseInstanceParam('nope,bad', toHex), { given: true, keys: [], invalid: ['nope', 'bad'] });
+  // A typo next to a valid key is named, not silently dropped.
+  assert.deepEqual(parseInstanceParam(`${PK},typo,${PK}`, toHex), { given: true, keys: [PK], invalid: ['typo'] });
+});
+
+test('an optional tag present without a value rejects the event', () => {
+  for (const name of ['lnd_block_height', 'lnd_synced_to_chain', 'lnd_network']) {
+    const event = instance({ [name]: null });
+    event.tags.push([name]);
+    assert.equal(parseHealthEvent(event, NOW, yes).reason, `bad ${name}`, name);
+  }
+  const withP = instance({}, { content: 'abc' });
+  withP.tags.push(['p']);
+  assert.equal(parseHealthEvent(withP, NOW, yes).reason, 'bad p');
+});
+
+test('watchers are remembered with their software', () => {
+  const event = {
+    id: 'f'.repeat(64),
+    pubkey: PK,
+    kind: 38389,
+    created_at: NOW,
+    content: '',
+    tags: [
+      ['d', PK],
+      ['y', 'mostro-watchdog'],
+      ['z', 'watcher'],
+      ['interval', '60'],
+      ['seq', '1'],
+      ['expiration', String(NOW + 180)],
+    ],
+  };
+  const { report } = parseHealthEvent(event, NOW, yes);
+
+  assert.deepEqual(remember({}, report, NOW)[PK], { name: 'mostro-watchdog', lastSeen: NOW });
 });

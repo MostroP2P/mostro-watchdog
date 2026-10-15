@@ -191,7 +191,10 @@ export function parseHealthEvent(event, now, verify) {
   // `watching` once per pubkey.
   const singles = shape === 'instance' ? [...INSTANCE_REQUIRED, ...INSTANCE_OPTIONAL] : WATCHER_REQUIRED;
   for (const name of singles) {
-    if (tags.filter((t) => t[0] === name).length > 1) return fail(`repeated ${name}`);
+    const found = tags.filter((t) => t[0] === name);
+    if (found.length > 1) return fail(`repeated ${name}`);
+    // Present but with no value is malformed, never "absent".
+    if (found.length === 1 && found[0].length < 2) return fail(`bad ${name}`);
   }
   const required = shape === 'instance' ? INSTANCE_REQUIRED : WATCHER_REQUIRED;
   for (const name of required) {
@@ -342,7 +345,8 @@ export function keepNewest(store, report, accepted) {
 export function parseInstanceParam(raw, toHex) {
   const entries = (raw || '').split(',').map((k) => k.trim()).filter(Boolean);
   const keys = [...new Set(entries.map(toHex).filter(Boolean))];
-  return { given: entries.length > 0, keys, invalid: entries.length - entries.map(toHex).filter(Boolean).length };
+  const invalid = entries.filter((entry) => !toHex(entry));
+  return { given: entries.length > 0, keys, invalid };
 }
 
 /** `tip` while it is younger than `maxAge` seconds, else null. */
@@ -351,15 +355,16 @@ export function freshTip(tip, now, maxAge = TIP_MAX_AGE) {
 }
 
 /**
- * The instances seen so far (`{ pubkey: { name, lastSeen } }`), with
- * `report` added, and without those not seen for KNOWN_MAX_AGE. Returns a
- * new object.
+ * The publishers seen so far (`{ pubkey: { name, lastSeen } }`), with
+ * `report` added, and without those not seen for KNOWN_MAX_AGE. The name
+ * is an instance's name, or a watcher's software. Returns a new object.
  */
 export function remember(known, report, now) {
   const next = forgetOld(known, now);
   const previous = next[report.pubkey];
   if (!previous || previous.lastSeen <= report.createdAt) {
-    next[report.pubkey] = { name: report.name, lastSeen: report.createdAt };
+    const name = report.shape === 'watcher' ? report.software : report.name;
+    next[report.pubkey] = { name: name ?? null, lastSeen: report.createdAt };
   }
   return next;
 }
@@ -443,6 +448,9 @@ function saveJSON(key, value) {
 }
 
 let known = forgetOld(loadJSON(KNOWN_KEY, {}), Math.floor(Date.now() / 1000));
+// Watchers seen on earlier visits: a dead one shows as unknown, not gone.
+const KNOWN_WATCHERS_KEY = 'mostro-status:known-watchers';
+let knownWatchers = forgetOld(loadJSON(KNOWN_WATCHERS_KEY, {}), Math.floor(Date.now() / 1000));
 // What was accepted on earlier visits, fixed for this one: it settles ties.
 const remembered = Object.freeze(Object.fromEntries(
   Object.entries(loadJSON(ACCEPTED_KEY, {})).filter(([pubkey, a]) =>
@@ -583,6 +591,16 @@ function render() {
       el('td', {}, `${ago(t - w.createdAt)} ago`),
       el('td', {}, pill(state === 'ok' ? 'ok' : 'unknown', state === 'ok' ? 'alive' : 'unknown')));
   });
+  // Watchers seen on an earlier visit that no relay serves now.
+  for (const [key, seen] of Object.entries(knownWatchers)) {
+    if (watchers.has(key)) continue;
+    rows.push(el('tr', {},
+      el('td', { class: 'key', title: key }, npub(key)),
+      el('td', {}, seen.name || '—'),
+      el('td', {}, '—'),
+      el('td', {}, `${ago(t - seen.lastSeen)} ago`),
+      el('td', {}, pill('unknown'))));
+  }
   document.getElementById('watchers').replaceChildren(...rows);
   document.getElementById('watchers-empty').hidden = rows.length > 0;
 }
@@ -622,16 +640,24 @@ function onEvent(event) {
   if (report.shape === 'instance') {
     known = remember(known, report, now());
     saveJSON(KNOWN_KEY, known);
+  } else {
+    knownWatchers = remember(knownWatchers, report, now());
+    saveJSON(KNOWN_WATCHERS_KEY, knownWatchers);
   }
   render();
 }
 
 document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;
-if (badInstanceParam) {
+if (instanceParam.invalid.length) {
+  // Named, so a typo doesn't silently drop an instance from the page.
   const error = document.getElementById('param-error');
-  error.textContent = 'None of the keys in the "instance" parameter is a valid npub or hex public key, so nothing is shown. Fix the URL, or remove the parameter to see every instance.';
+  const list = instanceParam.invalid.map((k) => `"${k}"`).join(', ');
+  error.textContent = badInstanceParam
+    ? `None of the keys in the "instance" parameter is a valid npub or hex public key (${list}), so nothing is shown. Fix the URL, or remove the parameter to see every instance.`
+    : `Ignored invalid keys in the "instance" parameter: ${list}. The other instances are shown.`;
   error.hidden = false;
-} else {
+}
+if (!badInstanceParam) {
   const pool = new SimplePool({ enableReconnect: true });
   const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
   if (onlyInstances.length) instanceFilter.authors = onlyInstances;
