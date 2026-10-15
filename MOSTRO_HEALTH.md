@@ -84,7 +84,6 @@ details, no reference height) counts for neither.
 
 | Alert | When (defaults) | Severity | Needs |
 |---|---|---|---|
-| Relays unreachable from the watchdog | its own heartbeat can't be read back from any relay | Critical | `alert_on_relays` |
 | Mostro info event silent | info event older than `info_silence_threshold` | Critical | phase 0 |
 | Mostro in maintenance mode | `maintenance_mode` is `true` | Warning | phase 0 |
 | Mostro is silent | health event older than 3 × `interval`, past `expiration`, or never seen | Critical | phase 1 |
@@ -133,8 +132,7 @@ A relay outage looks exactly like a silent Mostro. Every round the watchdog
 publishes its own heartbeat and reads it back (without a heartbeat, it checks that
 any relay is connected). When no relay returns it, the watchdog holds the silence
 alerts, which are unknown until a relay answers, and logs the outage. Its own relays
-are its infrastructure, so the outage reaches Telegram ("Relays unreachable from the
-watchdog") only with `alert_on_relays = true`.
+are its infrastructure, so the outage never reaches Telegram, only the log.
 
 When Mostro comes back after being silent and its details report a relay outage of
 its own in the last hour, the "resolved" message says how long its relays were
@@ -203,7 +201,6 @@ renotify_interval = 3600         # critical reminders; 0 = never
 trusted_peers = []               # instances trusted for the height median
 publish_heartbeat = true         # once phase 1 or peer_watchdogs is on
 heartbeat_watching_tag = false
-alert_on_relays = false          # the watchdog's own relay outages to Telegram
 peer_watchdogs = []              # npub or hex
 # alerts_chat_id = -100123       # defaults to [telegram].chat_id
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"    # signs the heartbeat; one per watchdog

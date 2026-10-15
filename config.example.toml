@@ -158,9 +158,6 @@ http_port = 8080
 # watchdog's key to the instance in public. (default: false)
 # heartbeat_watching_tag = false
 
-# Send the watchdog's own relay outages to Telegram. They are logged either
-# way, and they always hold the "silent" alerts. (default: false)
-# alert_on_relays = false
 
 # Other watchdogs (npub or hex) whose heartbeat this one watches. Run two on
 # different machines, each with the other's key here. (default: none)

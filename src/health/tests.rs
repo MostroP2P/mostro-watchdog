@@ -192,28 +192,6 @@ async fn unreachable_relays_are_only_logged_by_default_and_hold_silence() {
 }
 
 #[tokio::test]
-async fn unreachable_relays_alert_as_relays_not_as_a_silent_mostro() {
-    let mut h = Harness::new(MonitorConfig {
-        alert_on_relays: true,
-        ..config()
-    })
-    .await;
-
-    for i in 0..10 {
-        h.round(NOW + 60 * i, &[], false).await;
-    }
-
-    let sends = h.sends();
-    assert_eq!(sends.len(), 1, "{sends:#?}");
-    assert!(
-        sends[0].contains("*Relays unreachable from the watchdog*"),
-        "{}",
-        sends[0]
-    );
-    assert!(!sends[0].contains("silent"), "{}", sends[0]);
-}
-
-#[tokio::test]
 async fn a_silent_mostro_is_reported_when_relays_round_trip() {
     let mut h = Harness::new(config()).await;
     minutes(&mut h, NOW, 3, false, 1).await;
@@ -700,4 +678,94 @@ async fn a_split_round_counts_the_messages_that_went_out_as_delivered() {
         .sum();
     assert_eq!(rest, 40 - sent_first);
     assert!(h.store.pending_recoveries().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_recovery_is_told_only_once_it_is_stored() {
+    let mut h = Harness::new(config()).await;
+    minutes(&mut h, NOW, 5, true, 1).await;
+    assert_eq!(h.sends().len(), 1);
+    sqlx::query(
+        "CREATE TRIGGER no_recovery BEFORE INSERT ON health_pending_recoveries \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+
+    minutes(&mut h, NOW + 300, 5, false, 100).await;
+    assert_eq!(h.sends().len(), 1, "not told while it can't be stored");
+    assert_eq!(
+        h.store.open_incidents().await.unwrap().len(),
+        3,
+        "still open on disk"
+    );
+
+    sqlx::query("DROP TRIGGER no_recovery")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    minutes(&mut h, NOW + 600, 1, false, 200).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 2, "{sends:#?}");
+    assert!(sends[1].starts_with("✅ *Resolved*"), "{}", sends[1]);
+    assert!(h.store.open_incidents().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn a_failed_acknowledgement_is_retried_and_never_resends() {
+    let mut h = Harness::new(config()).await;
+    sqlx::query(
+        "CREATE TRIGGER no_ack BEFORE UPDATE ON health_incidents \
+         WHEN NEW.notified_at IS NOT NULL BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+
+    minutes(&mut h, NOW, 6, true, 1).await;
+    assert_eq!(h.sends().len(), 1, "sent once, even though the ack failed");
+    assert!(h
+        .store
+        .open_incidents()
+        .await
+        .unwrap()
+        .iter()
+        .all(|i| i.notified_at.is_none()));
+
+    sqlx::query("DROP TRIGGER no_ack")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    minutes(&mut h, NOW + 360, 1, true, 100).await;
+    assert_eq!(h.sends().len(), 1);
+    assert!(h
+        .store
+        .open_incidents()
+        .await
+        .unwrap()
+        .iter()
+        .all(|i| i.notified_at.is_some()));
+}
+
+#[tokio::test]
+async fn an_older_recovery_is_told_before_the_same_rule_opening_again() {
+    let mut h = Harness::new(config()).await;
+    minutes(&mut h, NOW, 5, true, 1).await;
+    h.monitor.messenger.clear();
+
+    // Telegram is down while it clears and then breaks again.
+    h.monitor.messenger.set_down(true);
+    minutes(&mut h, NOW + 300, 4, false, 100).await;
+    minutes(&mut h, NOW + 540, 4, true, 200).await;
+    h.monitor.messenger.set_down(false);
+    minutes(&mut h, NOW + 780, 1, true, 300).await;
+
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    let resolved = sends[0].find("✅ *Resolved*").expect("the recovery");
+    let opened = sends[0]
+        .find("🚨 *Mostro health alert*")
+        .expect("the new alert");
+    assert!(resolved < opened, "{}", sends[0]);
 }

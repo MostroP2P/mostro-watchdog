@@ -462,14 +462,20 @@ pub fn newest<'a, T>(
 where
     T: 'a,
 {
-    let best = candidates
-        .into_iter()
-        .max_by_key(|candidate| envelope(candidate).seq)?;
-    let env = envelope(best);
+    let candidates: Vec<&T> = candidates.into_iter().collect();
+    let top = candidates.iter().map(|c| envelope(c).seq).max()?;
+    let tied = candidates
+        .iter()
+        .copied()
+        .filter(|c| envelope(c).seq == top);
     match last {
-        Some(last) if env.seq < last.seq => None,
-        Some(last) if env.seq == last.seq && env.id != last.id => None,
-        _ => Some(best),
+        Some(last) if top < last.seq => None,
+        // The accepted revision wins a tie: a conflicting event with the
+        // same seq never replaces it, and its presence is no reason to
+        // reject the accepted one.
+        Some(last) if top == last.seq => tied.into_iter().find(|c| envelope(c).id == last.id),
+        // A tie between new revisions: NIP-01's order, lowest id first.
+        _ => tied.min_by_key(|c| envelope(c).id),
     }
 }
 
@@ -854,6 +860,26 @@ pub(crate) mod tests {
             id: reports[0].envelope.id,
         };
         assert!(newest(&reports[1..2], |r| &r.envelope, Some(other)).is_none());
+    }
+
+    #[test]
+    fn the_accepted_revision_wins_a_tie_on_seq() {
+        let mostro = Keys::generate();
+        let accepted =
+            parse_health(&health_event(&mostro, NOW, 7), mostro.public_key(), NOW).unwrap();
+        // Another validly signed event with the same seq.
+        let conflicting =
+            parse_health(&health_event(&mostro, NOW - 1, 7), mostro.public_key(), NOW).unwrap();
+        let last = Accepted {
+            seq: 7,
+            id: accepted.envelope.id,
+        };
+
+        for order in [[&accepted, &conflicting], [&conflicting, &accepted]] {
+            let chosen = newest(order, |r| &r.envelope, Some(last)).unwrap();
+            assert_eq!(chosen.envelope.id, accepted.envelope.id);
+        }
+        assert!(newest([&conflicting], |r| &r.envelope, Some(last)).is_none());
     }
 
     #[test]

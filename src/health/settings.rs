@@ -102,10 +102,6 @@ pub struct MonitorConfig {
     /// the watchdog's key to the instance in public, so it is off unless
     /// the operator turns it on.
     pub heartbeat_watching_tag: bool,
-    /// Send the watchdog's own relay outages to Telegram. Off by default:
-    /// they are the watchdog's infrastructure, logged with `tracing`. They
-    /// still hold the silence alerts either way.
-    pub alert_on_relays: bool,
     /// Other watchdogs (npub or hex) whose heartbeat this one watches.
     pub peer_watchdogs: Vec<String>,
     /// Telegram chat for health alerts. Defaults to `[telegram].chat_id`.
@@ -139,7 +135,6 @@ impl Default for MonitorConfig {
             trusted_peers: Vec::new(),
             publish_heartbeat: true,
             heartbeat_watching_tag: false,
-            alert_on_relays: false,
             peer_watchdogs: Vec::new(),
             alerts_chat_id: None,
             private_key_env: DEFAULT_PRIVATE_KEY_ENV.to_string(),
@@ -428,12 +423,11 @@ mod tests {
     }
 
     #[test]
-    fn an_upgrade_alone_publishes_nothing_and_alerts_on_no_relay_outage() {
+    fn an_upgrade_alone_publishes_nothing() {
         let config = MonitorConfig::default();
 
         assert!(!config.heartbeat_enabled());
         assert!(!config.heartbeat_watching_tag);
-        assert!(!config.alert_on_relays);
 
         let phase_one = MonitorConfig {
             mostro_health_enabled: true,

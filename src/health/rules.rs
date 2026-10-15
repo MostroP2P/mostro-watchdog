@@ -41,7 +41,6 @@ impl Severity {
 /// One condition the watchdog alerts on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum RuleId {
-    RelaysUnreachable,
     InfoSilent,
     HealthSilent,
     StatusDown,
@@ -60,8 +59,7 @@ pub enum RuleId {
 }
 
 impl RuleId {
-    pub const ALL: [RuleId; 16] = [
-        Self::RelaysUnreachable,
+    pub const ALL: [RuleId; 15] = [
         Self::InfoSilent,
         Self::HealthSilent,
         Self::StatusDown,
@@ -82,7 +80,6 @@ impl RuleId {
     /// The stored name. Never change one: open incidents are keyed by it.
     pub fn as_str(self) -> &'static str {
         match self {
-            Self::RelaysUnreachable => "relays_unreachable",
             Self::InfoSilent => "info_silent",
             Self::HealthSilent => "health_silent",
             Self::StatusDown => "status_down",
@@ -120,7 +117,6 @@ impl RuleId {
     /// The headline of the alert.
     pub fn title(self) -> &'static str {
         match self {
-            Self::RelaysUnreachable => "Relays unreachable from the watchdog",
             Self::InfoSilent => "Mostro info event silent",
             Self::HealthSilent => "Mostro is silent",
             Self::StatusDown => "Mostro reports itself down",
@@ -176,13 +172,13 @@ impl Reading {
     const GOOD: Self = Self::Good { detail: None };
 }
 
-/// Who an alert is about: Mostro, a peer watchdog, or the watchdog's own
-/// relays. Incidents are keyed by subject and rule.
+/// Who an alert is about: Mostro or a peer watchdog. Incidents are keyed
+/// by subject and rule. The watchdog's own relays are never a subject:
+/// they are its infrastructure, logged and never sent to Telegram.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Subject {
     Mostro(PublicKey),
     PeerWatchdog(PublicKey),
-    Relays,
 }
 
 impl Subject {
@@ -191,14 +187,10 @@ impl Subject {
         match self {
             Self::Mostro(pk) => pk.to_hex(),
             Self::PeerWatchdog(pk) => format!("watchdog:{}", pk.to_hex()),
-            Self::Relays => "relays".into(),
         }
     }
 
     pub fn parse(key: &str) -> Option<Self> {
-        if key == "relays" {
-            return Some(Self::Relays);
-        }
         if let Some(hex) = key.strip_prefix("watchdog:") {
             return PublicKey::from_hex(hex).ok().map(Self::PeerWatchdog);
         }
@@ -260,17 +252,10 @@ impl Snapshot<'_> {
 /// Every reading of `snapshot` under `config`.
 pub fn evaluate(snapshot: &Snapshot, config: &MonitorConfig) -> Vec<(Subject, RuleId, Reading)> {
     let mostro = Subject::Mostro(snapshot.mostro);
+    // The watchdog's own relays are its infrastructure: an outage is
+    // logged (`Monitor::log_relays`) and never sent to Telegram. It only
+    // holds the silence alerts (`Snapshot::relays_down`).
     let mut readings = Vec::new();
-    // The watchdog's own relays are its infrastructure: logged, and only
-    // sent to Telegram when the operator asks. Either way an outage holds
-    // the silence alerts (`Snapshot::relays_down`).
-    if config.alert_on_relays {
-        readings.push((
-            Subject::Relays,
-            RuleId::RelaysUnreachable,
-            relays_unreachable(snapshot),
-        ));
-    }
     if config.info_silence_threshold > 0 {
         readings.push((
             mostro.clone(),
@@ -357,17 +342,6 @@ pub fn human_duration(secs: u64) -> String {
         (0, 0, m) => format!("{m} min"),
         (0, h, m) => format!("{h} h {m} min"),
         (d, h, _) => format!("{d} d {h} h"),
-    }
-}
-
-fn relays_unreachable(s: &Snapshot) -> Reading {
-    match s.relays_reachable {
-        Some(false) => Reading::bad(
-            "The watchdog could not read its own event back from any relay. \
-             Mostro's state is unknown until a relay answers.",
-        ),
-        Some(true) => Reading::good("The watchdog reaches its relays again."),
-        None => Reading::Unknown,
     }
 }
 
@@ -697,6 +671,8 @@ fn htlc_expiry(s: &Snapshot, min_blocks: i64) -> Reading {
         return Reading::Unknown;
     }
     match (lnd.nearest_htlc_expiry_blocks, lnd.pending_htlcs) {
+        // An expiry with no pending HTLC is contradictory.
+        (Some(_), Some(0)) => Reading::Unknown,
         (Some(blocks), pending) if blocks < min_blocks => Reading::bad(format!(
             "The nearest pending HTLC expires in {blocks} blocks ({} pending).",
             pending.map_or("?".into(), |n| n.to_string())
@@ -1207,6 +1183,19 @@ mod tests {
     }
 
     #[test]
+    fn an_htlc_expiry_with_no_pending_htlc_is_unknown() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let contradictory = details(|body| {
+            body["lnd"]["pending_htlcs"] = 0.into();
+            body["lnd"]["nearest_htlc_expiry_blocks"] = 5.into();
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&contradictory));
+
+        assert_eq!(reading(&s, RuleId::HtlcExpiry), Reading::Unknown);
+    }
+
+    #[test]
     fn overflowing_payout_counters_are_unknown() {
         let mostro = Keys::generate();
         let report = report_with(&mostro, |_| {});
@@ -1315,26 +1304,18 @@ mod tests {
     }
 
     #[test]
-    fn the_watchdogs_own_relays_are_alerted_on_only_when_asked() {
+    fn the_watchdogs_own_relay_outage_only_holds_the_silence_alerts() {
         let mostro = Keys::generate();
         let mut s = snapshot(&mostro, None, None);
         s.relays_reachable = Some(false);
 
-        let default = evaluate(&s, &MonitorConfig::default());
-        assert!(default
-            .iter()
-            .all(|(_, rule, _)| *rule != RuleId::RelaysUnreachable));
+        let readings = evaluate(&s, &config());
 
-        let opted_in = MonitorConfig {
-            alert_on_relays: true,
-            ..MonitorConfig::default()
-        };
-        let readings = evaluate(&s, &opted_in);
-        let (_, _, reading) = readings
+        // No reading is about the relays; silence is unknown, not bad.
+        assert!(readings
             .iter()
-            .find(|(_, rule, _)| *rule == RuleId::RelaysUnreachable)
-            .unwrap();
-        assert!(is_bad(reading));
+            .all(|(subject, _, _)| matches!(subject, Subject::Mostro(_))));
+        assert!(readings.iter().all(|(_, _, r)| !is_bad(r)), "{readings:?}");
     }
 
     #[test]
@@ -1390,11 +1371,7 @@ mod tests {
     #[test]
     fn subjects_and_rules_round_trip_through_their_stored_names() {
         let pk = Keys::generate().public_key();
-        for subject in [
-            Subject::Mostro(pk),
-            Subject::PeerWatchdog(pk),
-            Subject::Relays,
-        ] {
+        for subject in [Subject::Mostro(pk), Subject::PeerWatchdog(pk)] {
             assert_eq!(Subject::parse(&subject.key()), Some(subject));
         }
         for rule in RuleId::ALL {

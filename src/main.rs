@@ -1167,8 +1167,11 @@ fn chrono_timestamp(unix: u64) -> String {
 }
 
 fn escape_markdown(text: &str) -> String {
+    // MarkdownV2 reserves the backslash too: one left unescaped escapes the
+    // character after it, `*` of the template included.
     let special_chars = [
-        '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!',
+        '\\', '_', '*', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.',
+        '!',
     ];
     let mut escaped = String::with_capacity(text.len());
     for c in text.chars() {
@@ -1542,6 +1545,7 @@ mod tests {
         assert_eq!(escape_markdown("{brace}"), "\\{brace\\}");
         assert_eq!(escape_markdown(".dot"), "\\.dot");
         assert_eq!(escape_markdown("!exclaim"), "\\!exclaim");
+        assert_eq!(escape_markdown("back\\slash\\"), "back\\\\slash\\\\");
 
         // Test complex case with special characters from CodeRabbit example
         assert_eq!(
@@ -1655,9 +1659,11 @@ mod tests {
         assert_eq!(escape_markdown_code(""), "");
         assert_eq!(chrono_timestamp(0), "1970-01-01 00:00:00 UTC"); // Unix epoch
 
-        // Test boundary conditions - backslash is NOT in escape_markdown special chars
-        assert_eq!(escape_markdown("\\"), "\\"); // backslash not escaped by escape_markdown
-        assert_eq!(escape_markdown_code("\\"), "\\\\"); // but IS escaped by escape_markdown_code
+        // Backslashes are escaped everywhere: unescaped, one at the end of a
+        // value would escape the template's next delimiter (Telegram allows
+        // escaping any character from 1 to 126).
+        assert_eq!(escape_markdown("\\"), "\\\\");
+        assert_eq!(escape_markdown_code("\\"), "\\\\");
         assert_eq!(escape_markdown_code("`"), "\\`");
     }
 

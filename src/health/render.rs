@@ -48,7 +48,6 @@ pub fn subject_label(subject: &Subject, mostro_name: Option<&str>) -> String {
             "Peer watchdog `{}`",
             escape_markdown_code(&short_key(&pk.to_hex()))
         ),
-        Subject::Relays => "This watchdog's relays".into(),
     }
 }
 
@@ -222,7 +221,7 @@ mod tests {
 
     fn incident(rule: RuleId, detail: &str) -> Incident {
         Incident {
-            subject: Subject::Relays,
+            subject: Subject::PeerWatchdog(Keys::generate().public_key()),
             rule,
             severity: rule.severity(),
             started_at: T0,
@@ -376,6 +375,16 @@ mod tests {
         );
         assert!(label.chars().count() < 200, "{label}");
         assert_escaped(&label);
+    }
+
+    #[test]
+    fn a_name_ending_in_a_backslash_cannot_escape_the_template() {
+        let pk = Keys::generate().public_key();
+
+        let label = subject_label(&Subject::Mostro(pk), Some("evil\\"));
+
+        // The backslash is escaped, so the closing `*` stays a delimiter.
+        assert!(label.starts_with("*evil\\\\* `"), "{label}");
     }
 
     #[test]

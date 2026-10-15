@@ -107,6 +107,9 @@ pub struct Monitor<M> {
     undelivered: Vec<Notice>,
     /// The last relay state logged, so an outage is logged once.
     relays_logged: Option<bool>,
+    /// Store writes that failed, retried in order every round, with the
+    /// recovery each one holds back until it is stored.
+    pending_writes: Vec<(Change, Option<Notice>)>,
 }
 
 /// What a round brings in from relays and explorers.
@@ -166,6 +169,7 @@ impl<M: Messenger> Monitor<M> {
             content_logged: None,
             undelivered,
             relays_logged: None,
+            pending_writes: Vec::new(),
         })
     }
 
@@ -426,16 +430,51 @@ impl<M: Messenger> Monitor<M> {
             renotify_interval: self.config.renotify_interval,
         };
         let mut notices = std::mem::take(&mut self.undelivered);
+        // Writes that failed last round go first, in order; a recovery held
+        // behind one is released once it is stored.
+        notices.extend(self.flush().await);
         for (subject, rule, reading) in readings {
             let (notice, change) = self.tracker.observe(subject, rule, reading, now, policy);
-            if let Some(change) = change {
-                if let Err(e) = self.store.apply(&change).await {
-                    error!(error = %e, "Failed to persist a health incident");
+            match (change, notice) {
+                // A recovery is told only once it is stored: told and then
+                // lost, a restart would bring the incident back.
+                (Some(change @ Change::Resolve { .. }), notice) => {
+                    notices.extend(self.persist(change, notice).await);
                 }
+                (Some(change), notice) => {
+                    notices.extend(self.persist(change, None).await);
+                    notices.extend(notice);
+                }
+                (None, notice) => notices.extend(notice),
             }
-            notices.extend(notice);
         }
         self.deliver(notices, now).await;
+    }
+
+    /// Queues `change` behind any earlier write that failed and writes the
+    /// queue in order. Returns the notices whose writes are now stored.
+    async fn persist(&mut self, change: Change, hold: Option<Notice>) -> Vec<Notice> {
+        self.pending_writes.push((change, hold));
+        self.flush().await
+    }
+
+    /// Writes the queued changes in order, stopping at the first failure:
+    /// the rest wait for the next round, so they never land out of order.
+    async fn flush(&mut self) -> Vec<Notice> {
+        let mut released = Vec::new();
+        while let Some((change, _)) = self.pending_writes.first() {
+            if let Err(e) = self.store.apply(change).await {
+                error!(
+                    error = %e,
+                    queued = self.pending_writes.len(),
+                    "Failed to persist a health incident; retried next round"
+                );
+                break;
+            }
+            let (_, hold) = self.pending_writes.remove(0);
+            released.extend(hold);
+        }
+        released
     }
 
     async fn deliver(&mut self, notices: Vec<Notice>, now: u64) {
@@ -457,8 +496,16 @@ impl<M: Messenger> Monitor<M> {
                 .or_default()
                 .push(index);
         }
+        // In the order things happened: a recovery Telegram refused earlier
+        // comes before the same rule opening again.
+        let when = |index: &usize| transition_time(&notices[*index], now);
+        let mut groups: Vec<((u8, Subject), Vec<usize>)> = groups.into_iter().collect();
+        for (_, indices) in &mut groups {
+            indices.sort_by_key(when);
+        }
+        groups.sort_by_key(|((kind, _), indices)| (indices.iter().map(when).min(), *kind));
         let mostro_name = self.health.as_ref().and_then(|h| h.name.clone());
-        let order: Vec<Vec<usize>> = groups.values().cloned().collect();
+        let order: Vec<Vec<usize>> = groups.iter().map(|(_, indices)| indices.clone()).collect();
         let sections: Vec<render::Section> = groups
             .iter()
             .map(|((kind, subject), indices)| {
@@ -518,12 +565,24 @@ impl<M: Messenger> Monitor<M> {
                     .tracker
                     .mark_notified(&incident.subject, incident.rule, now),
             };
+            // A failed acknowledgement is retried with the other writes,
+            // so the notice isn't sent again while the watchdog runs.
             if let Some(change) = change {
-                if let Err(e) = self.store.apply(&change).await {
-                    error!(error = %e, "Failed to persist a health incident");
-                }
+                // A recovery an earlier write held back may be released
+                // here: it goes out next round.
+                let released = self.persist(change, None).await;
+                self.undelivered.extend(released);
             }
         }
+    }
+}
+
+/// When the state change behind `notice` happened.
+fn transition_time(notice: &Notice, now: u64) -> u64 {
+    match notice {
+        Notice::Opened(incident) => incident.opened_at,
+        Notice::Reminder(_) => now,
+        Notice::Resolved { at, .. } => *at,
     }
 }
 
