@@ -48,11 +48,11 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(15);
 /// How long the watchdog waits to read its own heartbeat back.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Other instances' health events older than this are not fetched: the
+/// Trusted instances' health events older than this are not fetched: the
 /// longest interval allows three hours of freshness.
 const PEER_LOOKBACK_SECS: u64 = 3 * event::MAX_INTERVAL;
 
-/// Most instance events fetched per round for the peer median.
+/// Most trusted-instance events fetched per round for the peer median.
 const PEER_FETCH_LIMIT: usize = 500;
 
 /// The `z` tag, filterable as `#z`.
@@ -73,6 +73,8 @@ pub struct Monitor<M> {
     mostro: PublicKey,
     keys: Option<Keys>,
     peers: Vec<PublicKey>,
+    /// Instances trusted for the block-height median, never Mostro itself.
+    trusted_peers: Vec<PublicKey>,
     chat_id: i64,
     started_at: u64,
     messenger: M,
@@ -111,6 +113,12 @@ impl<M: Messenger> Monitor<M> {
         store: HealthStore,
     ) -> Result<Self, sqlx::Error> {
         let peers = config.peer_watchdogs().unwrap_or_default();
+        let trusted_peers = config
+            .trusted_peers()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|pk| *pk != mostro)
+            .collect();
         let mut accepted = HashMap::new();
         for pubkey in std::iter::once(&mostro).chain(&peers) {
             if let Some(last) = store.accepted(pubkey).await? {
@@ -124,6 +132,7 @@ impl<M: Messenger> Monitor<M> {
             mostro,
             keys,
             peers,
+            trusted_peers,
             chat_id,
             started_at,
             messenger,
@@ -154,10 +163,11 @@ impl<M: Messenger> Monitor<M> {
                     .author(self.mostro)
                     .identifier(self.mostro.to_hex()),
             );
-            if self.config.use_peer_instances_for_height {
+            if !self.trusted_peers.is_empty() {
                 filters.push(
                     Filter::new()
                         .kind(HEALTH_KIND)
+                        .authors(self.trusted_peers.clone())
                         .custom_tag(z_tag(), event::Z_HEALTH)
                         .since(Timestamp::from(now.saturating_sub(PEER_LOOKBACK_SECS)))
                         .limit(PEER_FETCH_LIMIT),
@@ -239,12 +249,9 @@ impl<M: Messenger> Monitor<M> {
                 self.peer_beats.insert(peer, beat.envelope);
             }
         }
-        self.peer_heights = match (
-            self.reference_network(),
-            self.config.use_peer_instances_for_height,
-        ) {
-            (Some(network), true) => height::peer_heights(events, self.mostro, network, now),
-            _ => Vec::new(),
+        self.peer_heights = match self.reference_network() {
+            Some(network) => height::peer_heights(events, &self.trusted_peers, network, now),
+            None => Vec::new(),
         };
     }
 

@@ -142,9 +142,11 @@ http_port = 8080
 # reminds; warnings never do. (default: 3600)
 # renotify_interval = 3600
 
-# Compare LND's block height with the median of other Mostro instances on the
-# same network too (at least 3 needed). (default: true)
-# use_peer_instances_for_height = true
+# Other Mostro instances (npub or hex) you trust: the median block height of
+# those on the same network (at least 3 fresh) is a reference too, next to the
+# explorers. Never every discovered instance: anyone can sign an event with a
+# made-up height. (default: none, explorers only)
+# trusted_peers = []
 
 # Publish the watchdog's own heartbeat (kind 38389, z = watcher). It is also
 # the relay round-trip probe that tells "relays down" from "Mostro silent".

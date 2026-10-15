@@ -11,7 +11,7 @@ use std::collections::BTreeMap;
 use nostr_sdk::prelude::*;
 use serde::Deserialize;
 
-use super::event::HealthReport;
+use super::event::{EscrowMode, HealthReport};
 
 /// The payload version this watchdog reads.
 pub const SUPPORTED_VERSION: u64 = 1;
@@ -144,6 +144,13 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
     };
     if details.v != Some(SUPPORTED_VERSION) {
         return Content::UnknownVersion(details.v);
+    }
+    // `null` is for a cashu instance, which has no LND and pays out no
+    // Lightning invoice. A Lightning payload without them is malformed.
+    if report.escrow_mode == EscrowMode::Lightning
+        && (details.lnd.is_none() || details.payouts.is_none())
+    {
+        return Content::Unreadable;
     }
     if !agrees_with_tags(&details, report) {
         return Content::Inconsistent;
@@ -392,6 +399,29 @@ pub(crate) mod tests {
         assert_eq!(details.lnd, None);
         assert_eq!(details.payouts, None);
         assert_eq!(details.relays.unwrap().connected, Some(4));
+    }
+
+    #[test]
+    fn a_lightning_payload_with_null_lnd_or_payouts_is_unreadable() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        for field in ["lnd", "payouts"] {
+            let mut body = payload();
+            body[field] = serde_json::Value::Null;
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |_| {},
+            );
+
+            assert_eq!(
+                read(&report(&event, &mostro), Some(&watchdog)),
+                Content::Unreadable,
+                "{field}"
+            );
+        }
     }
 
     #[test]

@@ -4,8 +4,10 @@
 //!
 //! Two references, only ever within the instance's `lnd_network`:
 //! - public explorers for that network (the highest answer wins);
-//! - the median height of other instances on the same network, from their
-//!   fresh health events, when at least [`MIN_PEERS`] are available.
+//! - the median height of the instances the operator trusts
+//!   (`trusted_peers`) on the same network, from their fresh health
+//!   events, when at least [`MIN_PEERS`] are available. Never every
+//!   discovered instance: anyone can sign an event with a made-up height.
 //!
 //! With neither (for example on regtest), the cross-check is skipped.
 
@@ -36,15 +38,16 @@ pub fn median(mut heights: Vec<u64>) -> Option<u64> {
     Some(heights[(heights.len() - 1) / 2])
 }
 
-/// Heights of other instances on `network`, from their fresh health
-/// events, one per instance (its highest `seq`).
-pub fn peer_heights(events: &[Event], exclude: PublicKey, network: &str, now: u64) -> Vec<u64> {
+/// Heights of the `trusted` instances on `network`, from their fresh
+/// health events, one per instance (its highest `seq`).
+pub fn peer_heights(events: &[Event], trusted: &[PublicKey], network: &str, now: u64) -> Vec<u64> {
     let mut by_instance: HashMap<PublicKey, Vec<HealthReport>> = HashMap::new();
     for report in events
         .iter()
+        .filter(|event| trusted.contains(&event.pubkey))
         .filter_map(|event| parse_any_health(event, now).ok())
     {
-        if report.envelope.pubkey != exclude && report.envelope.is_fresh(now) {
+        if report.envelope.is_fresh(now) {
             by_instance
                 .entry(report.envelope.pubkey)
                 .or_default()
@@ -128,7 +131,7 @@ pub fn reference(explorer: Option<(u64, String)>, peers: &[u64]) -> Option<Refer
         .flatten()
         .map(|height| Reference {
             height,
-            source: format!("the median of {} other instances", peers.len()),
+            source: format!("the median of {} trusted instances", peers.len()),
         });
     let explorer = explorer.map(|(height, source)| Reference { height, source });
     match (explorer, peer) {
@@ -142,12 +145,11 @@ mod tests {
     use super::*;
     use crate::health::event::tests::{health_tags, set_tag, sign, NOW};
 
-    fn instance(height: &str, network: &str, created_at: u64) -> Event {
-        let keys = Keys::generate();
-        let mut tags = health_tags(&keys, created_at, 1);
+    fn instance(keys: &Keys, height: &str, network: &str, created_at: u64) -> Event {
+        let mut tags = health_tags(keys, created_at, 1);
         set_tag(&mut tags, "lnd_block_height", &[height]);
         set_tag(&mut tags, "lnd_network", &[network]);
-        sign(&keys, tags, "", created_at)
+        sign(keys, tags, "", created_at)
     }
 
     #[test]
@@ -158,21 +160,34 @@ mod tests {
     }
 
     #[test]
-    fn peer_heights_only_count_fresh_instances_on_the_same_network() {
-        let me = Keys::generate();
-        let mine = sign(&me, health_tags(&me, NOW, 1), "", NOW);
+    fn peer_heights_only_count_fresh_trusted_instances_on_the_same_network() {
+        let (a, b, c, d) = (
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+            Keys::generate(),
+        );
+        let stranger = Keys::generate();
         let events = vec![
-            instance("971485", "mainnet", NOW),
-            instance("971486", "mainnet", NOW - 30),
-            instance("2000", "signet", NOW),
-            instance("971000", "mainnet", NOW - 1000),
-            mine,
+            instance(&a, "971485", "mainnet", NOW),
+            instance(&b, "971486", "mainnet", NOW - 30),
+            instance(&c, "2000", "signet", NOW),
+            instance(&d, "971000", "mainnet", NOW - 1000),
+            // Validly signed, made-up height, not trusted: ignored.
+            instance(&stranger, "999999", "mainnet", NOW),
+        ];
+        let trusted = [
+            a.public_key(),
+            b.public_key(),
+            c.public_key(),
+            d.public_key(),
         ];
 
-        let mut heights = peer_heights(&events, me.public_key(), "mainnet", NOW);
+        let mut heights = peer_heights(&events, &trusted, "mainnet", NOW);
         heights.sort();
 
         assert_eq!(heights, vec![971_485, 971_486]);
+        assert!(peer_heights(&events, &[], "mainnet", NOW).is_empty());
     }
 
     #[test]
@@ -200,7 +215,7 @@ mod tests {
         let peers = [971_486, 971_486, 971_487];
         let both = reference(explorer, &peers).unwrap();
         assert_eq!(both.height, 971_486);
-        assert_eq!(both.source, "the median of 3 other instances");
+        assert_eq!(both.source, "the median of 3 trusted instances");
         assert_eq!(reference(None, &peers).unwrap().height, 971_486);
     }
 }

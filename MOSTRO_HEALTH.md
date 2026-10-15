@@ -69,8 +69,9 @@ to one key: set the watchdog's pubkey as the health recipient in mostrod. The
 watchdog logs its hex pubkey at startup.
 
 Without a key, or when the details are for another key, can't be decrypted, use an
-unknown version or contradict the public tags, the watchdog checks the public tags
-only, and logs why once.
+unknown version, contradict the public tags or (on a Lightning instance) lack the
+`lnd` or `payouts` object, the watchdog checks the public tags only, and logs why
+once.
 
 ### Rules
 
@@ -112,8 +113,11 @@ problem. The watchdog compares `lnd_block_height` with:
 
 1. the explorers in `block_height_sources` for the instance's `lnd_network` (the
    highest answer wins; defaults for mainnet, testnet, testnet4 and signet);
-2. the median `lnd_block_height` of at least three other instances on the same
-   network, from their fresh health events (`use_peer_instances_for_height`).
+2. the median `lnd_block_height` of the instances listed in `trusted_peers` on the
+   same network, from their fresh health events, when at least three are fresh. Only
+   instances you trust: anyone can publish a validly signed health event with a
+   made-up height, so discovered instances never count. Empty by default, which
+   means explorers only; explorers queried directly are the preferred reference.
 
 The higher of the two is the reference. Heights only compare within one network: on a
 network with neither (regtest, simnet) the cross-check is skipped, never made against
@@ -182,7 +186,7 @@ mostro_health_enabled = false    # turn on once mostrod publishes kind 38389
 check_interval = 60              # seconds between rounds; also the heartbeat interval
 consecutive_samples = 3
 renotify_interval = 3600         # critical reminders; 0 = never
-use_peer_instances_for_height = true
+trusted_peers = []               # instances trusted for the height median
 publish_heartbeat = true
 heartbeat_watching_tag = true
 peer_watchdogs = []              # npub or hex

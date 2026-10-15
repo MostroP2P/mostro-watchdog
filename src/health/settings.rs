@@ -87,9 +87,12 @@ pub struct MonitorConfig {
     /// Explorer endpoints that answer the chain tip height as plain text,
     /// per `lnd_network`.
     pub block_height_sources: HashMap<String, Vec<String>>,
-    /// Also use the median block height of other Mostro instances' fresh
-    /// health events as a reference (when at least three are available).
-    pub use_peer_instances_for_height: bool,
+    /// Other Mostro instances (npub or hex) whose block height the watchdog
+    /// trusts: the median of their fresh health events is a reference, when
+    /// at least three are fresh. Empty: explorers only. Never every
+    /// discovered instance, since anyone can publish a validly signed event
+    /// with a made-up height.
+    pub trusted_peers: Vec<String>,
     /// Publish the watchdog's own heartbeat (kind 38389, `z` = `watcher`).
     /// It is also the relay round-trip probe. Needs the watchdog's key.
     pub publish_heartbeat: bool,
@@ -118,7 +121,7 @@ impl Default for MonitorConfig {
             consecutive_samples: 3,
             renotify_interval: 3600,
             block_height_sources: default_block_height_sources(),
-            use_peer_instances_for_height: true,
+            trusted_peers: Vec::new(),
             publish_heartbeat: true,
             heartbeat_watching_tag: true,
             peer_watchdogs: Vec::new(),
@@ -186,13 +189,12 @@ impl MonitorConfig {
 
     /// The configured peer watchdogs, parsed.
     pub fn peer_watchdogs(&self) -> Result<Vec<PublicKey>, String> {
-        self.peer_watchdogs
-            .iter()
-            .map(|key| {
-                PublicKey::parse(key.trim())
-                    .map_err(|_| format!("health.peer_watchdogs: {key:?} is not a valid pubkey"))
-            })
-            .collect()
+        parse_keys("peer_watchdogs", &self.peer_watchdogs)
+    }
+
+    /// The instances trusted for the block-height median, parsed.
+    pub fn trusted_peers(&self) -> Result<Vec<PublicKey>, String> {
+        parse_keys("trusted_peers", &self.trusted_peers)
     }
 
     /// Checks the values that can be wrong on their own.
@@ -229,8 +231,18 @@ impl MonitorConfig {
         if self.private_key_env.trim().is_empty() {
             return Err("health.private_key_env cannot be empty".into());
         }
+        self.trusted_peers()?;
         self.peer_watchdogs().map(|_| ())
     }
+}
+
+fn parse_keys(field: &str, keys: &[String]) -> Result<Vec<PublicKey>, String> {
+    keys.iter()
+        .map(|key| {
+            PublicKey::parse(key.trim())
+                .map_err(|_| format!("health.{field}: {key:?} is not a valid pubkey"))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -369,6 +381,20 @@ mod tests {
             ..MonitorConfig::default()
         };
         assert!(bad.validate().unwrap_err().contains("peer_watchdogs"));
+    }
+
+    #[test]
+    fn the_peer_median_is_off_unless_peers_are_trusted_explicitly() {
+        let keys = nostr_sdk::prelude::Keys::generate();
+
+        assert!(MonitorConfig::default().trusted_peers().unwrap().is_empty());
+        let config = parse(&format!(
+            "trusted_peers = [\"{}\"]\n",
+            keys.public_key().to_hex()
+        ));
+        assert_eq!(config.trusted_peers().unwrap(), vec![keys.public_key()]);
+        let bad = parse("trusted_peers = [\"nope\"]\n");
+        assert!(bad.validate().unwrap_err().contains("trusted_peers"));
     }
 
     #[test]

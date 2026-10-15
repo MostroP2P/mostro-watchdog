@@ -362,7 +362,8 @@ stops running:
   maintenance mode is reported when it starts and ends.
 - **Phase 1** (`mostro_health_enabled = true`), with a mostrod that publishes the
   health event (kind 38389): the event must stay fresh, and its checks, its block
-  height (compared with public explorers and other instances), its payouts and its
+  height (compared with public explorers and, optionally, instances you trust), its
+  payouts and its
   HTLCs are watched. It would have caught the 2026-10-14 incident, where an instance
   paid nobody for 21 hours, within about half an hour.
 
@@ -403,6 +404,7 @@ See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the set
 | `health.check_interval` | Seconds between checks and the heartbeat interval, 30 to 3600 (default: `60`) |
 | `health.consecutive_samples` | Bad readings in a row before an alert, good ones before it is resolved (default: `3`) |
 | `health.renotify_interval` | Seconds between reminders of an active critical alert, `0` never (default: `3600`) |
+| `health.trusted_peers` | Mostro instances (npub or hex) whose median block height is also a reference (default: none, explorers only) |
 | `health.publish_heartbeat` | Publish the watchdog's own heartbeat, the relay round-trip probe (default: `true`) |
 | `health.peer_watchdogs` | Other watchdogs (npub or hex) whose heartbeat this one watches (default: none) |
 | `health.alerts_chat_id` | Telegram chat for health alerts (default: `telegram.chat_id`) |
