@@ -148,9 +148,14 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
     }
     // `null` is for a cashu instance, which has no LND and pays out no
     // Lightning invoice. A Lightning payload without them is malformed.
-    if report.escrow_mode == EscrowMode::Lightning
-        && (details.lnd.is_none() || details.payouts.is_none())
-    {
+    // `lnd` and `payouts` are objects exactly on a Lightning instance and
+    // `null` exactly on a Cashu one; anything else is malformed.
+    let has_lightning = (details.lnd.is_some(), details.payouts.is_some());
+    let shape_matches = match report.escrow_mode {
+        EscrowMode::Lightning => has_lightning == (true, true),
+        EscrowMode::Cashu => has_lightning == (false, false),
+    };
+    if !shape_matches {
         return Content::Unreadable;
     }
     if !agrees_with_tags(&details, report) || !possible_in_time(&details, report) {
@@ -185,7 +190,14 @@ fn possible_in_time(details: &HealthDetails, report: &HealthReport) -> bool {
         Some((Some(start), Some(end))) => start <= end,
         _ => true,
     };
-    in_the_past && outage_ordered
+    // An order can't have waited longer than there has been time since
+    // 1970 by the event's clock.
+    let age_possible = details
+        .payouts
+        .as_ref()
+        .and_then(|p| p.oldest_settled_unpaid_order_age_secs)
+        .is_none_or(|age| age <= created_at);
+    in_the_past && outage_ordered && age_possible
 }
 
 fn agrees_with_tags(details: &HealthDetails, report: &HealthReport) -> bool {
@@ -528,6 +540,75 @@ pub(crate) mod tests {
             read(&report(&event, &mostro), Some(&watchdog)),
             Content::Inconsistent
         );
+    }
+
+    #[test]
+    fn a_cashu_payload_with_lightning_objects_is_unreadable() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        for (lnd_null, payouts_null) in [(false, false), (true, false), (false, true)] {
+            let mut body = payload();
+            if lnd_null {
+                body["lnd"] = serde_json::Value::Null;
+            }
+            if payouts_null {
+                body["payouts"] = serde_json::Value::Null;
+            }
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |tags| {
+                    set_tag(tags, "escrow_mode", &["cashu"]);
+                    for name in ["lnd_block_height", "lnd_synced_to_chain", "lnd_network"] {
+                        set_tag(tags, name, &[]);
+                    }
+                    tags.retain(|t| t[0] != "check" || (t[1] != "lnd_sync" && t[1] != "payouts"));
+                },
+            );
+
+            assert_eq!(
+                read(&report(&event, &mostro), Some(&watchdog)),
+                Content::Unreadable,
+                "lnd null {lnd_null}, payouts null {payouts_null}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_order_older_than_the_epoch_is_not_believed() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        let mut body = payload();
+        body["payouts"]["settled_unpaid_orders"] = 1.into();
+        body["payouts"]["oldest_settled_unpaid_order_age_secs"] = u64::MAX.into();
+        let event = encrypted_event(
+            &mostro,
+            &watchdog.public_key(),
+            &body.to_string(),
+            1,
+            |_| {},
+        );
+
+        assert_eq!(
+            read(&report(&event, &mostro), Some(&watchdog)),
+            Content::Inconsistent
+        );
+
+        // At most the event's own timestamp is possible.
+        body["payouts"]["oldest_settled_unpaid_order_age_secs"] = NOW.into();
+        let event = encrypted_event(
+            &mostro,
+            &watchdog.public_key(),
+            &body.to_string(),
+            1,
+            |_| {},
+        );
+        assert!(matches!(
+            read(&report(&event, &mostro), Some(&watchdog)),
+            Content::Details(_)
+        ));
     }
 
     #[test]
