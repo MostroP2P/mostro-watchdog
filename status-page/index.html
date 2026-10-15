@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mostro Status</title>
+<meta name="description" content="Live health of Mostro instances, read from their signed Nostr health events (kind 38389).">
+<style>
+  :root {
+    --bg: #f6f7f9;
+    --card: #ffffff;
+    --text: #1d2330;
+    --muted: #5d6677;
+    --border: #dfe3ea;
+    --ok: #1a7f37;
+    --ok-bg: #dcf5e3;
+    --degraded: #8a5a00;
+    --degraded-bg: #fdf0cc;
+    --down: #b42318;
+    --down-bg: #fde3e1;
+    --unknown: #4b5563;
+    --unknown-bg: #e7e9ee;
+    --accent: #3b5bdb;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #11141a;
+      --card: #1a1f28;
+      --text: #e6e9ef;
+      --muted: #9aa3b2;
+      --border: #2c3341;
+      --ok: #6fdc8c;
+      --ok-bg: #173a24;
+      --degraded: #f4c45a;
+      --degraded-bg: #3d3014;
+      --down: #ff8a80;
+      --down-bg: #45201d;
+      --unknown: #b4bcc8;
+      --unknown-bg: #2a303b;
+      --accent: #8da2fb;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--bg);
+    color: var(--text);
+    font: 15px/1.5 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  }
+  main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+  header h1 { font-size: 1.6rem; margin: 0 0 4px; }
+  header p { margin: 0; color: var(--muted); }
+  .summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0 24px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 16px; }
+  .card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-left: 6px solid var(--unknown);
+    border-radius: 10px;
+    padding: 14px 16px;
+    min-width: 0;
+  }
+  .card.ok { border-left-color: var(--ok); }
+  .card.degraded { border-left-color: var(--degraded); }
+  .card.down { border-left-color: var(--down); }
+  .card h3 { margin: 0; font-size: 1.05rem; overflow-wrap: anywhere; }
+  .key { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 0.8rem; color: var(--muted); overflow-wrap: anywhere; }
+  .row { display: flex; justify-content: space-between; gap: 8px; align-items: baseline; }
+  .pill {
+    display: inline-block;
+    padding: 1px 10px;
+    border-radius: 999px;
+    font-size: 0.8rem;
+    font-weight: 600;
+    white-space: nowrap;
+  }
+  .pill.ok { color: var(--ok); background: var(--ok-bg); }
+  .pill.degraded, .pill.warn { color: var(--degraded); background: var(--degraded-bg); }
+  .pill.down, .pill.fail { color: var(--down); background: var(--down-bg); }
+  .pill.unknown { color: var(--unknown); background: var(--unknown-bg); }
+  dl { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; margin: 10px 0 0; font-size: 0.9rem; }
+  dt { color: var(--muted); }
+  dd { margin: 0; overflow-wrap: anywhere; }
+  .lag { color: var(--down); font-weight: 600; }
+  ul.checks { list-style: none; padding: 0; margin: 10px 0 0; display: flex; flex-wrap: wrap; gap: 6px; }
+  .note { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+  h2 { font-size: 1.15rem; margin: 32px 0 12px; }
+  table { width: 100%; border-collapse: collapse; background: var(--card); border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  th, td { text-align: left; padding: 8px 12px; border-bottom: 1px solid var(--border); font-size: 0.9rem; vertical-align: top; }
+  th { color: var(--muted); font-weight: 600; }
+  .table-wrap { overflow-x: auto; }
+  .empty { color: var(--muted); padding: 16px 0; }
+  footer { margin-top: 32px; color: var(--muted); font-size: 0.85rem; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<main>
+  <header>
+    <h1>Mostro Status</h1>
+    <p>Live health of Mostro instances, from their signed Nostr health events (kind 38389). Public tags only: no key, no backend.</p>
+  </header>
+
+  <div class="summary" id="summary" aria-live="polite"></div>
+
+  <section aria-labelledby="instances-title">
+    <h2 id="instances-title">Instances</h2>
+    <div class="grid" id="instances"></div>
+    <p class="empty" id="instances-empty">Waiting for health events from the relays…</p>
+  </section>
+
+  <section aria-labelledby="watchers-title" id="watchers-section">
+    <h2 id="watchers-title">Watchers</h2>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>Watcher</th><th>Software</th><th>Watching</th><th>Last seen</th><th>State</th></tr></thead>
+        <tbody id="watchers"></tbody>
+      </table>
+    </div>
+    <p class="empty" id="watchers-empty">No watcher heartbeat seen yet.</p>
+  </section>
+
+  <footer>
+    <p id="relays-line"></p>
+    <p>An instance with no valid event, or whose last event expired or is older than three intervals, is shown as <strong>unknown</strong>, never as ok. Block heights are compared with public explorers for the same network; a lag of 3 blocks or more is highlighted.</p>
+  </footer>
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/nostr-tools@2.25.2/lib/nostr.bundle.js"
+        integrity="sha384-FXQAsrQPF8+Yw4G9sjW+s9sUIozKgjjidpD4OPcUaIxR5Z7gMcDFArOKmEq+KES2"
+        crossorigin="anonymous"></script>
+
+<script type="module">
+// BEGIN health-lib
+// The reader rules of the protocol's health event (health_event.md, "What a
+// reader owes"), as pure functions so they are tested with node (see
+// health.test.mjs). `verify` checks the NIP-01 signature.
+export const HEALTH_KIND = 38389;
+export const MIN_INTERVAL = 30;
+export const MAX_INTERVAL = 3600;
+export const MAX_SEQ = 9007199254740991;
+export const MAX_FUTURE_SKEW = 300;
+
+const INSTANCE_REQUIRED = ['d', 'y', 'z', 'status', 'escrow_mode', 'maintenance_mode', 'mostro_version', 'interval', 'seq', 'expiration'];
+const INSTANCE_OPTIONAL = ['lnd_block_height', 'lnd_synced_to_chain', 'lnd_network', 'p'];
+const WATCHER_REQUIRED = ['d', 'y', 'z', 'interval', 'seq', 'expiration'];
+const STATUSES = ['ok', 'degraded', 'down'];
+const CHECK_STATES = ['ok', 'warn', 'fail', 'unknown'];
+const KNOWN_CHECKS = ['lnd_sync', 'payouts', 'relays', 'database', 'cashu_mint'];
+
+function isInteger(value) {
+  return typeof value === 'string' && /^(0|[1-9][0-9]*)$/.test(value);
+}
+
+function isHexKey(value) {
+  return typeof value === 'string' && /^[0-9a-f]{64}$/.test(value);
+}
+
+/** The single value of tag `name`, or undefined. */
+function single(tags, name) {
+  const tag = tags.find((t) => t[0] === name);
+  return tag ? tag[1] : undefined;
+}
+
+/**
+ * Validates a kind-38389 event. Returns `{ valid: true, report }` or
+ * `{ valid: false, reason }`. Never trusts a field before checking it.
+ */
+export function parseHealthEvent(event, now, verify) {
+  const fail = (reason) => ({ valid: false, reason });
+  if (!event || event.kind !== HEALTH_KIND || !Array.isArray(event.tags)) return fail('not kind 38389');
+  if (!event.tags.every((t) => Array.isArray(t) && t.length >= 1 && t.every((v) => typeof v === 'string'))) {
+    return fail('malformed tags');
+  }
+  if (!verify(event)) return fail('invalid signature');
+  const tags = event.tags;
+  const z = single(tags, 'z');
+  const shape = z === 'health' ? 'instance' : z === 'watcher' ? 'watcher' : null;
+  if (!shape) return fail('z is neither health nor watcher');
+
+  // Every tag of the table appears at most once; `check` once per name;
+  // `watching` once per pubkey.
+  const singles = shape === 'instance' ? [...INSTANCE_REQUIRED, ...INSTANCE_OPTIONAL] : WATCHER_REQUIRED;
+  for (const name of singles) {
+    if (tags.filter((t) => t[0] === name).length > 1) return fail(`repeated ${name}`);
+  }
+  const required = shape === 'instance' ? INSTANCE_REQUIRED : WATCHER_REQUIRED;
+  for (const name of required) {
+    const value = single(tags, name);
+    if (value === undefined) return fail(`missing ${name}`);
+  }
+  if (single(tags, 'd') !== event.pubkey) return fail('d is not the author');
+  if (event.created_at > now + MAX_FUTURE_SKEW) return fail('dated in the future');
+
+  const interval = single(tags, 'interval');
+  const seq = single(tags, 'seq');
+  const expiration = single(tags, 'expiration');
+  if (!isInteger(interval) || Number(interval) < MIN_INTERVAL || Number(interval) > MAX_INTERVAL) return fail('bad interval');
+  if (!isInteger(seq) || Number(seq) < 1 || Number(seq) > MAX_SEQ) return fail('bad seq');
+  if (!isInteger(expiration) || Number(expiration) !== event.created_at + 3 * Number(interval)) return fail('bad expiration');
+
+  const base = {
+    pubkey: event.pubkey,
+    id: event.id,
+    createdAt: event.created_at,
+    interval: Number(interval),
+    seq: Number(seq),
+    expiration: Number(expiration),
+  };
+
+  if (shape === 'watcher') {
+    const watching = [];
+    for (const tag of tags.filter((t) => t[0] === 'watching')) {
+      if (!isHexKey(tag[1]) || watching.includes(tag[1])) return fail('bad watching');
+      watching.push(tag[1]);
+    }
+    return { valid: true, report: { ...base, shape, software: single(tags, 'y'), watching } };
+  }
+
+  const y = tags.find((t) => t[0] === 'y');
+  if (y[1] !== 'mostro') return fail('y is not mostro');
+  const status = single(tags, 'status');
+  if (!STATUSES.includes(status)) return fail('bad status');
+  const escrowMode = single(tags, 'escrow_mode');
+  if (escrowMode !== 'lightning' && escrowMode !== 'cashu') return fail('bad escrow_mode');
+  const maintenance = single(tags, 'maintenance_mode');
+  if (maintenance !== 'true' && maintenance !== 'false') return fail('bad maintenance_mode');
+
+  const checks = [];
+  const seen = new Set();
+  for (const tag of tags.filter((t) => t[0] === 'check')) {
+    const [, name, state, since] = tag;
+    if (tag.length < 4 || !isInteger(since) || Number(since) > event.created_at || seen.has(name)) {
+      return fail('bad check');
+    }
+    seen.add(name);
+    if (KNOWN_CHECKS.includes(name)) {
+      checks.push({ name, state: CHECK_STATES.includes(state) ? state : 'unknown', since: Number(since) });
+    }
+  }
+  if (checks.length === 0) return fail('no check');
+
+  const height = single(tags, 'lnd_block_height');
+  if (height !== undefined && !isInteger(height)) return fail('bad lnd_block_height');
+  const synced = single(tags, 'lnd_synced_to_chain');
+  if (synced !== undefined && synced !== 'true' && synced !== 'false') return fail('bad lnd_synced_to_chain');
+  const network = single(tags, 'lnd_network');
+  if (network !== undefined && network === '') return fail('bad lnd_network');
+  const p = single(tags, 'p');
+  if (p !== undefined && !isHexKey(p)) return fail('bad p');
+  if ((p !== undefined) === (event.content === '')) return fail('p without content or content without p');
+
+  return {
+    valid: true,
+    report: {
+      ...base,
+      shape,
+      name: y[2] || null,
+      status,
+      escrowMode,
+      maintenance: maintenance === 'true',
+      version: single(tags, 'mostro_version'),
+      blockHeight: height === undefined ? null : Number(height),
+      synced: synced === undefined ? null : synced === 'true',
+      network: network ?? null,
+      checks,
+    },
+  };
+}
+
+/** Whether `report` can still be trusted at `now`. */
+export function isFresh(report, now) {
+  return now < report.expiration && now - report.createdAt <= 3 * report.interval;
+}
+
+/** The state to show: the reported status while fresh, else unknown. */
+export function displayState(report, now) {
+  if (!report || !isFresh(report, now)) return 'unknown';
+  return report.shape === 'instance' ? report.status : 'ok';
+}
+
+/**
+ * Keeps, per pubkey, the valid revision with the highest seq. Returns
+ * true when `report` replaced what was there.
+ */
+export function keepNewest(store, report) {
+  const current = store.get(report.pubkey);
+  if (current && current.seq >= report.seq) return false;
+  store.set(report.pubkey, report);
+  return true;
+}
+
+/** "45 s", "7 min", "2 h 5 min", "3 d 4 h". */
+export function ago(seconds) {
+  const s = Math.max(0, Math.floor(seconds));
+  const d = Math.floor(s / 86400);
+  const h = Math.floor((s % 86400) / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  if (d) return `${d} d ${h} h`;
+  if (h) return `${h} h ${m} min`;
+  if (m) return `${m} min`;
+  return `${s} s`;
+}
+// END health-lib
+
+const DEFAULT_RELAYS = ['wss://relay.mostro.network', 'wss://nos.lol', 'wss://relay.damus.io'];
+const EXPLORERS = {
+  mainnet: ['https://mempool.space/api/blocks/tip/height', 'https://blockstream.info/api/blocks/tip/height'],
+  testnet: ['https://mempool.space/testnet/api/blocks/tip/height', 'https://blockstream.info/testnet/api/blocks/tip/height'],
+  testnet4: ['https://mempool.space/testnet4/api/blocks/tip/height'],
+  signet: ['https://mempool.space/signet/api/blocks/tip/height'],
+};
+const LAG_BLOCKS = 3;
+const EXPLORER_REFRESH_MS = 60_000;
+
+const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
+const params = new URLSearchParams(location.search);
+const relays = (params.get('relays') || '')
+  .split(',')
+  .map((r) => r.trim())
+  .filter((r) => /^wss?:\/\//.test(r));
+const relayList = relays.length ? relays : DEFAULT_RELAYS;
+const onlyInstances = (params.get('instance') || '')
+  .split(',')
+  .map((k) => k.trim())
+  .filter(Boolean)
+  .map(toHex)
+  .filter(Boolean);
+const showWatchers = params.get('watchers') !== '0';
+
+const instances = new Map();
+const watchers = new Map();
+const tips = new Map();
+
+function toHex(key) {
+  if (/^[0-9a-f]{64}$/.test(key)) return key;
+  try {
+    const decoded = nip19.decode(key);
+    return decoded.type === 'npub' ? decoded.data : null;
+  } catch {
+    return null;
+  }
+}
+
+function npub(hex) {
+  try {
+    const encoded = nip19.npubEncode(hex);
+    return `${encoded.slice(0, 12)}…${encoded.slice(-6)}`;
+  } catch {
+    return `${hex.slice(0, 8)}…`;
+  }
+}
+
+function now() {
+  return Math.floor(Date.now() / 1000);
+}
+
+function el(tag, attrs = {}, ...children) {
+  const node = document.createElement(tag);
+  for (const [key, value] of Object.entries(attrs)) {
+    if (key === 'class') node.className = value;
+    else node.setAttribute(key, value);
+  }
+  for (const child of children) {
+    if (child === null || child === undefined) continue;
+    node.append(child instanceof Node ? child : document.createTextNode(String(child)));
+  }
+  return node;
+}
+
+function pill(state, text = state) {
+  return el('span', { class: `pill ${state}` }, text);
+}
+
+function heightLine(report) {
+  if (report.blockHeight === null) return 'LND unreachable';
+  const tip = report.network ? tips.get(report.network) : undefined;
+  const base = `${report.blockHeight}${report.network ? ` (${report.network})` : ''}`;
+  if (!tip) return base;
+  const lag = tip.height - report.blockHeight;
+  if (lag >= LAG_BLOCKS) {
+    return el('span', {}, `${base} · reference ${tip.height} from ${tip.source} · `, el('span', { class: 'lag' }, `${lag} blocks behind`));
+  }
+  return `${base} · reference ${tip.height} from ${tip.source}`;
+}
+
+function instanceCard(report, t) {
+  const state = displayState(report, t);
+  const fresh = state !== 'unknown';
+  const card = el('article', { class: `card ${state}` });
+  card.append(
+    el('div', { class: 'row' }, el('h3', {}, report.name || 'Mostro instance'), pill(state)),
+    el('div', { class: 'key', title: report.pubkey }, npub(report.pubkey)),
+  );
+  const dl = el('dl');
+  const add = (term, value) => dl.append(el('dt', {}, term), el('dd', {}, value));
+  add('Last seen', `${ago(t - report.createdAt)} ago`);
+  if (!fresh) {
+    add('Why unknown', t >= report.expiration ? 'its last event expired' : 'its last event is older than three intervals');
+  }
+  add('Escrow', report.escrowMode);
+  if (report.escrowMode === 'lightning') add('Block height', heightLine(report));
+  if (report.maintenance) add('Maintenance', 'on: new orders are rejected');
+  add('Version', report.version);
+  card.append(dl);
+  const checks = el('ul', { class: 'checks', 'aria-label': 'Checks' });
+  for (const check of report.checks) {
+    checks.append(el('li', { title: `${check.state} for ${ago(report.createdAt - check.since)} at the time of the event` }, pill(check.state, `${check.name}: ${check.state}`)));
+  }
+  card.append(checks);
+  if (!fresh) card.append(el('p', { class: 'note' }, 'The states above are from the last valid event and may no longer hold.'));
+  return card;
+}
+
+function render() {
+  const t = now();
+  // Most urgent first: down, degraded, ok, then unknown.
+  const rank = { down: 0, degraded: 1, ok: 2, unknown: 3 };
+  const list = [...instances.values()]
+    .filter((r) => !onlyInstances.length || onlyInstances.includes(r.pubkey))
+    .sort((a, b) => rank[displayState(a, t)] - rank[displayState(b, t)]
+      || (a.name || '').localeCompare(b.name || '')
+      || a.pubkey.localeCompare(b.pubkey));
+  const grid = document.getElementById('instances');
+  grid.replaceChildren(...list.map((r) => instanceCard(r, t)));
+  // Instances asked for by key but never seen are unknown too.
+  for (const key of onlyInstances) {
+    if (!instances.has(key)) {
+      grid.append(
+        el('article', { class: 'card unknown' },
+          el('div', { class: 'row' }, el('h3', {}, 'Mostro instance'), pill('unknown')),
+          el('div', { class: 'key', title: key }, npub(key)),
+          el('p', { class: 'note' }, 'No valid health event seen.')),
+      );
+    }
+  }
+  document.getElementById('instances-empty').hidden = grid.children.length > 0;
+
+  const counts = { ok: 0, degraded: 0, down: 0, unknown: 0 };
+  for (const r of list) counts[displayState(r, t)] += 1;
+  counts.unknown += onlyInstances.filter((k) => !instances.has(k)).length;
+  document.getElementById('summary').replaceChildren(
+    ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
+  );
+
+  const section = document.getElementById('watchers-section');
+  section.hidden = !showWatchers;
+  const rows = [...watchers.values()].sort((a, b) => a.pubkey.localeCompare(b.pubkey)).map((w) => {
+    const state = displayState(w, t);
+    const watching = w.watching.length
+      ? w.watching.map((k) => instances.get(k)?.name || npub(k)).join(', ')
+      : '—';
+    return el('tr', {},
+      el('td', { class: 'key', title: w.pubkey }, npub(w.pubkey)),
+      el('td', {}, w.software),
+      el('td', {}, watching),
+      el('td', {}, `${ago(t - w.createdAt)} ago`),
+      el('td', {}, pill(state === 'ok' ? 'ok' : 'unknown', state === 'ok' ? 'alive' : 'unknown')));
+  });
+  document.getElementById('watchers').replaceChildren(...rows);
+  document.getElementById('watchers-empty').hidden = rows.length > 0;
+}
+
+async function refreshTips() {
+  const networks = new Set([...instances.values()].map((r) => r.network).filter(Boolean));
+  for (const network of networks) {
+    const urls = EXPLORERS[network];
+    if (!urls) continue; // No independent reference (regtest): no comparison.
+    const answers = await Promise.all(urls.map(async (url) => {
+      try {
+        const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
+        const body = (await response.text()).trim();
+        return response.ok && /^[1-9][0-9]{0,15}$/.test(body) ? { height: Number(body), source: new URL(url).host } : null;
+      } catch {
+        return null;
+      }
+    }));
+    const best = answers.filter(Boolean).sort((a, b) => b.height - a.height)[0];
+    if (best) tips.set(network, best);
+  }
+  render();
+}
+
+function onEvent(event) {
+  const result = parseHealthEvent(event, now(), (e) => verifyEvent(e));
+  if (!result.valid) {
+    console.debug('Ignored kind 38389 event', event.id, result.reason);
+    return;
+  }
+  const store = result.report.shape === 'instance' ? instances : watchers;
+  if (keepNewest(store, result.report)) render();
+}
+
+document.getElementById('relays-line').textContent = `Relays: ${relayList.join(', ')}`;
+const pool = new SimplePool({ enableReconnect: true });
+const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
+if (onlyInstances.length) instanceFilter.authors = onlyInstances;
+pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
+if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+render();
+setInterval(render, 1000);
+setTimeout(refreshTips, 3000);
+setInterval(refreshTips, EXPLORER_REFRESH_MS);
+</script>
+</body>
+</html>
