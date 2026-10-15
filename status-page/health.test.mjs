@@ -14,6 +14,7 @@ const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
+  syncAccepted, withLock,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -357,4 +358,83 @@ test('an empty instance parameter is an error, not every instance', () => {
   }
   const none = params('relays=wss://x.org');
   assert.equal(parseInstanceParam(none.get('instance'), toHex, none.has('instance')).given, false);
+});
+
+/** A localStorage stand-in: one value, counting writes. */
+function fakeStorage(initial = {}) {
+  let raw = JSON.stringify(initial);
+  return {
+    writes: 0,
+    read: () => JSON.parse(raw),
+    write(value) {
+      this.writes += 1;
+      raw = JSON.stringify(value);
+    },
+    get value() {
+      return JSON.parse(raw);
+    },
+  };
+}
+
+/** A Web Locks stand-in that runs requests one after another. */
+function fakeLocks() {
+  let queue = Promise.resolve();
+  const held = [];
+  return {
+    held,
+    request(name, critical) {
+      const run = queue.then(async () => {
+        held.push(name);
+        try {
+          return await critical();
+        } finally {
+          held.pop();
+        }
+      });
+      queue = run.catch(() => {});
+      return run;
+    },
+  };
+}
+
+test('read-merge-write under the lock keeps every tab\'s best revision', async () => {
+  const A = 'a'.repeat(64);
+  const B = 'b'.repeat(64);
+  const storage = fakeStorage({ [A]: { seq: 3, id: 'x' } });
+  const locks = fakeLocks();
+  // Two tabs loaded stale copies and write at the same time.
+  const tab1 = { [A]: { seq: 9, id: 'x' } };
+  const tab2 = { [A]: { seq: 4, id: 'x' }, [B]: { seq: 7, id: 'y' } };
+
+  await Promise.all([
+    withLock(locks, 'lock', () => syncAccepted(storage.read, (v) => storage.write(v), tab1)),
+    withLock(locks, 'lock', () => syncAccepted(storage.read, (v) => storage.write(v), tab2)),
+  ]);
+
+  assert.deepEqual(storage.value, { [A]: { seq: 9, id: 'x' }, [B]: { seq: 7, id: 'y' } });
+});
+
+test('an unchanged merge writes nothing, so tabs never wake each other in a loop', () => {
+  const A = 'a'.repeat(64);
+  const storage = fakeStorage({ [A]: { seq: 9, id: 'x' } });
+
+  syncAccepted(storage.read, (v) => storage.write(v), { [A]: { seq: 5, id: 'x' } });
+  syncAccepted(storage.read, (v) => storage.write(v), {});
+  assert.equal(storage.writes, 0);
+
+  syncAccepted(storage.read, (v) => storage.write(v), { [A]: { seq: 10, id: 'x' } });
+  assert.equal(storage.writes, 1);
+});
+
+test('without the lock API the critical section still runs', async () => {
+  let ran = false;
+  const result = await withLock(undefined, 'lock', () => {
+    ran = true;
+    return 42;
+  });
+
+  assert.equal(ran, true);
+  assert.equal(result, 42);
+  const locks = fakeLocks();
+  await withLock(locks, 'mostro-status:accepted', () => assert.deepEqual(locks.held, ['mostro-status:accepted']));
 });

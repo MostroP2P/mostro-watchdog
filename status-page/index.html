@@ -419,7 +419,32 @@ export function mergeAccepted(stored, mine) {
       if (valid && better(entry, merged[pubkey])) merged[pubkey] = { seq: entry.seq, id: entry.id };
     }
   }
+  // Sorted keys: the same content always serializes the same, so writing
+  // back an unchanged merge is a no-op and tabs don't wake each other.
+  return Object.fromEntries(Object.entries(merged).sort(([a], [b]) => (a < b ? -1 : 1)));
+}
+
+/**
+ * Reads what is stored, merges `mine` into it and writes the result back
+ * when it differs. Run it under `withLock`, so another tab can't write
+ * between the read and the write. Returns the merged map.
+ */
+export function syncAccepted(read, write, mine) {
+  const stored = read();
+  const merged = mergeAccepted(stored, mine);
+  if (JSON.stringify(merged) !== JSON.stringify(mergeAccepted(stored, {}))) write(merged);
   return merged;
+}
+
+/**
+ * Runs `critical` holding the Web Locks lock `name` when the browser has
+ * the API (`navigator.locks`), which makes a read-merge-write atomic
+ * across tabs. Without it, runs it directly: the merge still never lowers
+ * what another tab stored.
+ */
+export async function withLock(locks, name, critical) {
+  if (locks && typeof locks.request === 'function') return locks.request(name, critical);
+  return critical();
 }
 
 /** Merges two known-publisher maps: per publisher, the latest sighting. */
@@ -528,6 +553,15 @@ function currentAccepted() {
   accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), accepted);
   return accepted;
 }
+
+/** Merges this tab's revisions into storage, writing only a change. */
+function storeAccepted() {
+  accepted = syncAccepted(() => loadJSON(ACCEPTED_KEY, {}), (merged) => saveJSON(ACCEPTED_KEY, merged), accepted);
+}
+
+/** The lock that makes the read-merge-write of the seq store atomic. */
+const ACCEPTED_LOCK = 'mostro-status:accepted';
+const locks = typeof navigator !== 'undefined' ? navigator.locks : undefined;
 
 function toHex(key) {
   if (/^[0-9a-f]{64}$/.test(key)) return key;
@@ -704,16 +738,20 @@ function onEvent(event) {
     console.debug('Ignored kind 38389 event', event.id, result.reason);
     return;
   }
-  const { report } = result;
+  // One event at a time, and no other tab writing between our read and
+  // our write.
+  withLock(locks, ACCEPTED_LOCK, () => acceptEvent(result.report)).catch((error) => {
+    console.error('Could not record a health event', error);
+  });
+}
+
+function acceptEvent(report) {
   const store = report.shape === 'instance' ? instances : watchers;
   // Judged against what any tab stored by now, not a page-load snapshot.
   if (!keepNewest(store, report, currentAccepted()[report.pubkey])) return;
   waiting.delete(report.pubkey);
-  accepted = mergeAccepted(loadJSON(ACCEPTED_KEY, {}), {
-    ...accepted,
-    [report.pubkey]: { seq: report.seq, id: report.id },
-  });
-  saveJSON(ACCEPTED_KEY, accepted);
+  accepted = { ...accepted, [report.pubkey]: { seq: report.seq, id: report.id } };
+  storeAccepted();
   if (report.shape === 'instance') {
     known = mergeKnown(loadJSON(KNOWN_KEY, {}), remember(known, report, now()), now());
     saveJSON(KNOWN_KEY, known);
@@ -732,13 +770,20 @@ function onEvent(event) {
 // replaces it with "waiting" until it arrives; new sightings are merged.
 window.addEventListener('storage', (event) => {
   if (event.key === ACCEPTED_KEY) {
-    const stored = currentAccepted();
-    for (const shown of [instances, watchers]) {
-      for (const pubkey of superseded(shown, stored)) {
-        shown.delete(pubkey);
-        waiting.add(pubkey);
+    withLock(locks, ACCEPTED_LOCK, () => {
+      const stored = currentAccepted();
+      for (const shown of [instances, watchers]) {
+        for (const pubkey of superseded(shown, stored)) {
+          shown.delete(pubkey);
+          waiting.add(pubkey);
+        }
       }
-    }
+      // A tab without the lock API may have overwritten a better revision
+      // this one knows: write the winners back (only if anything changed).
+      storeAccepted();
+      render();
+    }).catch((error) => console.error('Could not reconcile stored revisions', error));
+    return;
   } else if (event.key === KNOWN_KEY) {
     known = mergeKnown(loadJSON(KNOWN_KEY, {}), known, now());
   } else if (event.key === KNOWN_WATCHERS_KEY) {

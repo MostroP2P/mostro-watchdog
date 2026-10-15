@@ -33,7 +33,11 @@ remembers in the browser's `localStorage`, when it is available:
   after 30 days), so one whose events are no longer served shows as **unknown** with
   "last seen" instead of vanishing.
 
-One rule orders the revisions of a publisher everywhere: a higher `seq` wins, and on
+Reading, merging and writing the stored revisions happens under a Web Locks lock
+(`navigator.locks`) when the browser has the API, so two tabs can't interleave; without
+it, the merge still never lowers what another tab stored, and a tab that hears of a
+change writes the winning revisions back. One rule orders the revisions of a publisher
+everywhere: a higher `seq` wins, and on
 an equal `seq` the lower event id. Each incoming event is judged against what any tab
 has stored by then, writes merge with the stored data by the same rule, and when
 another tab stores a revision that beats the one shown here, this tab shows the
