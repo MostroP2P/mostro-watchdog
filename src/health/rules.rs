@@ -587,7 +587,12 @@ fn no_payout_success(s: &Snapshot, threshold: u64) -> Reading {
     let Some(waiting) = payouts.settled_unpaid_orders else {
         return Reading::Unknown;
     };
-    let oldest = payouts.oldest_settled_unpaid_order_age_secs.unwrap_or(0);
+    let oldest = match payouts.oldest_settled_unpaid_order_age_secs {
+        Some(age) => age,
+        None if waiting == 0 => 0,
+        // Orders waiting but no age: contradictory, so unknown.
+        None => return Reading::Unknown,
+    };
     let since_success = payouts
         .last_payout_success_at
         .map(|at| s.now.saturating_sub(at));
@@ -623,6 +628,7 @@ fn payout_failure_rate(s: &Snapshot, max_rate: f64, min_attempts: u64) -> Readin
     let reasons = payouts
         .failure_reasons_1h
         .iter()
+        .flatten()
         .filter(|(_, count)| **count > 0)
         .map(|(reason, count)| format!("{reason} {count}"))
         .collect::<Vec<_>>()
@@ -645,12 +651,14 @@ fn htlc_expiry(s: &Snapshot, min_blocks: i64) -> Reading {
     if lnd.reachable != Some(true) {
         return Reading::Unknown;
     }
-    match lnd.nearest_htlc_expiry_blocks {
-        Some(blocks) if blocks < min_blocks => Reading::bad(format!(
+    match (lnd.nearest_htlc_expiry_blocks, lnd.pending_htlcs) {
+        (Some(blocks), pending) if blocks < min_blocks => Reading::bad(format!(
             "The nearest pending HTLC expires in {blocks} blocks ({} pending).",
-            lnd.pending_htlcs.map_or("?".into(), |n| n.to_string())
+            pending.map_or("?".into(), |n| n.to_string())
         )),
-        _ => Reading::good("No pending HTLC is close to its expiry."),
+        // `null` means "no pending HTLC" only when the count says so.
+        (Some(_), _) | (None, Some(0)) => Reading::good("No pending HTLC is close to its expiry."),
+        _ => Reading::Unknown,
     }
 }
 
@@ -658,16 +666,21 @@ fn settled_unpaid(s: &Snapshot, threshold: u64) -> Reading {
     let Some(payouts) = s.fresh_details().and_then(|d| d.payouts.as_ref()) else {
         return Reading::Unknown;
     };
+    // `null` is unknown, never zero.
+    let Some(waiting) = payouts.settled_unpaid_orders else {
+        return Reading::Unknown;
+    };
     match payouts.oldest_settled_unpaid_order_age_secs {
         Some(age) if age >= threshold => Reading::Bad {
             detail: format!(
-                "{} order(s) settled but unpaid; the oldest for {}.",
-                payouts.settled_unpaid_orders.unwrap_or(1),
+                "{waiting} order(s) settled but unpaid; the oldest for {}.",
                 human_duration(age)
             ),
             since: Some(s.now.saturating_sub(age)),
             min_duration: 0,
         },
+        // Orders waiting but no age: contradictory, so unknown.
+        None if waiting > 0 => Reading::Unknown,
         _ => Reading::good("No order waits long for its payout."),
     }
 }
@@ -991,6 +1004,34 @@ mod tests {
             panic!("expected good");
         };
         assert!(detail.ends_with("unreachable for 20 min."), "{detail}");
+    }
+
+    #[test]
+    fn null_metrics_make_their_rules_unknown_never_good() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let unknowns = details(|body| {
+            for field in [
+                "payouts_succeeded_1h",
+                "payouts_failed_1h",
+                "failure_reasons_1h",
+                "settled_unpaid_orders",
+            ] {
+                body["payouts"][field] = serde_json::Value::Null;
+            }
+            body["lnd"]["pending_htlcs"] = serde_json::Value::Null;
+            body["lnd"]["nearest_htlc_expiry_blocks"] = serde_json::Value::Null;
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&unknowns));
+
+        for rule in [
+            RuleId::NoPayoutSuccess,
+            RuleId::PayoutFailureRate,
+            RuleId::SettledUnpaid,
+            RuleId::HtlcExpiry,
+        ] {
+            assert_eq!(reading(&s, rule), Reading::Unknown, "{rule:?}");
+        }
     }
 
     #[test]

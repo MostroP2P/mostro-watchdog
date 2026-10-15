@@ -63,9 +63,10 @@ pub struct PayoutDetails {
     pub window_secs: Option<u64>,
     pub payouts_succeeded_1h: Option<u64>,
     pub payouts_failed_1h: Option<u64>,
-    /// Failed attempts by reason. A reason this version doesn't know (from
-    /// a newer LND or daemon) is kept as is; it never fails the payload.
-    pub failure_reasons_1h: BTreeMap<String, u64>,
+    /// Failed attempts by reason; `None` when unknown. A reason this
+    /// version doesn't know (from a newer LND or daemon) is kept as is; it
+    /// never fails the payload.
+    pub failure_reasons_1h: Option<BTreeMap<String, u64>>,
     pub last_payout_success_at: Option<u64>,
     pub settled_unpaid_orders: Option<u64>,
     pub oldest_settled_unpaid_order_age_secs: Option<u64>,
@@ -345,7 +346,7 @@ pub(crate) mod tests {
             panic!("expected details");
         };
 
-        let reasons = details.payouts.unwrap().failure_reasons_1h;
+        let reasons = details.payouts.unwrap().failure_reasons_1h.unwrap();
         assert_eq!(reasons.get("no_route"), Some(&2));
         assert_eq!(reasons.get("quantum_decoherence"), Some(&1));
     }
@@ -422,6 +423,40 @@ pub(crate) mod tests {
                 "{field}"
             );
         }
+    }
+
+    #[test]
+    fn null_payout_and_dev_fee_metrics_read_as_unknown_not_zero() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        let mut body = payload();
+        for field in [
+            "payouts_succeeded_1h",
+            "payouts_failed_1h",
+            "failure_reasons_1h",
+            "settled_unpaid_orders",
+            "awaiting_buyer_invoice_orders",
+        ] {
+            body["payouts"][field] = serde_json::Value::Null;
+        }
+        body["dev_fee"] = serde_json::json!({"pending": null, "failed_1h": null});
+        let event = encrypted_event(
+            &mostro,
+            &watchdog.public_key(),
+            &body.to_string(),
+            1,
+            |_| {},
+        );
+
+        let Content::Details(details) = read(&report(&event, &mostro), Some(&watchdog)) else {
+            panic!("expected details");
+        };
+
+        let payouts = details.payouts.unwrap();
+        assert_eq!(payouts.payouts_failed_1h, None);
+        assert_eq!(payouts.failure_reasons_1h, None);
+        assert_eq!(payouts.settled_unpaid_orders, None);
+        assert_eq!(details.dev_fee.unwrap().pending, None);
     }
 
     #[test]
