@@ -769,3 +769,58 @@ async fn an_older_recovery_is_told_before_the_same_rule_opening_again() {
         .expect("the new alert");
     assert!(resolved < opened, "{}", sends[0]);
 }
+
+#[tokio::test]
+async fn an_alert_is_told_only_once_its_incident_is_stored() {
+    let mut h = Harness::new(config()).await;
+    sqlx::query(
+        "CREATE TRIGGER no_open BEFORE INSERT ON health_incidents \
+         BEGIN SELECT RAISE(ABORT, 'disk full'); END",
+    )
+    .execute(h.store.pool())
+    .await
+    .unwrap();
+
+    minutes(&mut h, NOW, 5, true, 1).await;
+    assert!(h.sends().is_empty(), "not told while it can't be stored");
+
+    sqlx::query("DROP TRIGGER no_open")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    minutes(&mut h, NOW + 300, 3, true, 100).await;
+    let sends = h.sends();
+    assert_eq!(sends.len(), 1, "{sends:#?}");
+    // Each rule once, though the tracker repeated the undelivered alert.
+    assert_eq!(
+        sends[0].matches("*LND not synced to chain*").count(),
+        1,
+        "{}",
+        sends[0]
+    );
+    assert_eq!(h.store.open_incidents().await.unwrap().len(), 3);
+}
+
+#[test]
+fn startup_notes_only_speak_of_what_is_on() {
+    let keys = WatchdogKeys {
+        sign: Some(Keys::generate()),
+        decrypt: None,
+    };
+
+    // Phase 0 alone: no heartbeat, no decryption, nothing to say.
+    assert!(key_notes(&MonitorConfig::default(), &keys).is_empty());
+
+    let notes = key_notes(&config(), &keys);
+    assert_eq!(notes.len(), 2);
+    assert!(notes[0].1.starts_with("Heartbeat signed by"));
+    assert!(notes[1].0, "no decrypt key is a warning");
+
+    let no_heartbeat = MonitorConfig {
+        publish_heartbeat: false,
+        ..config()
+    };
+    let notes = key_notes(&no_heartbeat, &keys);
+    assert_eq!(notes.len(), 1);
+    assert!(!notes[0].1.contains("Heartbeat"));
+}

@@ -153,7 +153,7 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
     {
         return Content::Unreadable;
     }
-    if !agrees_with_tags(&details, report) {
+    if !agrees_with_tags(&details, report) || !possible_in_time(&details, report) {
         return Content::Inconsistent;
     }
     Content::Details(Box::new(details))
@@ -162,6 +162,32 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
 /// Whether the payload says the same as the public tags where they
 /// overlap. They are produced together; a mismatch is a publisher bug,
 /// and the tags win.
+/// Whether every moment the payload names happened by the time the event
+/// was signed, and an outage ended no earlier than it began. A payload
+/// that dates things after its own event is not believed at all.
+fn possible_in_time(details: &HealthDetails, report: &HealthReport) -> bool {
+    let created_at = report.envelope.created_at;
+    let lnd = details.lnd.as_ref();
+    let relays = details.relays.as_ref();
+    let moments = [
+        details.generated_at,
+        lnd.and_then(|l| l.unsynced_since),
+        lnd.and_then(|l| l.best_header_timestamp),
+        details
+            .payouts
+            .as_ref()
+            .and_then(|p| p.last_payout_success_at),
+        relays.and_then(|r| r.last_outage_started_at),
+        relays.and_then(|r| r.last_outage_ended_at),
+    ];
+    let in_the_past = moments.into_iter().flatten().all(|at| at <= created_at);
+    let outage_ordered = match relays.map(|r| (r.last_outage_started_at, r.last_outage_ended_at)) {
+        Some((Some(start), Some(end))) => start <= end,
+        _ => true,
+    };
+    in_the_past && outage_ordered
+}
+
 fn agrees_with_tags(details: &HealthDetails, report: &HealthReport) -> bool {
     let maintenance_agrees = details
         .maintenance
@@ -457,6 +483,51 @@ pub(crate) mod tests {
         assert_eq!(payouts.failure_reasons_1h, None);
         assert_eq!(payouts.settled_unpaid_orders, None);
         assert_eq!(details.dev_fee.unwrap().pending, None);
+    }
+
+    #[test]
+    fn a_payload_dating_things_after_its_event_is_not_believed() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        let cases: [(&str, &str); 5] = [
+            ("lnd", "unsynced_since"),
+            ("lnd", "best_header_timestamp"),
+            ("payouts", "last_payout_success_at"),
+            ("relays", "last_outage_started_at"),
+            ("relays", "last_outage_ended_at"),
+        ];
+        for (object, field) in cases {
+            let mut body = payload();
+            body[object][field] = (NOW + 3600).into();
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |_| {},
+            );
+
+            assert_eq!(
+                read(&report(&event, &mostro), Some(&watchdog)),
+                Content::Inconsistent,
+                "{object}.{field}"
+            );
+        }
+        // An outage that ended before it began.
+        let mut body = payload();
+        body["relays"]["last_outage_started_at"] = (NOW - 60).into();
+        body["relays"]["last_outage_ended_at"] = (NOW - 600).into();
+        let event = encrypted_event(
+            &mostro,
+            &watchdog.public_key(),
+            &body.to_string(),
+            1,
+            |_| {},
+        );
+        assert_eq!(
+            read(&report(&event, &mostro), Some(&watchdog)),
+            Content::Inconsistent
+        );
     }
 
     #[test]

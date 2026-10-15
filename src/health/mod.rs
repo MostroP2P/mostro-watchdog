@@ -251,10 +251,7 @@ impl<M: Messenger> Monitor<M> {
     /// Takes in what the relays returned.
     pub async fn ingest(&mut self, events: &[Event], now: u64) {
         if let Some(info) = newest_info(events, self.mostro, now) {
-            if self
-                .info
-                .is_none_or(|known| info.created_at > known.created_at)
-            {
+            if self.info.is_none_or(|known| info.rank() > known.rank()) {
                 self.info = Some(info);
             }
         }
@@ -436,19 +433,42 @@ impl<M: Messenger> Monitor<M> {
         for (subject, rule, reading) in readings {
             let (notice, change) = self.tracker.observe(subject, rule, reading, now, policy);
             match (change, notice) {
-                // A recovery is told only once it is stored: told and then
-                // lost, a restart would bring the incident back.
-                (Some(change @ Change::Resolve { .. }), notice) => {
-                    notices.extend(self.persist(change, notice).await);
-                }
+                // An alert or a recovery is told only once its state change
+                // is stored: told and then lost, a restart would repeat the
+                // alert or bring the incident back.
                 (Some(change), notice) => {
-                    notices.extend(self.persist(change, None).await);
-                    notices.extend(notice);
+                    notices.extend(self.persist(change, notice).await);
                 }
                 (None, notice) => notices.extend(notice),
             }
         }
+        // An alert the tracker repeats because it was never delivered waits
+        // for its stored incident like the first one, and goes out once.
+        let mut seen = std::collections::HashSet::new();
+        notices.retain(|notice| {
+            let incident = notice.incident();
+            let key = (incident.subject.clone(), incident.rule);
+            match notice {
+                Notice::Opened(_) => !self.is_pending(&key) && seen.insert(key),
+                _ => true,
+            }
+        });
         self.deliver(notices, now).await;
+    }
+
+    /// Whether a write for this incident is still waiting in the queue.
+    fn is_pending(&self, (subject, rule): &(Subject, rules::RuleId)) -> bool {
+        self.pending_writes.iter().any(|(change, _)| match change {
+            Change::Upsert(incident) | Change::Resolve { incident, .. } => {
+                incident.subject == *subject && incident.rule == *rule
+            }
+            Change::Delete(s, r)
+            | Change::Delivered {
+                subject: s,
+                rule: r,
+                ..
+            } => s == subject && r == rule,
+        })
     }
 
     /// Queues `change` behind any earlier write that failed and writes the
@@ -664,24 +684,16 @@ pub fn launch(
         decrypt: decrypt.or_else(|| sign.clone()),
         sign,
     };
-    match &keys.sign {
-        Some(sign) => info!(
-            "🩺 Mostro health monitoring on. Heartbeat signed by {} (hex)",
-            sign.public_key().to_hex()
-        ),
-        None => warn!(
-            "🩺 Mostro health monitoring on without a watchdog key ({} unset): no \
-             heartbeat is published",
-            config.private_key_env
-        ),
-    }
-    match &keys.decrypt {
-        Some(decrypt) => info!(
-            "Health details are read when mostrod encrypts them to {} (hex); set it as \
-             the health recipient in mostrod",
-            decrypt.public_key().to_hex()
-        ),
-        None => warn!("No key to decrypt the health details: only the public tags are read"),
+    info!(
+        "🩺 Mostro health monitoring on: {}",
+        summary(config, keys.sign.is_some())
+    );
+    for (warning, note) in key_notes(config, &keys) {
+        if warning {
+            warn!("{note}");
+        } else {
+            info!("{note}");
+        }
     }
     let http = reqwest::Client::builder()
         .user_agent(format!("mostro-watchdog/{}", crate::version::VERSION))
@@ -698,6 +710,45 @@ pub fn launch(
         http,
     }));
     Ok(summary)
+}
+
+/// What to log about the keys at startup, as `(is_warning, text)`. Only
+/// about what is on: the heartbeat once it is enabled, decryption once the
+/// health event is read.
+fn key_notes(config: &MonitorConfig, keys: &WatchdogKeys) -> Vec<(bool, String)> {
+    let mut notes = Vec::new();
+    if config.heartbeat_enabled() {
+        notes.push(match &keys.sign {
+            Some(sign) => (
+                false,
+                format!("Heartbeat signed by {} (hex)", sign.public_key().to_hex()),
+            ),
+            None => (
+                true,
+                format!(
+                    "No watchdog key ({} unset): no heartbeat is published",
+                    config.private_key_env
+                ),
+            ),
+        });
+    }
+    if config.mostro_health_enabled {
+        notes.push(match &keys.decrypt {
+            Some(decrypt) => (
+                false,
+                format!(
+                    "Health details are read when mostrod encrypts them to {} (hex); set \
+                     it as the health recipient in mostrod",
+                    decrypt.public_key().to_hex()
+                ),
+            ),
+            None => (
+                true,
+                "No key to decrypt the health details: only the public tags are read".into(),
+            ),
+        });
+    }
+    notes
 }
 
 /// What is watched, for the startup message.

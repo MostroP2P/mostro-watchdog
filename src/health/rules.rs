@@ -695,8 +695,11 @@ fn htlc_expiry(s: &Snapshot, min_blocks: i64) -> Reading {
 /// one, so a mint going from warn to fail is not "resolved" in between.
 /// Lightning instances don't emit the check: no reading.
 fn cashu_mint(s: &Snapshot, bad: CheckState) -> Reading {
+    // Only a Cashu instance has a mint; the check on a Lightning one is a
+    // publisher bug and no reading.
     let Some(check) = s
         .fresh_health()
+        .filter(|h| h.escrow_mode == EscrowMode::Cashu)
         .and_then(|h| h.check(super::event::CheckName::CashuMint))
     else {
         return Reading::Unknown;
@@ -815,10 +818,7 @@ mod tests {
             started_at: NOW - 3600,
             mostro: mostro.public_key(),
             relays_reachable: Some(true),
-            info: Some(InfoSnapshot {
-                created_at: NOW - 60,
-                maintenance_mode: false,
-            }),
+            info: Some(InfoSnapshot::at(NOW - 60, false)),
             health,
             details,
             reference: Some(Reference {
@@ -1132,10 +1132,22 @@ mod tests {
             Reading::Good { .. }
         ));
 
-        // A Lightning instance has no such check: no reading at all.
+        // A Lightning instance has no such check: no reading at all, even
+        // when it (wrongly) reports one.
         let lightning = report_with(&mostro, |_| {});
         let s = snapshot(&mostro, Some(&lightning), None);
         assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
+        let wrong = report_with(&mostro, |tags| {
+            tags.push(vec![
+                "check".into(),
+                "cashu_mint".into(),
+                "fail".into(),
+                "1791900000".into(),
+            ]);
+        });
+        let s = snapshot(&mostro, Some(&wrong), None);
+        assert_eq!(reading(&s, RuleId::CashuMintFail), Reading::Unknown);
+        assert_eq!(reading(&s, RuleId::CashuMintWarn), Reading::Unknown);
     }
 
     #[test]
@@ -1278,10 +1290,7 @@ mod tests {
         ));
 
         let mut s = snapshot(&mostro, None, None);
-        s.info = Some(InfoSnapshot {
-            created_at: NOW - 60,
-            maintenance_mode: true,
-        });
+        s.info = Some(InfoSnapshot::at(NOW - 60, true));
         assert!(is_bad(&reading(&s, RuleId::Maintenance)));
     }
 
@@ -1295,20 +1304,14 @@ mod tests {
         let mut s = snapshot(&mostro, Some(&on), None);
 
         // mostrod ended maintenance and republished its info event first.
-        s.info = Some(InfoSnapshot {
-            created_at: NOW + 5,
-            maintenance_mode: false,
-        });
+        s.info = Some(InfoSnapshot::at(NOW + 5, false));
         assert!(matches!(
             reading(&s, RuleId::Maintenance),
             Reading::Good { .. }
         ));
 
         // An older info event doesn't override the fresh health event.
-        s.info = Some(InfoSnapshot {
-            created_at: NOW - 5,
-            maintenance_mode: false,
-        });
+        s.info = Some(InfoSnapshot::at(NOW - 5, false));
         assert!(is_bad(&reading(&s, RuleId::Maintenance)));
     }
 
@@ -1319,18 +1322,12 @@ mod tests {
         let mut s = snapshot(&mostro, Some(&report), None);
         // The health event went stale; the last info event predates it.
         s.now = NOW + 600;
-        s.info = Some(InfoSnapshot {
-            created_at: NOW - 60,
-            maintenance_mode: false,
-        });
+        s.info = Some(InfoSnapshot::at(NOW - 60, false));
 
         assert_eq!(reading(&s, RuleId::Maintenance), Reading::Unknown);
 
         // A newer info event does tell.
-        s.info = Some(InfoSnapshot {
-            created_at: NOW + 300,
-            maintenance_mode: false,
-        });
+        s.info = Some(InfoSnapshot::at(NOW + 300, false));
         assert!(matches!(
             reading(&s, RuleId::Maintenance),
             Reading::Good { .. }
@@ -1356,10 +1353,7 @@ mod tests {
     fn phase_zero_works_without_the_health_event() {
         let mostro = Keys::generate();
         let mut s = snapshot(&mostro, None, None);
-        s.info = Some(InfoSnapshot {
-            created_at: NOW - 901,
-            maintenance_mode: false,
-        });
+        s.info = Some(InfoSnapshot::at(NOW - 901, false));
         let config = MonitorConfig {
             info_silence_threshold: 900,
             ..MonitorConfig::default()

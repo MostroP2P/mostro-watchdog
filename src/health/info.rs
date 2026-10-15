@@ -12,9 +12,28 @@ use super::event::MAX_FUTURE_SKEW_SECS;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct InfoSnapshot {
     pub created_at: u64,
+    /// Breaks ties on `created_at`: NIP-01 keeps the lowest id.
+    pub id: EventId,
     /// `maintenance_mode = "true"`. Daemons that predate the tag omit it,
     /// which reads as `false`.
     pub maintenance_mode: bool,
+}
+
+impl InfoSnapshot {
+    /// NIP-01 order of addressable events: newer first, then the lowest id
+    /// (as `serbero::discovery::rank`).
+    pub fn rank(&self) -> (u64, std::cmp::Reverse<EventId>) {
+        (self.created_at, std::cmp::Reverse(self.id))
+    }
+
+    #[cfg(test)]
+    pub fn at(created_at: u64, maintenance_mode: bool) -> Self {
+        Self {
+            created_at,
+            id: EventId::from_byte_array([0; 32]),
+            maintenance_mode,
+        }
+    }
 }
 
 /// Reads a verified info event from `mostro`; `None` for anything else.
@@ -35,6 +54,7 @@ pub fn parse_info(event: &Event, mostro: PublicKey, now: u64) -> Option<InfoSnap
     });
     Some(InfoSnapshot {
         created_at: event.created_at.as_secs(),
+        id: event.id,
         maintenance_mode,
     })
 }
@@ -48,7 +68,7 @@ pub fn newest_info<'a>(
     events
         .into_iter()
         .filter_map(|event| parse_info(event, mostro, now))
-        .max_by_key(|info| info.created_at)
+        .max_by_key(InfoSnapshot::rank)
 }
 
 #[cfg(test)]
@@ -77,6 +97,20 @@ mod tests {
 
         assert_eq!(info.created_at, NOW - 60);
         assert!(info.maintenance_mode);
+    }
+
+    #[test]
+    fn equal_timestamps_are_settled_by_the_lowest_id() {
+        let mostro = Keys::generate();
+        let d = mostro.public_key().to_hex();
+        let on = info_event(&mostro, &d, NOW, &[&["maintenance_mode", "true"]]);
+        let off = info_event(&mostro, &d, NOW, &[&["maintenance_mode", "false"]]);
+        let lowest = if on.id < off.id { &on } else { &off };
+
+        for order in [[&on, &off], [&off, &on]] {
+            let info = newest_info(order, mostro.public_key(), NOW).unwrap();
+            assert_eq!(info.id, lowest.id);
+        }
     }
 
     #[test]
