@@ -67,11 +67,23 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
+/// The watchdog's keys for health monitoring.
+#[derive(Clone, Default)]
+pub struct WatchdogKeys {
+    /// Signs the heartbeat. Each watchdog must have its own: heartbeats
+    /// from one key share one addressable coordinate, so a live watchdog
+    /// would mask a dead one.
+    pub sign: Option<Keys>,
+    /// Decrypts the health event's details. Watchdogs may share it, since
+    /// the details are encrypted to one recipient. Defaults to `sign`.
+    pub decrypt: Option<Keys>,
+}
+
 /// The state of health monitoring between two rounds.
 pub struct Monitor<M> {
     config: MonitorConfig,
     mostro: PublicKey,
-    keys: Option<Keys>,
+    keys: WatchdogKeys,
     peers: Vec<PublicKey>,
     /// Instances trusted for the block-height median, never Mostro itself.
     trusted_peers: Vec<PublicKey>,
@@ -106,7 +118,7 @@ impl<M: Messenger> Monitor<M> {
     pub async fn new(
         config: MonitorConfig,
         mostro: PublicKey,
-        keys: Option<Keys>,
+        keys: WatchdogKeys,
         chat_id: i64,
         started_at: u64,
         messenger: M,
@@ -196,7 +208,7 @@ impl<M: Messenger> Monitor<M> {
         if !self.config.publish_heartbeat {
             return None;
         }
-        let keys = self.keys.as_ref()?;
+        let keys = self.keys.sign.as_ref()?;
         let next = heartbeat::next(self.last_heartbeat, now_ms);
         if heartbeat::too_far_ahead(next, now_ms / 1000) {
             error!(
@@ -279,7 +291,7 @@ impl<M: Messenger> Monitor<M> {
             return;
         }
         self.accept(&report.envelope).await;
-        let content = content::read(&report, self.keys.as_ref());
+        let content = content::read(&report, self.keys.decrypt.as_ref());
         self.log_content(&content);
         self.details = match content {
             Content::Details(details) => Some(*details),
@@ -490,7 +502,7 @@ struct Wiring {
     chat_id: i64,
     config: MonitorConfig,
     mostro: PublicKey,
-    keys: Option<Keys>,
+    keys: WatchdogKeys,
     pool: sqlx::SqlitePool,
     http: reqwest::Client,
 }
@@ -510,24 +522,36 @@ pub fn launch(
         info!("Mostro health monitoring off");
         return Ok("disabled".into());
     }
-    let keys =
-        crate::config::read_optional_key(&config.private_key_env, |name| std::env::var(name).ok())?;
-    match &keys {
-        Some(keys) => info!(
-            "🩺 Mostro health monitoring on. Watchdog pubkey (hex): {}; set it as the \
-             health recipient in mostrod to receive the encrypted details",
-            keys.public_key().to_hex()
+    let env = |name: &str| std::env::var(name).ok();
+    let sign = crate::config::read_optional_key(&config.private_key_env, env)?;
+    let decrypt = crate::config::read_optional_key(&config.decrypt_key_env, env)?;
+    let keys = WatchdogKeys {
+        decrypt: decrypt.or_else(|| sign.clone()),
+        sign,
+    };
+    match &keys.sign {
+        Some(sign) => info!(
+            "🩺 Mostro health monitoring on. Heartbeat signed by {} (hex)",
+            sign.public_key().to_hex()
         ),
         None => warn!(
-            "🩺 Mostro health monitoring on without a watchdog key ({} unset): only the \
-             public tags are read and no heartbeat is published",
+            "🩺 Mostro health monitoring on without a watchdog key ({} unset): no \
+             heartbeat is published",
             config.private_key_env
         ),
+    }
+    match &keys.decrypt {
+        Some(decrypt) => info!(
+            "Health details are read when mostrod encrypts them to {} (hex); set it as \
+             the health recipient in mostrod",
+            decrypt.public_key().to_hex()
+        ),
+        None => warn!("No key to decrypt the health details: only the public tags are read"),
     }
     let http = reqwest::Client::builder()
         .user_agent(format!("mostro-watchdog/{}", crate::version::VERSION))
         .build()?;
-    let summary = summary(config, keys.is_some());
+    let summary = summary(config, keys.sign.is_some());
     tokio::spawn(run(Wiring {
         client: client.clone(),
         bot: bot.clone(),

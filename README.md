@@ -368,7 +368,9 @@ stops running:
   paid nobody for 21 hours, within about half an hour.
 
 The watchdog publishes its own heartbeat, so "relays down" is never mistaken for
-"Mostro silent" and two watchdogs can watch each other. Telegram only gets state
+"Mostro silent" and two watchdogs can watch each other. Two watchdogs must use
+**different** `WATCHDOG_NOSTR_PRIVATE_KEY`s (each signs its own heartbeat) and may
+share `WATCHDOG_HEALTH_DECRYPT_KEY` to both read the encrypted details. Telegram only gets state
 changes: an alert, reminders while a critical one lasts, and a "resolved" message.
 
 ```text
@@ -407,6 +409,7 @@ See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the set
 | `health.trusted_peers` | Mostro instances (npub or hex) whose median block height is also a reference (default: none, explorers only) |
 | `health.publish_heartbeat` | Publish the watchdog's own heartbeat, the relay round-trip probe (default: `true`) |
 | `health.peer_watchdogs` | Other watchdogs (npub or hex) whose heartbeat this one watches (default: none) |
+| `health.decrypt_key_env` | Environment variable with a key that only decrypts the health details, shareable between watchdogs (default: `WATCHDOG_HEALTH_DECRYPT_KEY`, falling back to the signing key when unset) |
 | `health.alerts_chat_id` | Telegram chat for health alerts (default: `telegram.chat_id`) |
 | `health.thresholds.*` | When a reading counts as bad; see [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md#configuration) |
 

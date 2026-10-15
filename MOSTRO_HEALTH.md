@@ -65,8 +65,10 @@ It follows the spec's "What a reader owes":
 
 The public tags carry a coarse state per check, the block height and the network.
 Liquidity, payout counts, failure reasons and HTLC expiry travel encrypted (NIP-44)
-to one key: set the watchdog's pubkey as the health recipient in mostrod. The
-watchdog logs its hex pubkey at startup.
+to one key: set that key's pubkey as the health recipient in mostrod. The watchdog
+decrypts with the key in `WATCHDOG_HEALTH_DECRYPT_KEY` (`decrypt_key_env`), or with
+its own `WATCHDOG_NOSTR_PRIVATE_KEY` when that variable is unset, and logs the pubkey
+to set at startup.
 
 Without a key, or when the details are for another key, can't be decrypted, use an
 unknown version, contradict the public tags or (on a Lightning instance) lack the
@@ -169,8 +171,14 @@ The `watching` tag links the watchdog to the instance in public. Leave it out wi
 
 Run **two watchdogs on different machines**, outside the failure domain of mostrod and
 LND. Give each one the other's pubkey in `peer_watchdogs`: each alerts when the other
-goes silent. Give them the same key if both should read the encrypted details: they
-are addressed to one key.
+goes silent.
+
+- Each watchdog needs **its own** `WATCHDOG_NOSTR_PRIVATE_KEY`: it signs the
+  heartbeat, and heartbeats from one key share one addressable event, so a live
+  watchdog would hide a dead one.
+- To let both read the encrypted details, which mostrod addresses to a single key,
+  give them the **same** `WATCHDOG_HEALTH_DECRYPT_KEY` and set its pubkey as the health
+  recipient in mostrod.
 
 ## Configuration
 
@@ -193,7 +201,8 @@ publish_heartbeat = true
 heartbeat_watching_tag = true
 peer_watchdogs = []              # npub or hex
 # alerts_chat_id = -100123       # defaults to [telegram].chat_id
-# private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+# private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"    # signs the heartbeat; one per watchdog
+# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"   # decrypts the details; may be shared
 
 [health.block_height_sources]
 mainnet = [
@@ -217,8 +226,9 @@ degraded_for_secs = 600
 A `[health.block_height_sources]` table replaces the defaults: list every network
 you need.
 
-The key is the same one Serbero alerts and solver notifications use. It is optional
-here: without it, only the public tags are read and no heartbeat is published.
+`WATCHDOG_NOSTR_PRIVATE_KEY` is the same key Serbero alerts and solver notifications
+use. Both keys are optional here: without a signing key no heartbeat is published,
+and without any key only the public tags are read.
 
 ## Storage
 

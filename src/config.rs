@@ -531,15 +531,18 @@ impl Config {
                 );
             }
             health.monitor.validate()?;
-            check_key_variable(&health.monitor.private_key_env).map_err(
-                |problem| match problem {
-                    KeyProblem::KeyAsVariable => "health.private_key_env must name an \
-                        environment variable, but it holds a Nostr secret key; move the key \
-                        into the environment"
-                        .to_string(),
-                    _ => "health.private_key_env cannot be empty".to_string(),
-                },
-            )?;
+            for (field, variable) in [
+                ("private_key_env", &health.monitor.private_key_env),
+                ("decrypt_key_env", &health.monitor.decrypt_key_env),
+            ] {
+                check_key_variable(variable).map_err(|problem| match problem {
+                    KeyProblem::KeyAsVariable => format!(
+                        "health.{field} must name an environment variable, but it holds a \
+                         Nostr secret key; move the key into the environment"
+                    ),
+                    _ => format!("health.{field} cannot be empty"),
+                })?;
+            }
         }
 
         Ok(config)
@@ -846,6 +849,17 @@ chat_id = -1001
 
         let printed = format!("{err:?}");
         assert!(printed.contains("private_key_env"), "{printed}");
+        assert!(!printed.contains(&secret), "{printed}");
+    }
+
+    #[test]
+    fn a_key_pasted_as_the_decrypt_key_variable_is_rejected_without_echoing_it() {
+        let secret = Keys::generate().secret_key().to_secret_hex();
+
+        let err = load(&format!("\n[health]\ndecrypt_key_env = \"{secret}\"\n")).unwrap_err();
+
+        let printed = format!("{err:?}");
+        assert!(printed.contains("decrypt_key_env"), "{printed}");
         assert!(!printed.contains(&secret), "{printed}");
     }
 

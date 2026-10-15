@@ -108,8 +108,16 @@ pub struct MonitorConfig {
     /// variable is unset, only the public tags are read and no heartbeat is
     /// published.
     pub private_key_env: String,
+    /// Environment variable with a key that only decrypts the health
+    /// event's details. Two watchdogs may share it, while each signs its
+    /// heartbeat with its own `private_key_env` key. When the variable is
+    /// unset, the `private_key_env` key decrypts.
+    pub decrypt_key_env: String,
     pub thresholds: Thresholds,
 }
+
+/// Default `decrypt_key_env`.
+pub const DEFAULT_DECRYPT_KEY_ENV: &str = "WATCHDOG_HEALTH_DECRYPT_KEY";
 
 impl Default for MonitorConfig {
     fn default() -> Self {
@@ -127,6 +135,7 @@ impl Default for MonitorConfig {
             peer_watchdogs: Vec::new(),
             alerts_chat_id: None,
             private_key_env: DEFAULT_PRIVATE_KEY_ENV.to_string(),
+            decrypt_key_env: DEFAULT_DECRYPT_KEY_ENV.to_string(),
             thresholds: Thresholds::default(),
         }
     }
@@ -230,6 +239,9 @@ impl MonitorConfig {
         }
         if self.private_key_env.trim().is_empty() {
             return Err("health.private_key_env cannot be empty".into());
+        }
+        if self.decrypt_key_env.trim().is_empty() {
+            return Err("health.decrypt_key_env cannot be empty".into());
         }
         self.trusted_peers()?;
         self.peer_watchdogs().map(|_| ())

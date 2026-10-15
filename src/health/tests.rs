@@ -33,7 +33,10 @@ impl Harness {
         let monitor = Monitor::new(
             config,
             mostro.public_key(),
-            Some(watchdog.clone()),
+            WatchdogKeys {
+                sign: Some(watchdog.clone()),
+                decrypt: Some(watchdog.clone()),
+            },
             CHAT,
             NOW - 3600,
             FakeTelegram::default(),
@@ -55,7 +58,10 @@ impl Harness {
         self.monitor = Monitor::new(
             config,
             self.mostro.public_key(),
-            Some(self.watchdog.clone()),
+            WatchdogKeys {
+                sign: Some(self.watchdog.clone()),
+                decrypt: Some(self.watchdog.clone()),
+            },
             CHAT,
             NOW - 3600,
             FakeTelegram::default(),
@@ -421,4 +427,41 @@ async fn after_a_restart_the_current_event_restores_the_state_at_once() {
     let restored = h.monitor.health.as_ref().expect("state restored");
     assert_eq!(restored.envelope.id, current.id);
     assert!(h.sends().is_empty(), "{:#?}", h.sends());
+}
+
+#[tokio::test]
+async fn a_shared_decrypt_key_reads_the_details_while_the_heartbeat_keeps_its_own_key() {
+    let mut h = Harness::new(config()).await;
+    let shared = Keys::generate();
+    h.monitor.keys = WatchdogKeys {
+        sign: Some(h.watchdog.clone()),
+        decrypt: Some(shared.clone()),
+    };
+    let mut body = payload();
+    body["payouts"]["payouts_succeeded_1h"] = 0.into();
+    body["payouts"]["payouts_failed_1h"] = 9.into();
+
+    for i in 0..3 {
+        let now = NOW + 60 * i;
+        let mut tags = health_tags(&h.mostro, now, 1 + i);
+        set_tag(&mut tags, "p", &[&shared.public_key().to_hex()]);
+        let content = nip44::encrypt(
+            h.mostro.secret_key(),
+            &shared.public_key(),
+            body.to_string(),
+            nip44::Version::V2,
+        )
+        .unwrap();
+        let event = sign(&h.mostro, tags, &content, now);
+        let info = h.info(now);
+        h.round(now, &[info, event], true).await;
+    }
+    let heartbeat = h.monitor.next_heartbeat((NOW + 200) * 1000).await.unwrap();
+
+    assert!(
+        h.monitor.details.is_some(),
+        "details read with the shared key"
+    );
+    assert!(h.sends()[0].contains("*Buyer payouts failing*"));
+    assert_eq!(heartbeat.pubkey, h.watchdog.public_key());
 }

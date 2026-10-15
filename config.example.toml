@@ -170,6 +170,12 @@ http_port = 8080
 # (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
 
+# Environment variable with a key that only decrypts the health details. Two
+# watchdogs must sign their heartbeats with different private_key_env keys but
+# may share this one. When the variable is unset, the private_key_env key
+# decrypts. (default: "WATCHDOG_HEALTH_DECRYPT_KEY")
+# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"
+
 # Explorers asked for the chain tip, per lnd_network. A table here replaces
 # the defaults (mainnet, testnet, testnet4, signet), so list every network you
 # need. Networks without explorers (regtest) skip the cross-check.
@@ -232,6 +238,12 @@ http_port = 8080
 # Use the same one as [serbero] so the watchdog has a single key.
 # (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
+
+# Environment variable with a key that only decrypts the health details. Two
+# watchdogs must sign their heartbeats with different private_key_env keys but
+# may share this one. When the variable is unset, the private_key_env key
+# decrypts. (default: "WATCHDOG_HEALTH_DECRYPT_KEY")
+# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"
 
 # Seconds to wait for the solver's own-message receipt before notifying; also
 # groups a burst of messages into one notification. (default: 20, at most 600)
