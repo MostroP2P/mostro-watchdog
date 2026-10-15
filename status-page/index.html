@@ -149,6 +149,25 @@ const WATCHER_REQUIRED = ['d', 'y', 'z', 'interval', 'seq', 'expiration'];
 const STATUSES = ['ok', 'degraded', 'down'];
 const CHECK_STATES = ['ok', 'warn', 'fail', 'unknown'];
 const KNOWN_CHECKS = ['lnd_sync', 'payouts', 'relays', 'database', 'cashu_mint'];
+/** The `lnd_network` values of the spec; anything else is malformed. */
+const NETWORKS = ['mainnet', 'testnet', 'testnet4', 'signet', 'regtest', 'simnet'];
+
+/**
+ * Explorers per network, in a Map: a network name never reaches an object
+ * prototype (`toString`, `__proto__`). Networks without one (regtest,
+ * simnet) get no comparison.
+ */
+export const EXPLORERS = new Map([
+  ['mainnet', ['https://mempool.space/api/blocks/tip/height', 'https://blockstream.info/api/blocks/tip/height']],
+  ['testnet', ['https://mempool.space/testnet/api/blocks/tip/height', 'https://blockstream.info/testnet/api/blocks/tip/height']],
+  ['testnet4', ['https://mempool.space/testnet4/api/blocks/tip/height']],
+  ['signet', ['https://mempool.space/signet/api/blocks/tip/height']],
+]);
+
+/** The explorers for `network`, or none. */
+export function explorersFor(network) {
+  return EXPLORERS.get(network) || [];
+}
 
 /**
  * A base-10 integer tag value as a number, or null. Values past 2^53 − 1
@@ -263,7 +282,7 @@ export function parseHealthEvent(event, now, verify) {
   const synced = single(tags, 'lnd_synced_to_chain');
   if (synced !== undefined && synced !== 'true' && synced !== 'false') return fail('bad lnd_synced_to_chain');
   const network = single(tags, 'lnd_network');
-  if (network !== undefined && network === '') return fail('bad lnd_network');
+  if (network !== undefined && !NETWORKS.includes(network)) return fail('bad lnd_network');
   const p = single(tags, 'p');
   if (p !== undefined && !isHexKey(p)) return fail('bad p');
   if ((p !== undefined) === (event.content === '')) return fail('p without content or content without p');
@@ -341,15 +360,17 @@ export function superseded(shown, stored) {
 }
 
 /**
- * The `instance` URL parameter: whether it was given, and its valid keys
- * (hex). A parameter given with no valid key is an error, never "every
- * instance". `toHex` turns an npub or hex key into hex, or null.
+ * The `instance` URL parameter: whether it was given (`present`, from
+ * `URLSearchParams.has`), its valid keys (hex) and its invalid entries. A
+ * parameter given with no valid key, empty ones included, is an error,
+ * never "every instance". `toHex` turns an npub or hex key into hex, or
+ * null.
  */
-export function parseInstanceParam(raw, toHex) {
+export function parseInstanceParam(raw, toHex, present = raw !== null && raw !== undefined) {
   const entries = (raw || '').split(',').map((k) => k.trim()).filter(Boolean);
   const keys = [...new Set(entries.map(toHex).filter(Boolean))];
   const invalid = entries.filter((entry) => !toHex(entry));
-  return { given: entries.length > 0, keys, invalid };
+  return { given: present, keys, invalid };
 }
 
 /** `tip` while it is younger than `maxAge` seconds, else null. */
@@ -449,12 +470,6 @@ export function ago(seconds) {
 // END health-lib
 
 const DEFAULT_RELAYS = ['wss://relay.mostro.network', 'wss://nos.lol', 'wss://relay.damus.io'];
-const EXPLORERS = {
-  mainnet: ['https://mempool.space/api/blocks/tip/height', 'https://blockstream.info/api/blocks/tip/height'],
-  testnet: ['https://mempool.space/testnet/api/blocks/tip/height', 'https://blockstream.info/testnet/api/blocks/tip/height'],
-  testnet4: ['https://mempool.space/testnet4/api/blocks/tip/height'],
-  signet: ['https://mempool.space/signet/api/blocks/tip/height'],
-};
 const LAG_BLOCKS = 3;
 const EXPLORER_REFRESH_MS = 60_000;
 
@@ -462,7 +477,7 @@ const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
 const params = new URLSearchParams(location.search);
 const relayParam = parseRelayParam(params.get('relays'), DEFAULT_RELAYS);
 const relayList = relayParam.relays;
-const instanceParam = parseInstanceParam(params.get('instance'), toHex);
+const instanceParam = parseInstanceParam(params.get('instance'), toHex, params.has('instance'));
 const onlyInstances = instanceParam.keys;
 // Asked for specific instances, but none of the keys is valid: show that,
 // and watch nothing rather than every instance.
@@ -560,7 +575,7 @@ function heightLine(report) {
   const base = `${report.blockHeight}${report.network ? ` (${report.network})` : ''}`;
   if (!tip) {
     // A network with explorers whose tip is missing or too old.
-    return report.network && EXPLORERS[report.network] ? `${base} · no reference` : base;
+    return explorersFor(report.network).length ? `${base} · no reference` : base;
   }
   const lag = tip.height - report.blockHeight;
   if (lag >= LAG_BLOCKS) {
@@ -665,8 +680,8 @@ function render() {
 async function refreshTips() {
   const networks = new Set([...instances.values()].map((r) => r.network).filter(Boolean));
   for (const network of networks) {
-    const urls = EXPLORERS[network];
-    if (!urls) continue; // No independent reference (regtest): no comparison.
+    const urls = explorersFor(network);
+    if (!urls.length) continue; // No independent reference (regtest): no comparison.
     const answers = await Promise.all(urls.map(async (url) => {
       try {
         const response = await fetch(url, { signal: AbortSignal.timeout(10_000) });
@@ -745,6 +760,9 @@ if (relayParam.invalid.length) {
   warn(relayParam.usedDefaults
     ? `No valid relay in the "relays" parameter (${list}); using the default relays.`
     : `Ignored invalid relays in the "relays" parameter: ${list}.`);
+}
+if (badInstanceParam && !instanceParam.invalid.length) {
+  warn('The "instance" parameter is empty, so nothing is shown. Give npub or hex keys, or remove the parameter to see every instance.');
 }
 if (instanceParam.invalid.length) {
   // Named, so a typo doesn't silently drop an instance from the page.

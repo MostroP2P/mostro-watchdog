@@ -13,7 +13,7 @@ const html = readFileSync(new URL('./index.html', import.meta.url), 'utf8');
 const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END health-lib'));
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
-  KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam,
+  KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -333,4 +333,28 @@ test('relay URLs need a ws or wss scheme and a host, and bad ones are named', ()
   );
   assert.deepEqual(parseRelayParam('wss://', defaults), { relays: defaults, invalid: ['wss://'], usedDefaults: true });
   assert.deepEqual(parseRelayParam('ws://localhost:10547', defaults).relays, ['ws://localhost:10547/']);
+});
+
+test('a network name never reaches an object prototype', () => {
+  for (const name of ['toString', 'constructor', '__proto__', 'hasOwnProperty']) {
+    assert.deepEqual(explorersFor(name), [], name);
+    assert.equal(parseHealthEvent(instance({ lnd_network: [name] }), NOW, yes).reason, 'bad lnd_network', name);
+  }
+  assert.equal(explorersFor('mainnet').length, 2);
+  assert.deepEqual(explorersFor('regtest'), []);
+  assert.equal(parseHealthEvent(instance({ lnd_network: ['regtest'] }), NOW, yes).valid, true);
+});
+
+test('an empty instance parameter is an error, not every instance', () => {
+  const toHex = (k) => (/^[0-9a-f]{64}$/.test(k) ? k : null);
+  const params = (query) => new URLSearchParams(query);
+
+  for (const query of ['instance=', 'instance=,,,', 'instance= , ']) {
+    const p = params(query);
+    const parsed = parseInstanceParam(p.get('instance'), toHex, p.has('instance'));
+    assert.equal(parsed.given, true, query);
+    assert.deepEqual(parsed.keys, [], query);
+  }
+  const none = params('relays=wss://x.org');
+  assert.equal(parseInstanceParam(none.get('instance'), toHex, none.has('instance')).given, false);
 });
