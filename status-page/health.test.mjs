@@ -512,7 +512,7 @@ test('an instance reporting ok while behind the chain stops being ok after the w
 });
 
 test('discovered relays on loopback, link-local or private networks are not opened', () => {
-  for (const host of ['localhost', 'foo.localhost', '127.0.0.1', '10.1.2.3', '172.16.0.9', '172.31.255.1', '192.168.1.1', '169.254.1.1', '0.0.0.0', '[::1]', '[::]', '[fd00::1]', '[fe80::1]', '[::ffff:10.0.0.1]']) {
+  for (const host of ['localhost', 'localhost.', 'foo.localhost.', 'foo.localhost', '127.0.0.1', '10.1.2.3', '172.16.0.9', '172.31.255.1', '192.168.1.1', '169.254.1.1', '0.0.0.0', '[::1]', '[::]', '[fd00::1]', '[fe80::1]', '[::ffff:10.0.0.1]']) {
     assert.equal(isLocalOrPrivateHost(host), true, host);
   }
   for (const host of ['relay.mostro.network', '172.32.0.1', '8.8.8.8', '[2001:db8::1]', '11.0.0.1']) {

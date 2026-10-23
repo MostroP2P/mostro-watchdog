@@ -557,7 +557,9 @@ export function retryDelay(attempt) {
  * private addresses are not caught.
  */
 export function isLocalOrPrivateHost(hostname) {
-  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  // A trailing dot survives URL parsing (`localhost.`) and still resolves
+  // to loopback in browsers.
+  const host = hostname.replace(/^\[|\]$/g, '').replace(/\.$/, '').toLowerCase();
   if (host === 'localhost' || host.endsWith('.localhost')) return true;
   if (host.includes(':')) {
     return host === '::' || host === '::1' || host.startsWith('::ffff:')
