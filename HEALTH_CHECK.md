@@ -4,6 +4,10 @@ This document describes the health monitoring and heartbeat functionality implem
 
 ## Overview
 
+This page is about the watchdog's **own** process: its uptime, its relays and its
+HTTP endpoint. Alerts about the **Mostro instance** (its info event, its health
+event, LND, payouts) are described in [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md).
+
 mostro-watchdog includes comprehensive health monitoring to ensure the system is running properly and connected to all necessary services. This provides administrators with proactive alerts about system status.
 
 ## Features

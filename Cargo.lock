@@ -1669,6 +1669,7 @@ dependencies = [
  "mostro-core",
  "nostr-sdk",
  "openssl",
+ "reqwest",
  "serde",
  "serde_json",
  "sqlx",
