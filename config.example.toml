@@ -242,12 +242,6 @@ http_port = 8080
 # (default: "WATCHDOG_NOSTR_PRIVATE_KEY")
 # private_key_env = "WATCHDOG_NOSTR_PRIVATE_KEY"
 
-# Environment variable with a key that only decrypts the health details. Two
-# watchdogs must sign their heartbeats with different private_key_env keys but
-# may share this one. When the variable is unset, the private_key_env key
-# decrypts. (default: "WATCHDOG_HEALTH_DECRYPT_KEY")
-# decrypt_key_env = "WATCHDOG_HEALTH_DECRYPT_KEY"
-
 # Seconds to wait for the solver's own-message receipt before notifying; also
 # groups a burst of messages into one notification. (default: 20, at most 600)
 # grace_period = 20
