@@ -422,7 +422,7 @@ For a public view of the same events, without Telegram, see the static
 - [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
 - [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
 - [x] **Mostro health monitoring** ✅ *Alert when Mostro stops working, not only when it stops running*
-- [x] **Static status page** ✅ *Live health of every Mostro instance, no backend ([status-page/](status-page/))*
+- [x] **Static status page** ✅ *Live health of the Mostro instances it finds, no backend ([status-page/](status-page/))*
 - [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
 

@@ -185,7 +185,8 @@ goes silent.
 ## Status page
 
 [`status-page/`](status-page/) is a static page, with no backend and no key, that reads
-the same events from relays and shows every instance as ok, degraded, down or
+the same events from relays and shows the instances it finds there (or the ones asked
+for in the URL) as ok, degraded, down or
 unknown, with its block height next to an explorer's, and the watchers' heartbeats.
 
 ## Configuration

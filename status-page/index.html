@@ -523,9 +523,35 @@ export function relaysFromNip65(event, known) {
     if (!Array.isArray(tag) || tag[0] !== 'r') continue;
     if (tag[2] !== undefined && tag[2] !== 'write') continue;
     const href = relayHref(tag[1]);
-    if (href && !known.includes(href) && !relays.includes(href)) relays.push(href);
+    if (!href || isLocalOrPrivateHost(new URL(href).hostname)) continue;
+    if (!known.includes(href) && !relays.includes(href)) relays.push(href);
   }
   return relays;
+}
+
+/** How many relays discovered from NIP-65 lists the page opens at most. */
+export const MAX_DISCOVERED_RELAYS = 8;
+
+/**
+ * Whether `hostname` (as `URL.hostname` gives it, IPv6 in brackets) is
+ * localhost, loopback, unspecified, link-local or a private network. A
+ * relay list is the publisher's; it must not make a visitor's browser open
+ * connections inside the visitor's own network. The `relays` parameter is
+ * the visitor's choice and is not filtered. Public names that resolve to
+ * private addresses are not caught.
+ */
+export function isLocalOrPrivateHost(hostname) {
+  const host = hostname.replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host.endsWith('.localhost')) return true;
+  if (host.includes(':')) {
+    return host === '::' || host === '::1' || host.startsWith('::ffff:')
+      || /^f[cd]/.test(host) || host.startsWith('fe80');
+  }
+  const octets = host.split('.').map(Number);
+  if (octets.length !== 4 || octets.some((n) => !Number.isInteger(n))) return false;
+  const [a, b] = octets;
+  return a === 0 || a === 10 || a === 127 || (a === 169 && b === 254)
+    || (a === 172 && b >= 16 && b <= 31) || (a === 192 && b === 168);
 }
 
 /** Being this many blocks behind the explorers' tip is a lag. */
@@ -578,6 +604,13 @@ export function ago(seconds) {
 const DEFAULT_RELAYS = ['wss://relay.mostro.network', 'wss://nos.lol', 'wss://relay.damus.io'];
 const EXPLORER_REFRESH_MS = 60_000;
 
+if (!window.NostrTools) {
+  // The CDN request or its integrity check failed: say so, instead of
+  // waiting for events forever and looking like a healthy page with no data.
+  document.getElementById('instances-empty').textContent =
+    'Could not load the Nostr library from the CDN, so no health event can be read. Reload the page or check the network.';
+  throw new Error('nostr-tools failed to load');
+}
 const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
 const params = new URLSearchParams(location.search);
 const relayParam = parseRelayParam(params.get('relays'), DEFAULT_RELAYS);
@@ -771,9 +804,16 @@ function render() {
   const counts = { ok: 0, degraded: 0, down: 0, unknown: 0 };
   for (const r of list) counts[shownState(r, t, lagging)] += 1;
   counts.unknown += missing.length;
-  document.getElementById('summary').replaceChildren(
-    ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
-  );
+  // The summary is a live region: rebuilt only when it changes, or some
+  // screen readers would announce it every second.
+  const summary = document.getElementById('summary');
+  const summaryText = Object.entries(counts).map(([state, n]) => `${n} ${state}`).join(' · ');
+  if (summary.dataset.text !== summaryText) {
+    summary.dataset.text = summaryText;
+    summary.replaceChildren(
+      ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
+    );
+  }
 
   const section = document.getElementById('watchers-section');
   section.hidden = !showWatchers;
@@ -891,7 +931,9 @@ window.addEventListener('storage', (event) => {
  * they publish to, from their NIP-65 lists (kind 10002) as served by the
  * bootstrap relays, so an instance that publishes only to its own relays
  * is not shown as unknown. The bootstrap relays stay subscribed as the
- * fallback. Discovery itself searches the bootstrap relays only.
+ * fallback. Discovery itself searches the bootstrap relays only. At most
+ * MAX_DISCOVERED_RELAYS are opened, and none inside the visitor's own
+ * network (`isLocalOrPrivateHost`).
  */
 async function followRelayLists(pool, filter) {
   try {
@@ -909,6 +951,10 @@ async function followRelayLists(pool, filter) {
     const discovered = [];
     for (const event of newest.values()) {
       discovered.push(...relaysFromNip65(event, [...relayList, ...discovered]));
+    }
+    if (discovered.length > MAX_DISCOVERED_RELAYS) {
+      console.warn(`The instances' relay lists name ${discovered.length} new relays; only the first ${MAX_DISCOVERED_RELAYS} are opened`);
+      discovered.length = MAX_DISCOVERED_RELAYS;
     }
     if (!discovered.length) return;
     pool.subscribeMany(discovered, filter, { onevent: onEvent });

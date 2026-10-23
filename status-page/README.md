@@ -70,7 +70,7 @@ All options are URL query parameters:
 | Parameter | Example | Effect |
 |---|---|---|
 | `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from, and to discover instances and their relay lists on (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`). Without `instance`, only these relays are searched. Entries that aren't `ws:`/`wss:` URLs with a host are named in a warning and skipped; with none valid, the defaults are used |
-| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Their NIP-65 relay lists (kind 10002) are read from the `relays` relays, and their health events are also read from the relays those lists say they write to. Invalid keys are named in a warning; if none is valid, nothing is shown |
+| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Their NIP-65 relay lists (kind 10002) are read from the `relays` relays, and their health events are also read from the relays those lists say they write to (at most 8, and never one on localhost or a private network: a list is the publisher's, and must not open connections inside the visitor's network). Invalid keys are named in a warning; if none is valid, nothing is shown |
 | `watchers` | `?watchers=0` | Hide the watchers |
 
 ## Development

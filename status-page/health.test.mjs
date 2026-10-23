@@ -15,7 +15,7 @@ const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
   syncAccepted, withLock, parseTip, MAX_PLAUSIBLE_HEIGHT, relaysFromNip65, trackLag, shownState,
-  LAG_BLOCKS, LAG_FOR_SECS,
+  LAG_BLOCKS, LAG_FOR_SECS, isLocalOrPrivateHost, MAX_DISCOVERED_RELAYS,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -509,4 +509,18 @@ test('an instance reporting ok while behind the chain stops being ok after the w
   // Without a tracked lag it is the reported state.
   assert.equal(shownState(at(NOW + LAG_FOR_SECS), NOW + LAG_FOR_SECS, {}), 'ok');
   assert.equal(LAG_FOR_SECS, 900);
+});
+
+test('discovered relays on loopback, link-local or private networks are not opened', () => {
+  for (const host of ['localhost', 'foo.localhost', '127.0.0.1', '10.1.2.3', '172.16.0.9', '172.31.255.1', '192.168.1.1', '169.254.1.1', '0.0.0.0', '[::1]', '[::]', '[fd00::1]', '[fe80::1]', '[::ffff:10.0.0.1]']) {
+    assert.equal(isLocalOrPrivateHost(host), true, host);
+  }
+  for (const host of ['relay.mostro.network', '172.32.0.1', '8.8.8.8', '[2001:db8::1]', '11.0.0.1']) {
+    assert.equal(isLocalOrPrivateHost(host), false, host);
+  }
+  const list = { kind: 10002, tags: [['r', 'ws://localhost:7777'], ['r', 'wss://10.0.0.5'], ['r', 'wss://[::1]:4848'], ['r', 'wss://public.example']] };
+  assert.deepEqual(relaysFromNip65(list, []), ['wss://public.example/']);
+  // The explicit `relays` parameter is the visitor's choice and is not filtered.
+  assert.deepEqual(parseRelayParam('ws://localhost:10547', []).relays, ['ws://localhost:10547/']);
+  assert.equal(MAX_DISCOVERED_RELAYS, 8);
 });
