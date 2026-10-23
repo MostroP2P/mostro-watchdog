@@ -21,6 +21,15 @@ There is never a periodic "all good" message (#16). Silence in the channel means
 nothing changed. It doesn't prove the instance is healthy: that is what the
 watchdog's own heartbeat and peer watchdogs are for (below).
 
+The watchdog is the operator's private alarm. The public view of the same events is
+[Semáforo](https://github.com/MostroP2P/semaforo), the status page at
+[status.mostro.network](https://status.mostro.network): it reads the health events
+of the trusted instances from the relays, verifies them in the browser, compares
+block heights with public explorers and keeps 90 days of uptime, with no backend.
+Both are readers of the same protocol
+([`health_event.md`](https://github.com/MostroP2P/protocol)), so a change to the
+event or to mostrod's checks must be followed in both.
+
 ## Phase 0: the info event
 
 Works with any mostrod, no changes needed. The watchdog reads Mostro's info event
@@ -169,6 +178,9 @@ clock catches up.
 
 The `watching` tag (shown above) links the watchdog's key to the instance in public,
 so it is off by default; turn it on with `heartbeat_watching_tag = true`.
+
+The heartbeat is public and unencrypted: any reader of the protocol can list the
+watchers of an instance from it.
 
 ### Watching the watchdog
 
