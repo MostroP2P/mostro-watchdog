@@ -598,6 +598,28 @@ async fn an_older_revision_of_a_trusted_peer_cannot_lower_the_median() {
 }
 
 #[tokio::test]
+async fn an_alert_whose_incident_cleared_while_its_write_waited_is_never_sent() {
+    let mut h = Harness::new(config()).await;
+    // The incidents table is gone: the opening is held behind its write.
+    sqlx::query("DROP TABLE health_incidents")
+        .execute(h.store.pool())
+        .await
+        .unwrap();
+    minutes(&mut h, NOW, 3, true, 1).await;
+    // Healthy again, the write still failing: nothing is sent.
+    minutes(&mut h, NOW + 180, 2, false, 100).await;
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+
+    // The store recovers on the round whose good reading clears the
+    // incident: the held opening is released and must not be sent.
+    HealthStore::new(h.store.pool().clone()).await.unwrap();
+    minutes(&mut h, NOW + 300, 1, false, 102).await;
+
+    assert!(h.sends().is_empty(), "{:#?}", h.sends());
+    assert_eq!(h.monitor.tracker.open_incidents().count(), 0);
+}
+
+#[tokio::test]
 async fn a_failed_seq_write_is_retried_on_the_next_round() {
     let mut h = Harness::new(config()).await;
     let event = h.health(NOW, 5, false);

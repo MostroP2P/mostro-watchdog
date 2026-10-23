@@ -460,13 +460,20 @@ impl<M: Messenger> Monitor<M> {
             }
         }
         // An alert the tracker repeats because it was never delivered waits
-        // for its stored incident like the first one, and goes out once.
+        // for its stored incident like the first one, and goes out once. An
+        // opening released by `flush` this round for an incident this
+        // round's readings then cleared is dropped: told, it could never be
+        // resolved, and the condition is already over.
         let mut seen = std::collections::HashSet::new();
         notices.retain(|notice| {
             let incident = notice.incident();
             let key = (incident.subject.clone(), incident.rule);
             match notice {
-                Notice::Opened(_) => !self.is_pending(&key) && seen.insert(key),
+                Notice::Opened(_) => {
+                    !self.is_pending(&key)
+                        && self.tracker.is_open(&key.0, key.1)
+                        && seen.insert(key)
+                }
                 _ => true,
             }
         });
