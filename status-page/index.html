@@ -532,6 +532,20 @@ export function relaysFromNip65(event, known) {
 /** How many relays discovered from NIP-65 lists the page opens at most. */
 export const MAX_DISCOVERED_RELAYS = 8;
 
+/**
+ * `candidates` not yet in `open`, as many as the cap `limit` leaves room
+ * for: `added` is what to subscribe now, `all` the new list of open
+ * discovered relays. Pure; returns new arrays.
+ */
+export function addDiscovered(open, candidates, limit) {
+  const added = [];
+  for (const relay of candidates) {
+    if (open.length + added.length >= limit) break;
+    if (!open.includes(relay) && !added.includes(relay)) added.push(relay);
+  }
+  return { added, all: [...open, ...added] };
+}
+
 /** First delay before a relay that could not be connected is tried again. */
 export const RETRY_BASE_MS = 15_000;
 /** Longest delay between two tries of the same relay. */
@@ -953,33 +967,52 @@ window.addEventListener('storage', (event) => {
  * MAX_DISCOVERED_RELAYS are opened, and none inside the visitor's own
  * network (`isLocalOrPrivateHost`).
  */
+/** Requested instances whose relay list was found, and the relays opened from the lists. */
+const listsFound = new Set();
+let discoveredRelays = [];
+let discoveryRunning = false;
+
+/**
+ * Runs whenever a bootstrap relay answers, for the requested instances
+ * whose list has not been found yet: a list served only by a relay that
+ * recovers later is picked up then, instead of once at load. One run at a
+ * time; an instance that never published a list is asked for again on
+ * each recovery, which the relays' own reconnection bounds.
+ */
 async function followRelayLists(pool, filter) {
+  const pending = onlyInstances.filter((key) => !listsFound.has(key));
+  if (discoveryRunning || !pending.length) return;
+  discoveryRunning = true;
   try {
     const lists = await pool.querySync(
       relayList,
-      { kinds: [RELAY_LIST_KIND], authors: onlyInstances },
+      { kinds: [RELAY_LIST_KIND], authors: pending },
       { maxWait: 10_000 },
     );
     const newest = new Map();
     for (const event of lists) {
-      if (!onlyInstances.includes(event.pubkey) || !verifyEvent(event)) continue;
+      if (!pending.includes(event.pubkey) || !verifyEvent(event)) continue;
       const current = newest.get(event.pubkey);
       if (!current || event.created_at > current.created_at) newest.set(event.pubkey, event);
     }
-    const discovered = [];
-    for (const event of newest.values()) {
-      discovered.push(...relaysFromNip65(event, [...relayList, ...discovered]));
+    const candidates = [];
+    for (const [pubkey, event] of newest) {
+      listsFound.add(pubkey);
+      candidates.push(...relaysFromNip65(event, [...relayList, ...candidates]));
     }
-    if (discovered.length > MAX_DISCOVERED_RELAYS) {
-      console.warn(`The instances' relay lists name ${discovered.length} new relays; only the first ${MAX_DISCOVERED_RELAYS} are opened`);
-      discovered.length = MAX_DISCOVERED_RELAYS;
+    const { added, all } = addDiscovered(discoveredRelays, candidates, MAX_DISCOVERED_RELAYS);
+    if (candidates.some((relay) => !all.includes(relay))) {
+      console.warn(`The instances' relay lists name more than ${MAX_DISCOVERED_RELAYS} new relays; the rest are not opened`);
     }
-    if (!discovered.length) return;
-    subscribeOn(pool, discovered, [filter]);
+    if (!added.length) return;
+    discoveredRelays = all;
+    subscribeOn(pool, added, [filter]);
     document.getElementById('relays-line').textContent =
-      `Relays: ${relayList.join(', ')} · from the instances' relay lists: ${discovered.join(', ')}`;
+      `Relays: ${relayList.join(', ')} · from the instances' relay lists: ${discoveredRelays.join(', ')}`;
   } catch (error) {
-    console.warn('Could not read the instances\' relay lists; only the bootstrap relays are read', error);
+    console.warn('Could not read the instances\' relay lists; only the bootstrap relays are read for now', error);
+  } finally {
+    discoveryRunning = false;
   }
 }
 
@@ -1047,15 +1080,14 @@ if (!badInstanceParam) {
     const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
     if (onlyInstances.length) instanceFilter.authors = onlyInstances;
     const watcherFilter = { kinds: [HEALTH_KIND], '#z': ['watcher'] };
-    let listsFollowed = false;
     const pool = new SimplePool({
       enableReconnect: true,
       onRelayConnectionFailure: (url) => retryLater(pool, url),
       onRelayConnectionSuccess: (url) => {
         failures.delete(relayKey(url));
-        // The instances' relay lists are read once a bootstrap relay answers.
-        if (onlyInstances.length && !listsFollowed && relayList.some((r) => relayKey(r) === relayKey(url))) {
-          listsFollowed = true;
+        // Each bootstrap relay that answers may hold a relay list the
+        // others did not: look again for the instances still without one.
+        if (onlyInstances.length && relayList.some((r) => relayKey(r) === relayKey(url))) {
           followRelayLists(pool, instanceFilter);
         }
       },
