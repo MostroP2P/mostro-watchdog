@@ -13,7 +13,11 @@ For each instance it shows:
 - when it was last seen, its escrow mode, maintenance mode, version and checks;
 - for Lightning instances, LND's block height next to a public explorer's tip for the
   same network (mempool.space, blockstream.info), with a lag of 3 blocks or more
-  highlighted. On a network without explorers (regtest) there is no comparison.
+  highlighted. An instance that reports **ok** while 3 or more blocks behind for 15
+  minutes (the watchdog's `block_lag_for_secs`) is shown as **degraded**, and the card
+  says why: `status = ok` is not proof. The lag is counted from when this page first
+  saw it, so a reload starts the count again. On a network without explorers
+  (regtest) there is no comparison.
 
 It also lists the **watchers**: monitoring tools such as mostro-watchdog that publish a
 heartbeat (`z` = `watcher`), with what they watch and whether they are alive.
@@ -65,8 +69,8 @@ All options are URL query parameters:
 
 | Parameter | Example | Effect |
 |---|---|---|
-| `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`). Entries that aren't `ws:`/`wss:` URLs with a host are named in a warning and skipped; with none valid, the defaults are used |
-| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Invalid keys are named in a warning; if none is valid, nothing is shown |
+| `relays` | `?relays=wss://relay.mostro.network,wss://nos.lol` | Relays to read from, and to discover instances and their relay lists on (default: `relay.mostro.network`, `nos.lol`, `relay.damus.io`). Without `instance`, only these relays are searched. Entries that aren't `ws:`/`wss:` URLs with a host are named in a warning and skipped; with none valid, the defaults are used |
+| `instance` | `?instance=npub1...,npub1...` | Show only these instances (npub or hex), and show them as unknown until a valid event arrives. Their NIP-65 relay lists (kind 10002) are read from the `relays` relays, and their health events are also read from the relays those lists say they write to. Invalid keys are named in a warning; if none is valid, nothing is shown |
 | `watchers` | `?watchers=0` | Hide the watchers |
 
 ## Development

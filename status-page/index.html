@@ -124,7 +124,7 @@
 
   <footer>
     <p id="relays-line"></p>
-    <p>An instance with no valid event, or whose last event expired or is older than three intervals, is shown as <strong>unknown</strong>, never as ok. Block heights are compared with public explorers for the same network; a lag of 3 blocks or more is highlighted.</p>
+    <p>An instance with no valid event, or whose last event expired or is older than three intervals, is shown as <strong>unknown</strong>, never as ok. Block heights are compared with public explorers for the same network; a lag of 3 blocks or more is highlighted, and an instance that reports ok while behind for 15 minutes is shown as <strong>degraded</strong>, as the watchdog alerts it.</p>
   </footer>
 </main>
 
@@ -138,6 +138,8 @@
 // reader owes"), as pure functions so they are tested with node (see
 // health.test.mjs). `verify` checks the NIP-01 signature.
 export const HEALTH_KIND = 38389;
+/** NIP-65 relay lists. */
+export const RELAY_LIST_KIND = 10002;
 export const MIN_INTERVAL = 30;
 export const MAX_INTERVAL = 3600;
 export const MAX_SEQ = 9007199254740991;
@@ -166,8 +168,9 @@ export const EXPLORERS = new Map([
 
 /**
  * Highest tip believed from an explorer. Mainnet is under a million
- * blocks and testnet3, the tallest test chain, under five; anything far
- * above is a broken or hostile answer, not a chain.
+ * blocks and testnet3, the tallest test chain, a little over five million
+ * in late 2026; anything far above is a broken or hostile answer, not a
+ * chain.
  */
 export const MAX_PLAUSIBLE_HEIGHT = 10_000_000;
 
@@ -485,19 +488,78 @@ export function parseRelayParam(raw, defaults) {
   const relays = [];
   const invalid = [];
   for (const entry of entries) {
-    let url = null;
-    try {
-      url = new URL(entry);
-    } catch {
-      url = null;
-    }
-    if (url && (url.protocol === 'wss:' || url.protocol === 'ws:') && url.hostname) {
-      if (!relays.includes(url.href)) relays.push(url.href);
+    const href = relayHref(entry);
+    if (href) {
+      if (!relays.includes(href)) relays.push(href);
     } else {
       invalid.push(entry);
     }
   }
   return { relays: relays.length ? relays : defaults, invalid, usedDefaults: relays.length === 0 };
+}
+
+/** `entry` as a normalised relay URL (ws: or wss: with a host), or null. */
+function relayHref(entry) {
+  let url = null;
+  try {
+    url = new URL(entry);
+  } catch {
+    return null;
+  }
+  return (url.protocol === 'wss:' || url.protocol === 'ws:') && url.hostname ? url.href : null;
+}
+
+/**
+ * The relays a publisher writes to, from its NIP-65 list (kind 10002):
+ * the `r` tags with no marker or the `write` one, as normalised URLs,
+ * without those already in `known` or repeated. A `read` relay is where
+ * it reads, not where its health events are. The caller verifies the
+ * event's signature and author.
+ */
+export function relaysFromNip65(event, known) {
+  if (!event || event.kind !== RELAY_LIST_KIND || !Array.isArray(event.tags)) return [];
+  const relays = [];
+  for (const tag of event.tags) {
+    if (!Array.isArray(tag) || tag[0] !== 'r') continue;
+    if (tag[2] !== undefined && tag[2] !== 'write') continue;
+    const href = relayHref(tag[1]);
+    if (href && !known.includes(href) && !relays.includes(href)) relays.push(href);
+  }
+  return relays;
+}
+
+/** Being this many blocks behind the explorers' tip is a lag. */
+export const LAG_BLOCKS = 3;
+
+/**
+ * How long a lag must last before an instance that reports ok stops being
+ * shown as ok: the watchdog's `block_lag_for_secs`, so page and Telegram
+ * agree.
+ */
+export const LAG_FOR_SECS = 900;
+
+/**
+ * `lagging` with `pubkey` lagging since `now` when `lag` reaches
+ * LAG_BLOCKS (an earlier sighting stands), or without it when the lag is
+ * smaller or there is no reference to compare with (`lag` null): a lag is
+ * never invented. Returns a new object.
+ */
+export function trackLag(lagging, pubkey, lag, now) {
+  const { [pubkey]: since, ...rest } = lagging;
+  if (lag === null || lag === undefined || lag < LAG_BLOCKS) return rest;
+  return { ...rest, [pubkey]: since ?? now };
+}
+
+/**
+ * The state to show once the chain lag counts: `displayState`, except that
+ * an instance reporting ok while LAG_FOR_SECS behind the explorers is
+ * degraded, as the watchdog's block-lag rule has it. `ok` is not proof.
+ */
+export function shownState(report, now, lagging) {
+  const state = displayState(report, now);
+  const since = lagging[report.pubkey];
+  if (state === 'ok' && since !== undefined && now - since >= LAG_FOR_SECS) return 'degraded';
+  return state;
 }
 
 /** "45 s", "7 min", "2 h 5 min", "3 d 4 h". */
@@ -514,7 +576,6 @@ export function ago(seconds) {
 // END health-lib
 
 const DEFAULT_RELAYS = ['wss://relay.mostro.network', 'wss://nos.lol', 'wss://relay.damus.io'];
-const LAG_BLOCKS = 3;
 const EXPLORER_REFRESH_MS = 60_000;
 
 const { SimplePool, verifyEvent, nip19 } = window.NostrTools;
@@ -531,6 +592,8 @@ const showWatchers = params.get('watchers') !== '0';
 const instances = new Map();
 const watchers = new Map();
 const tips = new Map();
+/** Instances behind the chain, by pubkey, with when the lag was first seen. */
+let lagging = {};
 
 // Best-effort memory across visits (the spec treats a page as a stateless
 // reader): the instances seen, so one whose events are no longer served
@@ -638,7 +701,7 @@ function heightLine(report) {
 }
 
 function instanceCard(report, t) {
-  const state = displayState(report, t);
+  const state = shownState(report, t, lagging);
   const fresh = state !== 'unknown';
   const card = el('article', { class: `card ${state}` });
   card.append(
@@ -650,6 +713,9 @@ function instanceCard(report, t) {
   add('Last seen', `${ago(t - report.createdAt)} ago`);
   if (!fresh) {
     add('Why unknown', t >= report.expiration ? 'its last event expired' : 'its last event is older than three intervals');
+  }
+  if (state === 'degraded' && report.status === 'ok') {
+    add('Why degraded', `it reports ok, but LND has been ${LAG_BLOCKS} or more blocks behind the chain for ${ago(t - lagging[report.pubkey])}`);
   }
   add('Escrow', report.escrowMode);
   if (report.escrowMode === 'lightning') add('Block height', heightLine(report));
@@ -667,11 +733,18 @@ function instanceCard(report, t) {
 
 function render() {
   const t = now();
+  // A fresh instance's height against a fresh tip for its network; a
+  // stale event or a missing reference is no lag.
+  for (const r of instances.values()) {
+    const comparable = r.network && r.blockHeight !== null && isFresh(r, t);
+    const tip = comparable ? freshTip(tips.get(r.network), t) : null;
+    lagging = trackLag(lagging, r.pubkey, tip ? tip.height - r.blockHeight : null, t);
+  }
   // Most urgent first: down, degraded, ok, then unknown.
   const rank = { down: 0, degraded: 1, ok: 2, unknown: 3 };
   const list = [...instances.values()]
     .filter((r) => !onlyInstances.length || onlyInstances.includes(r.pubkey))
-    .sort((a, b) => rank[displayState(a, t)] - rank[displayState(b, t)]
+    .sort((a, b) => rank[shownState(a, t, lagging)] - rank[shownState(b, t, lagging)]
       || (a.name || '').localeCompare(b.name || '')
       || a.pubkey.localeCompare(b.pubkey));
   const grid = document.getElementById('instances');
@@ -696,7 +769,7 @@ function render() {
   document.getElementById('instances-empty').hidden = grid.children.length > 0;
 
   const counts = { ok: 0, degraded: 0, down: 0, unknown: 0 };
-  for (const r of list) counts[displayState(r, t)] += 1;
+  for (const r of list) counts[shownState(r, t, lagging)] += 1;
   counts.unknown += missing.length;
   document.getElementById('summary').replaceChildren(
     ...Object.entries(counts).map(([state, n]) => pill(state, `${n} ${state}`)),
@@ -813,6 +886,39 @@ window.addEventListener('storage', (event) => {
   render();
 });
 
+/**
+ * Subscribes to the health events of the requested instances on the relays
+ * they publish to, from their NIP-65 lists (kind 10002) as served by the
+ * bootstrap relays, so an instance that publishes only to its own relays
+ * is not shown as unknown. The bootstrap relays stay subscribed as the
+ * fallback. Discovery itself searches the bootstrap relays only.
+ */
+async function followRelayLists(pool, filter) {
+  try {
+    const lists = await pool.querySync(
+      relayList,
+      { kinds: [RELAY_LIST_KIND], authors: onlyInstances },
+      { maxWait: 10_000 },
+    );
+    const newest = new Map();
+    for (const event of lists) {
+      if (!onlyInstances.includes(event.pubkey) || !verifyEvent(event)) continue;
+      const current = newest.get(event.pubkey);
+      if (!current || event.created_at > current.created_at) newest.set(event.pubkey, event);
+    }
+    const discovered = [];
+    for (const event of newest.values()) {
+      discovered.push(...relaysFromNip65(event, [...relayList, ...discovered]));
+    }
+    if (!discovered.length) return;
+    pool.subscribeMany(discovered, filter, { onevent: onEvent });
+    document.getElementById('relays-line').textContent =
+      `Relays: ${relayList.join(', ')} · from the instances' relay lists: ${discovered.join(', ')}`;
+  } catch (error) {
+    console.warn('Could not read the instances\' relay lists; only the bootstrap relays are read', error);
+  }
+}
+
 /** Shows a problem with the page's parameters or connection. */
 function warn(text) {
   document.getElementById('param-errors').append(el('p', { class: 'param-error' }, text));
@@ -844,6 +950,7 @@ if (!badInstanceParam) {
     if (onlyInstances.length) instanceFilter.authors = onlyInstances;
     pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
     if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
+    if (onlyInstances.length) followRelayLists(pool, instanceFilter);
   } catch (error) {
     console.error('Could not subscribe to the relays', error);
     warn(`Could not connect to the relays: ${error?.message || error}`);

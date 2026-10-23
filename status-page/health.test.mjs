@@ -14,7 +14,8 @@ const lib = html.slice(html.indexOf('// BEGIN health-lib'), html.indexOf('// END
 const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
-  syncAccepted, withLock, parseTip, MAX_PLAUSIBLE_HEIGHT,
+  syncAccepted, withLock, parseTip, MAX_PLAUSIBLE_HEIGHT, relaysFromNip65, trackLag, shownState,
+  LAG_BLOCKS, LAG_FOR_SECS,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -455,4 +456,57 @@ test('an explorer tip must be an exact, plausible height', () => {
   ]) {
     assert.equal(parseTip(body), null, String(body));
   }
+});
+
+test('a NIP-65 list gives the relays its author writes to, the known ones excluded', () => {
+  const list = {
+    kind: 10002, pubkey: PK, created_at: NOW, tags: [
+      ['r', 'wss://a.example'],
+      ['r', 'wss://b.example', 'write'],
+      ['r', 'wss://c.example', 'read'],
+      ['r', 'https://not-a-relay.example'],
+      ['r', 'wss://'],
+      ['r'],
+      ['r', 'wss://a.example/'],
+      ['r', 'wss://known.example'],
+      ['e', 'f'.repeat(64)],
+    ],
+  };
+
+  const relays = relaysFromNip65(list, ['wss://known.example/']);
+
+  assert.deepEqual(relays, ['wss://a.example/', 'wss://b.example/']);
+  assert.deepEqual(relaysFromNip65({ kind: 10002, tags: [] }, []), []);
+  assert.deepEqual(relaysFromNip65({ kind: 3, tags: [['r', 'wss://a.example']] }, []), []);
+});
+
+test('a lag is tracked from when it was first seen, and dropped with the lag or the reference', () => {
+  let lagging = trackLag({}, PK, LAG_BLOCKS, NOW);
+  assert.equal(lagging[PK], NOW);
+
+  // Still lagging later: the first sighting stands.
+  lagging = trackLag(lagging, PK, 200, NOW + 300);
+  assert.equal(lagging[PK], NOW);
+
+  // Below the threshold, or no reference to compare with: not lagging.
+  assert.equal(trackLag(lagging, PK, LAG_BLOCKS - 1, NOW + 301)[PK], undefined);
+  assert.equal(trackLag(lagging, PK, null, NOW + 301)[PK], undefined);
+  // Immutable: the earlier map is untouched.
+  assert.equal(lagging[PK], NOW);
+});
+
+test('an instance reporting ok while behind the chain stops being ok after the watchdog\'s 15 minutes', () => {
+  const at = (createdAt) => parseHealthEvent(instance({}, { createdAt }), createdAt, yes).report;
+  const lagging = { [PK]: NOW };
+
+  assert.equal(shownState(at(NOW), NOW, lagging), 'ok');
+  assert.equal(shownState(at(NOW + LAG_FOR_SECS - 1), NOW + LAG_FOR_SECS - 1, lagging), 'ok');
+  assert.equal(shownState(at(NOW + LAG_FOR_SECS), NOW + LAG_FOR_SECS, lagging), 'degraded');
+  // The reported state is kept when it is already worse, or when the event is stale.
+  const down = parseHealthEvent(instance({ status: ['down'] }, { createdAt: NOW + LAG_FOR_SECS }), NOW + LAG_FOR_SECS, yes).report;
+  assert.equal(shownState(down, NOW + LAG_FOR_SECS, lagging), 'down');
+  assert.equal(shownState(at(NOW), NOW + LAG_FOR_SECS, lagging), 'unknown');
+  // Without a tracked lag it is the reported state.
+  assert.equal(shownState(at(NOW + LAG_FOR_SECS), NOW + LAG_FOR_SECS, {}), 'ok');
+  assert.equal(LAG_FOR_SECS, 900);
 });
