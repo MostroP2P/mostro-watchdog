@@ -113,7 +113,6 @@ impl Tracker {
         Self { tracks }
     }
 
-    #[cfg(test)]
     /// Whether an incident is open for this subject and rule.
     pub fn is_open(&self, subject: &Subject, rule: RuleId) -> bool {
         self.tracks
@@ -121,6 +120,7 @@ impl Tracker {
             .is_some_and(|track| track.incident.is_some())
     }
 
+    #[cfg(test)]
     pub fn open_incidents(&self) -> impl Iterator<Item = &Incident> {
         self.tracks.values().filter_map(|t| t.incident.as_ref())
     }
