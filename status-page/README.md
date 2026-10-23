@@ -48,7 +48,10 @@ another tab stores a revision that beats the one shown here, this tab shows the
 publisher as waiting until that revision arrives. Tabs and reloads therefore always
 agree. (The watchdog also lets its persisted event id win a tie; the spec treats a page
 as a stateless reader, and lowest id gives every tab the same answer.)
-Without storage (private mode, some `file://` setups) it works as before. Explorer
+Without storage (private mode, some `file://` setups) it works as before.
+A relay that cannot be connected when the page opens (offline, or a slow first
+connection) is tried again with a doubling delay, from 15 s up to 5 minutes between
+tries, for as long as the page is open; nostr-tools alone would drop it for good. Explorer
 tips are used for 30 minutes after they were fetched; when every explorer has failed
 for longer, the card says "no reference" instead of comparing with a stale tip.
 

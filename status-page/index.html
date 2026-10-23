@@ -532,6 +532,22 @@ export function relaysFromNip65(event, known) {
 /** How many relays discovered from NIP-65 lists the page opens at most. */
 export const MAX_DISCOVERED_RELAYS = 8;
 
+/** First delay before a relay that could not be connected is tried again. */
+export const RETRY_BASE_MS = 15_000;
+/** Longest delay between two tries of the same relay. */
+export const RETRY_MAX_MS = 300_000;
+
+/**
+ * How long to wait before the `attempt`-th retry of a relay (0-based):
+ * doubling from RETRY_BASE_MS, never more than RETRY_MAX_MS. A relay that
+ * fails to connect at first is otherwise dropped for good by nostr-tools,
+ * so a page opened offline would stay empty after the network returned.
+ */
+export function retryDelay(attempt) {
+  const n = Number.isInteger(attempt) && attempt > 0 ? attempt : 0;
+  return Math.min(RETRY_BASE_MS * 2 ** n, RETRY_MAX_MS);
+}
+
 /**
  * Whether `hostname` (as `URL.hostname` gives it, IPv6 in brackets) is
  * localhost, loopback, unspecified, link-local or a private network. A
@@ -957,7 +973,7 @@ async function followRelayLists(pool, filter) {
       discovered.length = MAX_DISCOVERED_RELAYS;
     }
     if (!discovered.length) return;
-    pool.subscribeMany(discovered, filter, { onevent: onEvent });
+    subscribeOn(pool, discovered, [filter]);
     document.getElementById('relays-line').textContent =
       `Relays: ${relayList.join(', ')} · from the instances' relay lists: ${discovered.join(', ')}`;
   } catch (error) {
@@ -987,16 +1003,62 @@ if (instanceParam.invalid.length) {
     ? `None of the keys in the "instance" parameter is a valid npub or hex public key (${list}), so nothing is shown. Fix the URL, or remove the parameter to see every instance.`
     : `Ignored invalid keys in the "instance" parameter: ${list}. The other instances are shown.`);
 }
+/** The filters each relay carries, by relay URL, so a retry re-sends them. */
+const relayFilters = new Map();
+/** Failed connection attempts per relay, and the relays with a retry scheduled. */
+const failures = new Map();
+const retrying = new Set();
+const relayKey = (url) => url.toLowerCase().replace(/\/+$/, '');
+
+/** Subscribes `filters` on `relays` and remembers them for retries. */
+function subscribeOn(pool, relays, filters) {
+  for (const url of relays) relayFilters.set(relayKey(url), filters);
+  for (const filter of filters) pool.subscribeMany(relays, filter, { onevent: onEvent });
+}
+
+/**
+ * A relay that could not be connected (unreachable, or its first connection
+ * timed out) is dropped by nostr-tools together with its subscription, and
+ * `enableReconnect` only covers connections that were open once. Try it
+ * again later, with a doubling delay capped at RETRY_MAX_MS, until it
+ * answers; relays are never given up on while the page is open.
+ */
+function retryLater(pool, url) {
+  const key = relayKey(url);
+  if (retrying.has(key)) return;
+  const attempt = failures.get(key) ?? 0;
+  failures.set(key, attempt + 1);
+  const delay = retryDelay(attempt);
+  console.warn(`Could not connect to ${url}; trying again in ${Math.round(delay / 1000)} s`);
+  retrying.add(key);
+  setTimeout(() => {
+    retrying.delete(key);
+    const filters = relayFilters.get(key);
+    if (filters) subscribeOn(pool, [url], filters);
+  }, delay);
+}
+
 if (!badInstanceParam) {
   // A relay library error must not stop the page: the timers below still
   // run, so remembered instances still turn unknown with time.
   try {
-    const pool = new SimplePool({ enableReconnect: true });
     const instanceFilter = { kinds: [HEALTH_KIND], '#z': ['health'] };
     if (onlyInstances.length) instanceFilter.authors = onlyInstances;
-    pool.subscribeMany(relayList, instanceFilter, { onevent: onEvent });
-    if (showWatchers) pool.subscribeMany(relayList, { kinds: [HEALTH_KIND], '#z': ['watcher'] }, { onevent: onEvent });
-    if (onlyInstances.length) followRelayLists(pool, instanceFilter);
+    const watcherFilter = { kinds: [HEALTH_KIND], '#z': ['watcher'] };
+    let listsFollowed = false;
+    const pool = new SimplePool({
+      enableReconnect: true,
+      onRelayConnectionFailure: (url) => retryLater(pool, url),
+      onRelayConnectionSuccess: (url) => {
+        failures.delete(relayKey(url));
+        // The instances' relay lists are read once a bootstrap relay answers.
+        if (onlyInstances.length && !listsFollowed && relayList.some((r) => relayKey(r) === relayKey(url))) {
+          listsFollowed = true;
+          followRelayLists(pool, instanceFilter);
+        }
+      },
+    });
+    subscribeOn(pool, relayList, showWatchers ? [instanceFilter, watcherFilter] : [instanceFilter]);
   } catch (error) {
     console.error('Could not subscribe to the relays', error);
     warn(`Could not connect to the relays: ${error?.message || error}`);

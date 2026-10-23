@@ -15,7 +15,7 @@ const {
   parseHealthEvent, isFresh, displayState, keepNewest, ago, better, superseded, freshTip, remember, forgetOld,
   KNOWN_MAX_AGE, TIP_MAX_AGE, parseInstanceParam, mergeAccepted, mergeKnown, parseRelayParam, explorersFor,
   syncAccepted, withLock, parseTip, MAX_PLAUSIBLE_HEIGHT, relaysFromNip65, trackLag, shownState,
-  LAG_BLOCKS, LAG_FOR_SECS, isLocalOrPrivateHost, MAX_DISCOVERED_RELAYS,
+  LAG_BLOCKS, LAG_FOR_SECS, isLocalOrPrivateHost, MAX_DISCOVERED_RELAYS, retryDelay, RETRY_BASE_MS, RETRY_MAX_MS,
 } = await import(
   `data:text/javascript;base64,${Buffer.from(lib).toString('base64')}`
 );
@@ -523,4 +523,13 @@ test('discovered relays on loopback, link-local or private networks are not open
   // The explicit `relays` parameter is the visitor's choice and is not filtered.
   assert.deepEqual(parseRelayParam('ws://localhost:10547', []).relays, ['ws://localhost:10547/']);
   assert.equal(MAX_DISCOVERED_RELAYS, 8);
+});
+
+test('a relay that could not be connected is retried with a doubling delay, capped at five minutes', () => {
+  assert.equal(retryDelay(0), RETRY_BASE_MS);
+  assert.equal(retryDelay(1), 2 * RETRY_BASE_MS);
+  assert.equal(retryDelay(2), 4 * RETRY_BASE_MS);
+  assert.equal(retryDelay(50), RETRY_MAX_MS);
+  assert.equal(retryDelay(-1), RETRY_BASE_MS);
+  assert.equal(RETRY_MAX_MS, 300_000);
 });
