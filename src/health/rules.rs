@@ -612,7 +612,9 @@ fn no_payout_success(s: &Snapshot, threshold: u64) -> Reading {
     let Some(payouts) = s.fresh_details().and_then(|d| d.payouts.as_ref()) else {
         return Reading::Unknown;
     };
-    let Some(waiting) = payouts.settled_unpaid_orders else {
+    // Stale orders are nobody's payout to make (mostro#1071): only the
+    // live ones say whether the node pays.
+    let Some(waiting) = live_settled_unpaid(payouts) else {
         return Reading::Unknown;
     };
     let oldest = match (waiting, payouts.oldest_settled_unpaid_order_age_secs) {
@@ -641,6 +643,12 @@ fn no_payout_success(s: &Snapshot, threshold: u64) -> Reading {
     }
 }
 
+/// Distinct failing orders before a failure rate is the node's and not
+/// one buyer's invoice (mostro#1071).
+const PAYOUT_FAILURE_MIN_ORDERS: u64 = 2;
+/// The failure reason that is the node's own however many orders failed.
+const INSUFFICIENT_BALANCE: &str = "insufficient_balance";
+
 fn payout_failure_rate(s: &Snapshot, max_rate: f64, min_attempts: u64) -> Reading {
     let Some(payouts) = s.fresh_details().and_then(|d| d.payouts.as_ref()) else {
         return Reading::Unknown;
@@ -655,6 +663,22 @@ fn payout_failure_rate(s: &Snapshot, max_rate: f64, min_attempts: u64) -> Readin
     };
     if attempts < min_attempts || (failed as f64) <= max_rate * attempts as f64 {
         return Reading::good("Most buyer payouts succeed again.");
+    }
+    // One order retried against one bad invoice is that buyer's problem,
+    // not the node's; running out of balance is the node's whatever the
+    // invoice. mostrod's own `payouts` check reads it the same way
+    // (mostro#1071). A daemon that doesn't count orders yet is read by the
+    // rate alone, as before.
+    let unfunded = payouts
+        .failure_reasons_1h
+        .as_ref()
+        .and_then(|reasons| reasons.get(INSUFFICIENT_BALANCE))
+        .is_some_and(|count| *count > 0);
+    let node_side = payouts
+        .payouts_failed_orders_1h
+        .is_none_or(|orders| orders >= PAYOUT_FAILURE_MIN_ORDERS);
+    if !node_side && !unfunded {
+        return Reading::good("Payouts fail on one order only: its invoice, not the node.");
     }
     let reasons = payouts
         .failure_reasons_1h
@@ -720,29 +744,52 @@ fn cashu_mint(s: &Snapshot, bad: CheckState) -> Reading {
     }
 }
 
+/// The settled-but-unpaid orders the daemon still means to pay: all of
+/// them less the stale ones (mostro#1071), which have no age. `None` when
+/// the count is unknown or there are more stale orders than orders.
+fn live_settled_unpaid(payouts: &super::content::PayoutDetails) -> Option<u64> {
+    // `null` is unknown, never zero.
+    let waiting = payouts.settled_unpaid_orders?;
+    waiting.checked_sub(payouts.stale_settled_unpaid_orders.unwrap_or(0))
+}
+
 fn settled_unpaid(s: &Snapshot, threshold: u64) -> Reading {
     let Some(payouts) = s.fresh_details().and_then(|d| d.payouts.as_ref()) else {
         return Reading::Unknown;
     };
-    // `null` is unknown, never zero.
-    let Some(waiting) = payouts.settled_unpaid_orders else {
+    let Some(waiting) = live_settled_unpaid(payouts) else {
         return Reading::Unknown;
     };
-    // An age with no order waiting is contradictory.
+    let stale = payouts.stale_settled_unpaid_orders.unwrap_or(0);
+    // An age with no live order waiting is contradictory.
     if waiting == 0 && payouts.oldest_settled_unpaid_order_age_secs.is_some() {
         return Reading::Unknown;
     }
+    // A stale order is left for the operator to clear: it warns until
+    // then, as mostrod's `payouts` check does, and never resolves alone.
+    let stale_note = if stale > 0 {
+        format!(
+            " {stale} stale order(s) settled over a week ago that nothing in mostrod will              pay: clear them."
+        )
+    } else {
+        String::new()
+    };
     match payouts.oldest_settled_unpaid_order_age_secs {
         Some(age) if age >= threshold => Reading::Bad {
             detail: format!(
-                "{waiting} order(s) settled but unpaid; the oldest for {}.",
+                "{waiting} order(s) settled but unpaid; the oldest for {}.{stale_note}",
                 human_duration(age)
             ),
             since: Some(s.now.saturating_sub(age)),
             min_duration: 0,
         },
-        // Orders waiting but no age: contradictory, so unknown.
+        // Live orders waiting but no age: contradictory, so unknown.
         None if waiting > 0 => Reading::Unknown,
+        _ if stale > 0 => Reading::Bad {
+            detail: stale_note.trim_start().to_string(),
+            since: None,
+            min_duration: 0,
+        },
         _ => Reading::good("No order waits long for its payout."),
     }
 }
@@ -867,6 +914,7 @@ mod tests {
             body["lnd"]["unsynced_since"] = 1_791_951_600u64.into();
             body["payouts"]["payouts_succeeded_1h"] = 0.into();
             body["payouts"]["payouts_failed_1h"] = 37.into();
+            body["payouts"]["payouts_failed_orders_1h"] = 4.into();
             body["payouts"]["failure_reasons_1h"] =
                 serde_json::json!({"incorrect_payment_details": 31, "no_route": 6});
             body["payouts"]["last_payout_success_at"] = 1_791_950_000u64.into();
@@ -1265,6 +1313,104 @@ mod tests {
                 Reading::Good { .. }
             ));
         }
+    }
+
+    /// mostro#1071: one buyer's bad invoice retried is that buyer's
+    /// problem, not the node's; running out of balance is the node's.
+    #[test]
+    fn a_failure_rate_on_one_order_is_the_invoice_not_the_node() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let one_order = details(|body| {
+            body["payouts"]["payouts_succeeded_1h"] = 1.into();
+            body["payouts"]["payouts_failed_1h"] = 4.into();
+            body["payouts"]["payouts_failed_orders_1h"] = 1.into();
+            body["payouts"]["failure_reasons_1h"] = serde_json::json!({"no_route": 4});
+        });
+        let two_orders = details(|body| {
+            body["payouts"]["payouts_succeeded_1h"] = 1.into();
+            body["payouts"]["payouts_failed_1h"] = 4.into();
+            body["payouts"]["payouts_failed_orders_1h"] = 2.into();
+        });
+        let unfunded = details(|body| {
+            body["payouts"]["payouts_succeeded_1h"] = 0.into();
+            body["payouts"]["payouts_failed_1h"] = 3.into();
+            body["payouts"]["payouts_failed_orders_1h"] = 1.into();
+            body["payouts"]["failure_reasons_1h"] =
+                serde_json::json!({"insufficient_balance": 1, "no_route": 2});
+        });
+        // A daemon from before mostro#1071 doesn't count orders: the rate
+        // alone decides, as before.
+        let older_daemon = details(|body| {
+            body["payouts"]["payouts_succeeded_1h"] = 1.into();
+            body["payouts"]["payouts_failed_1h"] = 4.into();
+            body["payouts"]
+                .as_object_mut()
+                .unwrap()
+                .remove("payouts_failed_orders_1h");
+        });
+
+        let s = snapshot(&mostro, Some(&report), Some(&one_order));
+        assert!(matches!(
+            reading(&s, RuleId::PayoutFailureRate),
+            Reading::Good { .. }
+        ));
+        for d in [&two_orders, &unfunded, &older_daemon] {
+            let s = snapshot(&mostro, Some(&report), Some(d));
+            assert!(is_bad(&reading(&s, RuleId::PayoutFailureRate)));
+        }
+    }
+
+    /// mostro#1071: a settled order nothing in the daemon will pay is
+    /// stale. It has no age in the payload, warns until the operator
+    /// clears it, and never says the node's payouts are stuck.
+    #[test]
+    fn stale_settled_orders_warn_and_never_count_as_stuck_payouts() {
+        let mostro = Keys::generate();
+        let report = report_with(&mostro, |_| {});
+        let only_stale = details(|body| {
+            body["payouts"]["settled_unpaid_orders"] = 1.into();
+            body["payouts"]["stale_settled_unpaid_orders"] = 1.into();
+            body["payouts"]["oldest_settled_unpaid_order_age_secs"] = serde_json::Value::Null;
+            body["payouts"]["last_payout_success_at"] = serde_json::Value::Null;
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&only_stale));
+        let Reading::Bad { detail, .. } = reading(&s, RuleId::SettledUnpaid) else {
+            panic!("a stale order warns");
+        };
+        assert!(detail.contains("stale"), "{detail}");
+        assert!(matches!(
+            reading(&s, RuleId::NoPayoutSuccess),
+            Reading::Good { .. }
+        ));
+
+        // A stale order next to a live one stuck for 3 h: both rules read
+        // the live one, and the warning names the stale one too.
+        let stale_and_stuck = details(|body| {
+            body["payouts"]["settled_unpaid_orders"] = 2.into();
+            body["payouts"]["stale_settled_unpaid_orders"] = 1.into();
+            body["payouts"]["oldest_settled_unpaid_order_age_secs"] = (3 * 3600).into();
+            body["payouts"]["last_payout_success_at"] = serde_json::Value::Null;
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&stale_and_stuck));
+        assert!(is_bad(&reading(&s, RuleId::NoPayoutSuccess)));
+        let Reading::Bad { detail, .. } = reading(&s, RuleId::SettledUnpaid) else {
+            panic!("a stuck order warns");
+        };
+        assert!(
+            detail.contains("1 order(s) settled but unpaid") && detail.contains("stale"),
+            "{detail}"
+        );
+
+        // More stale orders than orders: contradictory, no reading.
+        let contradictory = details(|body| {
+            body["payouts"]["settled_unpaid_orders"] = 1.into();
+            body["payouts"]["stale_settled_unpaid_orders"] = 2.into();
+            body["payouts"]["oldest_settled_unpaid_order_age_secs"] = serde_json::Value::Null;
+        });
+        let s = snapshot(&mostro, Some(&report), Some(&contradictory));
+        assert_eq!(reading(&s, RuleId::SettledUnpaid), Reading::Unknown);
+        assert_eq!(reading(&s, RuleId::NoPayoutSuccess), Reading::Unknown);
     }
 
     #[test]

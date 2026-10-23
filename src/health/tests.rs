@@ -334,6 +334,7 @@ async fn the_encrypted_details_feed_the_payout_rules() {
     let mut body = payload();
     body["payouts"]["payouts_succeeded_1h"] = 0.into();
     body["payouts"]["payouts_failed_1h"] = 9.into();
+    body["payouts"]["payouts_failed_orders_1h"] = 3.into();
     body["payouts"]["failure_reasons_1h"] = serde_json::json!({"no_route": 9});
 
     for i in 0..3 {
@@ -434,6 +435,7 @@ async fn a_shared_decrypt_key_reads_the_details_while_the_heartbeat_keeps_its_ow
     let mut body = payload();
     body["payouts"]["payouts_succeeded_1h"] = 0.into();
     body["payouts"]["payouts_failed_1h"] = 9.into();
+    body["payouts"]["payouts_failed_orders_1h"] = 3.into();
 
     for i in 0..3 {
         let now = NOW + 60 * i;

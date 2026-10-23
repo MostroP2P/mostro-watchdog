@@ -69,8 +69,17 @@ pub struct PayoutDetails {
     /// version doesn't know (from a newer LND or daemon) is kept as is; it
     /// never fails the payload.
     pub failure_reasons_1h: Option<BTreeMap<String, u64>>,
+    /// Distinct orders among `payouts_failed_1h` (mostro#1071). `None`
+    /// from a daemon that doesn't count them yet.
+    pub payouts_failed_orders_1h: Option<u64>,
     pub last_payout_success_at: Option<u64>,
     pub settled_unpaid_orders: Option<u64>,
+    /// Among `settled_unpaid_orders`, those nothing in the daemon will pay:
+    /// settled over a week ago, never attempted, no payout in flight
+    /// (mostro#1071). They have no age below. `None` from a daemon that
+    /// doesn't count them yet.
+    pub stale_settled_unpaid_orders: Option<u64>,
+    /// Age of the oldest settled-but-unpaid order that is not stale.
     pub oldest_settled_unpaid_order_age_secs: Option<u64>,
     pub awaiting_buyer_invoice_orders: Option<u64>,
 }
@@ -267,8 +276,10 @@ pub(crate) mod tests {
                 "payouts_succeeded_1h": 3,
                 "payouts_failed_1h": 0,
                 "failure_reasons_1h": {},
+                "payouts_failed_orders_1h": 0,
                 "last_payout_success_at": NOW - 600,
                 "settled_unpaid_orders": 0,
+                "stale_settled_unpaid_orders": 0,
                 "oldest_settled_unpaid_order_age_secs": null,
                 "awaiting_buyer_invoice_orders": 0
             },

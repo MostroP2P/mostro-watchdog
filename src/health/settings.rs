@@ -165,7 +165,8 @@ pub struct Thresholds {
     pub payout_failure_min_attempts: u64,
     /// Blocks before the nearest pending HTLC expires.
     pub htlc_expiry_blocks: i64,
-    /// Age of the oldest settled-but-unpaid order that warns.
+    /// Age of the oldest settled-but-unpaid order that warns: mostrod's
+    /// own `payouts` check warns at 30 min (mostro#1074).
     pub settled_unpaid_warn_secs: u64,
     /// Seconds a channel must stay inactive before it warns.
     pub inactive_channels_warn_secs: u64,
@@ -183,7 +184,7 @@ impl Default for Thresholds {
             payout_failure_rate: 0.5,
             payout_failure_min_attempts: 3,
             htlc_expiry_blocks: 72,
-            settled_unpaid_warn_secs: 900,
+            settled_unpaid_warn_secs: 1800,
             inactive_channels_warn_secs: 1800,
             degraded_for_secs: 600,
         }
@@ -306,7 +307,7 @@ mod tests {
         assert_eq!(t.payout_failure_rate, 0.5);
         assert_eq!(t.payout_failure_min_attempts, 3);
         assert_eq!(t.htlc_expiry_blocks, 72);
-        assert_eq!(t.settled_unpaid_warn_secs, 900);
+        assert_eq!(t.settled_unpaid_warn_secs, 1800);
         assert_eq!(t.inactive_channels_warn_secs, 1800);
         assert_eq!(t.degraded_for_secs, 600);
     }

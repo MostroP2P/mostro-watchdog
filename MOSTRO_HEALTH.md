@@ -93,11 +93,11 @@ details, no reference height) counts for neither.
 | LND not synced to chain | `lnd_synced_to_chain` = `false` for 10 min | Critical | phase 1 |
 | LND behind the chain | 3 blocks or more behind the reference for 15 min | Critical | phase 1 |
 | Buyer payouts stuck | an order settled-but-unpaid for 2 h and no successful payout for 2 h | Critical | details |
-| Buyer payouts failing | more than 50 % of at least 3 payout attempts failed in the event's window | Critical | details |
+| Buyer payouts failing | more than 50 % of at least 3 payout attempts failed in the event's window, spread over 2 orders or more or with an `insufficient_balance` failure (one order retried against one bad invoice is the buyer's problem, not the node's) | Critical | details |
 | HTLC close to expiry | nearest pending HTLC expires in fewer than 72 blocks | Critical | details |
 | Cashu mint failing | the `cashu_mint` check is `fail` (Cashu instances) | Critical | phase 1 |
 | Cashu mint degraded | the `cashu_mint` check is `warn` (Cashu instances) | Warning | phase 1 |
-| Orders waiting for their payout | oldest settled-but-unpaid order older than 15 min | Warning | details |
+| Orders waiting for their payout | oldest settled-but-unpaid order older than 30 min, or a stale one left (settled over a week ago, never attempted: nothing in mostrod will pay it, so it warns until the operator clears it and never counts as stuck payouts) | Warning | details |
 | Inactive Lightning channels | a channel inactive for 30 min | Warning | details |
 | Peer watchdog silent | a peer's heartbeat older than 3 × its interval, or never seen | Warning | `peer_watchdogs` |
 
@@ -221,7 +221,7 @@ no_payout_success_secs = 7200
 payout_failure_rate = 0.5
 payout_failure_min_attempts = 3
 htlc_expiry_blocks = 72
-settled_unpaid_warn_secs = 900
+settled_unpaid_warn_secs = 1800
 inactive_channels_warn_secs = 1800
 degraded_for_secs = 600
 ```

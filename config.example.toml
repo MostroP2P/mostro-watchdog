@@ -197,7 +197,7 @@ http_port = 8080
 # payout_failure_rate = 0.5
 # payout_failure_min_attempts = 3
 # htlc_expiry_blocks = 72
-# settled_unpaid_warn_secs = 900
+# settled_unpaid_warn_secs = 1800
 # inactive_channels_warn_secs = 1800
 # degraded_for_secs = 600
 
