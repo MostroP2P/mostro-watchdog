@@ -338,6 +338,7 @@ async fn the_encrypted_details_feed_the_payout_rules() {
 
     for i in 0..3 {
         let now = NOW + 60 * i;
+        body["generated_at"] = now.into();
         let mut tags = health_tags(&h.mostro, now, 1 + i);
         set_tag(&mut tags, "p", &[&h.watchdog.public_key().to_hex()]);
         let content = nip44::encrypt(
@@ -436,6 +437,7 @@ async fn a_shared_decrypt_key_reads_the_details_while_the_heartbeat_keeps_its_ow
 
     for i in 0..3 {
         let now = NOW + 60 * i;
+        body["generated_at"] = now.into();
         let mut tags = health_tags(&h.mostro, now, 1 + i);
         set_tag(&mut tags, "p", &[&shared.public_key().to_hex()]);
         let content = nip44::encrypt(

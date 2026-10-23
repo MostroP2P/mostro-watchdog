@@ -71,9 +71,10 @@ its own `WATCHDOG_NOSTR_PRIVATE_KEY` when that variable is unset, and logs the p
 to set at startup.
 
 Without a key, or when the details are for another key, can't be decrypted, use an
-unknown version, contradict the public tags or (on a Lightning instance) lack the
-`lnd` or `payouts` object, the watchdog checks the public tags only, and logs why
-once.
+unknown version, contradict the public tags, (on a Lightning instance) lack the
+`lnd` or `payouts` object, have no `generated_at`, or were generated more than one
+`interval` before the event that carries them (a payload republished from an earlier
+round), the watchdog checks the public tags only, and logs why once.
 
 ### Rules
 

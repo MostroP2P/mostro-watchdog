@@ -25,7 +25,9 @@ const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
 /// Version 1 of the payload. Every field is required by the spec, but a
 /// missing one reads as `None` ("unknown") rather than failing the parse:
-/// `null` already means "I don't know".
+/// `null` already means "I don't know". The exception is `generated_at`:
+/// details that can't be dated can't be told from stale ones, so `parse`
+/// rejects a payload without it.
 #[derive(Debug, Clone, Default, PartialEq, Deserialize)]
 #[serde(default)]
 pub struct HealthDetails {
@@ -155,18 +157,18 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
         EscrowMode::Lightning => has_lightning == (true, true),
         EscrowMode::Cashu => has_lightning == (false, false),
     };
-    if !shape_matches {
+    if !shape_matches || details.generated_at.is_none() {
         return Content::Unreadable;
     }
-    if !agrees_with_tags(&details, report) || !possible_in_time(&details, report) {
+    if !agrees_with_tags(&details, report)
+        || !possible_in_time(&details, report)
+        || !current(&details, report)
+    {
         return Content::Inconsistent;
     }
     Content::Details(Box::new(details))
 }
 
-/// Whether the payload says the same as the public tags where they
-/// overlap. They are produced together; a mismatch is a publisher bug,
-/// and the tags win.
 /// Whether every moment the payload names happened by the time the event
 /// was signed, and an outage ended no earlier than it began. A payload
 /// that dates things after its own event is not believed at all.
@@ -200,6 +202,22 @@ fn possible_in_time(details: &HealthDetails, report: &HealthReport) -> bool {
     in_the_past && outage_ordered && age_possible
 }
 
+/// Whether the details were generated for the round the event was published
+/// in: no earlier than one `interval` before the event. The daemon produces
+/// the payload and the tags together, so an older `generated_at` means a
+/// payload republished from a previous round, whose counters, order ages
+/// and channel metrics are no longer current and must not open or resolve
+/// an incident. `parse` already requires `generated_at`.
+fn current(details: &HealthDetails, report: &HealthReport) -> bool {
+    let envelope = &report.envelope;
+    details.generated_at.is_some_and(|generated_at| {
+        envelope.created_at.saturating_sub(generated_at) <= envelope.interval
+    })
+}
+
+/// Whether the payload says the same as the public tags where they
+/// overlap. They are produced together; a mismatch is a publisher bug,
+/// and the tags win.
 fn agrees_with_tags(details: &HealthDetails, report: &HealthReport) -> bool {
     let maintenance_agrees = details
         .maintenance
@@ -540,6 +558,67 @@ pub(crate) mod tests {
             read(&report(&event, &mostro), Some(&watchdog)),
             Content::Inconsistent
         );
+    }
+
+    #[test]
+    fn undated_details_are_unreadable() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        for body in [
+            {
+                let mut body = payload();
+                body["generated_at"] = serde_json::Value::Null;
+                body
+            },
+            {
+                let mut body = payload();
+                body.as_object_mut().unwrap().remove("generated_at");
+                body
+            },
+        ] {
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |_| {},
+            );
+
+            assert_eq!(
+                read(&report(&event, &mostro), Some(&watchdog)),
+                Content::Unreadable
+            );
+        }
+    }
+
+    #[test]
+    fn details_generated_before_the_events_round_are_not_believed() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        // The test event's interval is 60 s: details from the round before
+        // this one are stale, details from this round are not.
+        for (generated_at, expected) in [
+            (NOW - 61, Content::Inconsistent),
+            (NOW - 60, Content::Details(Box::default())),
+        ] {
+            let mut body = payload();
+            body["generated_at"] = generated_at.into();
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |_| {},
+            );
+
+            let content = read(&report(&event, &mostro), Some(&watchdog));
+
+            assert_eq!(
+                std::mem::discriminant(&content),
+                std::mem::discriminant(&expected),
+                "generated_at = {generated_at}: {content:?}"
+            );
+        }
     }
 
     #[test]
