@@ -384,6 +384,12 @@ Since: 2026-10-14 04:20:00 UTC
 
 See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the setup.
 
+The same health events feed the public status page at
+[status.mostro.network](https://status.mostro.network)
+([Semáforo](https://github.com/MostroP2P/semaforo)), which verifies them in the
+browser with no backend. The watchdog alerts the operator in private; the page shows
+everyone.
+
 ## Configuration Reference
 
 | Field | Description |
@@ -420,7 +426,7 @@ See [MOSTRO_HEALTH.md](MOSTRO_HEALTH.md) for the rules, the defaults and the set
 - [x] **Health check / heartbeat notifications** ✅ *Configurable monitoring and alerting*
 - [x] **Alert on dispute status changes** ✅ *Monitor all dispute lifecycle events*
 - [x] **Mostro health monitoring** ✅ *Alert when Mostro stops working, not only when it stops running*
-- [ ] Static status page for Mostro instances
+- [x] **Static status page for Mostro instances** ✅ *[status.mostro.network](https://status.mostro.network), built in [Semáforo](https://github.com/MostroP2P/semaforo) on the same health events*
 - [ ] Multiple Telegram channels for different event types
 - [ ] Docker image
 
