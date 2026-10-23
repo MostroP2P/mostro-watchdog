@@ -23,6 +23,11 @@ pub const MAX_PLAINTEXT_BYTES: usize = 32 * 1024;
 /// and base64-encoded stays well under this.
 const MAX_PAYLOAD_BYTES: usize = 64 * 1024;
 
+/// How far ahead of the event a block header's timestamp may be: it is
+/// the miner's clock, and Bitcoin accepts a block up to two hours ahead of
+/// a node's network-adjusted time.
+pub const MAX_HEADER_AHEAD_SECS: u64 = 2 * 3600;
+
 /// Version 1 of the payload. Every field is required by the spec, but a
 /// missing one reads as `None` ("unknown") rather than failing the parse:
 /// `null` already means "I don't know". The exception is `generated_at`:
@@ -180,15 +185,19 @@ pub fn parse(plaintext: &str, report: &HealthReport) -> Content {
 
 /// Whether every moment the payload names happened by the time the event
 /// was signed, and an outage ended no earlier than it began. A payload
-/// that dates things after its own event is not believed at all.
+/// that dates things after its own event is not believed at all. The best
+/// block header is the exception: its timestamp is the miner's, allowed
+/// up to `MAX_HEADER_AHEAD_SECS` ahead.
 fn possible_in_time(details: &HealthDetails, report: &HealthReport) -> bool {
     let created_at = report.envelope.created_at;
     let lnd = details.lnd.as_ref();
     let relays = details.relays.as_ref();
+    let header_possible = lnd
+        .and_then(|l| l.best_header_timestamp)
+        .is_none_or(|at| at <= created_at.saturating_add(MAX_HEADER_AHEAD_SECS));
     let moments = [
         details.generated_at,
         lnd.and_then(|l| l.unsynced_since),
-        lnd.and_then(|l| l.best_header_timestamp),
         details
             .payouts
             .as_ref()
@@ -208,7 +217,7 @@ fn possible_in_time(details: &HealthDetails, report: &HealthReport) -> bool {
         .as_ref()
         .and_then(|p| p.oldest_settled_unpaid_order_age_secs)
         .is_none_or(|age| age <= created_at);
-    in_the_past && outage_ordered && age_possible
+    in_the_past && header_possible && outage_ordered && age_possible
 }
 
 /// Whether the details were generated for the round the event was published
@@ -530,9 +539,8 @@ pub(crate) mod tests {
     fn a_payload_dating_things_after_its_event_is_not_believed() {
         let mostro = Keys::generate();
         let watchdog = Keys::generate();
-        let cases: [(&str, &str); 5] = [
+        let cases: [(&str, &str); 4] = [
             ("lnd", "unsynced_since"),
-            ("lnd", "best_header_timestamp"),
             ("payouts", "last_payout_success_at"),
             ("relays", "last_outage_started_at"),
             ("relays", "last_outage_ended_at"),
@@ -628,6 +636,37 @@ pub(crate) mod tests {
                 std::mem::discriminant(&content),
                 std::mem::discriminant(&expected),
                 "generated_at = {generated_at}: {content:?}"
+            );
+        }
+    }
+
+    /// A block's timestamp is the miner's, and Bitcoin accepts it up to
+    /// two hours ahead of the node's clock: a best header that recent is
+    /// valid data, not a payload from the future.
+    #[test]
+    fn a_best_header_up_to_two_hours_ahead_is_believed() {
+        let mostro = Keys::generate();
+        let watchdog = Keys::generate();
+        for (ahead, inconsistent) in [
+            (MAX_HEADER_AHEAD_SECS, false),
+            (MAX_HEADER_AHEAD_SECS + 1, true),
+        ] {
+            let mut body = payload();
+            body["lnd"]["best_header_timestamp"] = (NOW + ahead).into();
+            let event = encrypted_event(
+                &mostro,
+                &watchdog.public_key(),
+                &body.to_string(),
+                1,
+                |_| {},
+            );
+
+            let content = read(&report(&event, &mostro), Some(&watchdog));
+
+            assert_eq!(
+                content == Content::Inconsistent,
+                inconsistent,
+                "{ahead}: {content:?}"
             );
         }
     }
