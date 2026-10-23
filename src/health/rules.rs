@@ -549,6 +549,11 @@ fn lnd_unsynced(s: &Snapshot, min_duration: u64) -> Reading {
     let Some(health) = s.fresh_health() else {
         return Reading::Unknown;
     };
+    // Only a Lightning instance has an LND; the tag on a Cashu one is a
+    // publisher bug and no reading.
+    if health.escrow_mode != EscrowMode::Lightning {
+        return Reading::Unknown;
+    }
     match health.lnd_synced_to_chain {
         Some(true) => Reading::good(format!(
             "LND is synced at height {}.",
@@ -1090,6 +1095,19 @@ mod tests {
         ] {
             assert_eq!(reading(&s, rule), Reading::Unknown, "{rule:?}");
         }
+    }
+
+    #[test]
+    fn lnd_tags_on_a_cashu_report_give_no_lnd_reading() {
+        let mostro = Keys::generate();
+        let cashu_with_unsynced_lnd = report_with(&mostro, |tags| {
+            set_tag(tags, "escrow_mode", &["cashu"]);
+            set_tag(tags, "lnd_synced_to_chain", &["false"]);
+        });
+        let s = snapshot(&mostro, Some(&cashu_with_unsynced_lnd), None);
+
+        assert_eq!(reading(&s, RuleId::LndUnsynced), Reading::Unknown);
+        assert_eq!(reading(&s, RuleId::BlockLag), Reading::Unknown);
     }
 
     #[test]
